@@ -175,7 +175,7 @@ EXEMPLES_FORMULATIONS_CLIENTS = [
 def get_or_create_client(telephone: str) -> dict:
     """
     Cherche le client par son numéro.
-    S'il existe → retourne sa fiche.
+    S'il existe → retourne sa fiche + dernière prestation.
     S'il n'existe pas → crée une fiche vide et la retourne.
     """
     try:
@@ -184,14 +184,33 @@ def get_or_create_client(telephone: str) -> dict:
             .eq("telephone", telephone)\
             .execute()
         if result.data:
-            return result.data[0]
+            client = result.data[0]
+            # Récupère le dernier RDV confirmé
+            rdv_result = supabase.table("rendez_vous")\
+                .select("prestation, jour")\
+                .eq("client_id", client["id"])\
+                .eq("statut", "confirme")\
+                .order("jour", desc=True)\
+                .limit(1)\
+                .execute()
+            if rdv_result.data:
+                client["derniere_prestation"] = rdv_result.data[0].get("prestation")
+                client["derniere_date"] = rdv_result.data[0].get("jour")
+            else:
+                client["derniere_prestation"] = None
+                client["derniere_date"] = None
+            return client
         nouveau = supabase.table("clients")\
             .insert({"telephone": telephone})\
             .execute()
-        return nouveau.data[0]
+        c = nouveau.data[0]
+        c["derniere_prestation"] = None
+        c["derniere_date"] = None
+        return c
     except Exception as e:
         print(f"Erreur Supabase get_or_create_client: {e}")
-        return {"id": None, "telephone": telephone, "nom": None, "nb_visites": 0}
+        return {"id": None, "telephone": telephone, "nom": None, "nb_visites": 0,
+                "derniere_prestation": None, "derniere_date": None}
 
 
 def mettre_a_jour_nom_client(client_id: str, nom: str):
@@ -971,7 +990,13 @@ def extraire_jour_heure(texte, reference_date=None):
 # ====================================================
 # L'AGENT : Intentions & réponses
 # ====================================================
-def presentation(nom_client=None):
+def presentation(nom_client=None, derniere_prestation=None, derniere_date=None):
+    if nom_client and derniere_prestation and derniere_date:
+        return (
+            f"Bonjour {nom_client}, ravi de vous retrouver ! "
+            f"Votre dernière visite était une {derniere_prestation} le {derniere_date}. "
+            f"Souhaitez-vous reprendre la même prestation ?"
+        )
     if nom_client:
         return f"Bonjour {nom_client}, ravi de vous retrouver au {NOM_SALON}. Que puis-je faire pour vous ?"
     return f"Bonjour, vous êtes bien au {NOM_SALON}. Je peux vous aider à prendre un rendez-vous."
@@ -1065,6 +1090,7 @@ def reset_state():
     app.state.shampoing_tmp = False
     app.state.prix_tmp = None
     app.state.client_id_tmp = None
+    app.state.client_nouveau_tmp = False
 
 
 # ====================================================
@@ -1083,12 +1109,13 @@ async def appel(
         client = get_or_create_client(telephone)
         app.state.client_id_tmp = client.get("id")
         nom = client.get("nom")
-        if not nom:
-            audio = tts_voice(f"Bonjour, vous êtes bien au {NOM_SALON}. Pourriez-vous me donner votre prénom et votre nom s'il vous plaît ?")
-            vr.play(url=f"{BASE_URL}/{audio}")
-            vr.gather(input="speech", speechTimeout="auto", action="/appel_nom")
-            return str(vr)
-        audio = tts_voice(presentation(nom))
+        app.state.client_nouveau_tmp = not bool(nom)
+        msg = presentation(
+            nom,
+            client.get("derniere_prestation"),
+            client.get("derniere_date"),
+        )
+        audio = tts_voice(msg)
         vr.play(url=f"{BASE_URL}/{audio}")
         vr.gather(input="speech", speechTimeout="auto", action="/appel")
         return str(vr)
@@ -1252,6 +1279,28 @@ async def appel_nom(SpeechResult: str = Form(None)):
     audio = tts_voice("Désolé, je n'ai pas bien entendu. Pouvez-vous répéter votre prénom et votre nom ?")
     vr.play(f"{BASE_URL}/{audio}")
     vr.gather(input="speech", speechTimeout="auto", action="/appel_nom")
+    return str(vr)
+
+
+# ====================================================
+# TWILIO : CAPTURE DU PRÉNOM EN FIN D'APPEL (nouveau client)
+# ====================================================
+@app.post("/appel_nom_fin", response_class=PlainTextResponse)
+async def appel_nom_fin(SpeechResult: str = Form(None)):
+    vr = VoiceResponse()
+    if SpeechResult:
+        prenom = SpeechResult.strip()
+        client_id = app.state.client_id_tmp
+        if client_id and prenom:
+            mettre_a_jour_nom_client(client_id, prenom)
+        audio = tts_voice(f"Merci {prenom} ! À bientôt au {NOM_SALON}. Bonne journée !")
+        vr.play(f"{BASE_URL}/{audio}")
+        vr.hangup()
+        reset_state()
+        return str(vr)
+    audio = tts_voice("Désolé, je n'ai pas bien entendu. Pouvez-vous répéter votre prénom ?")
+    vr.play(f"{BASE_URL}/{audio}")
+    vr.gather(input="speech", speechTimeout="auto", action="/appel_nom_fin")
     return str(vr)
 
 
@@ -1436,12 +1485,18 @@ async def appel_prestation(SpeechResult: str = Form(None)):
             f"Durée estimée {detail_duree} "
             f"Fin prévue vers {fin_estimee}. "
             f"Vous recevrez la confirmation sur le site : {SITE_CLIENT}. "
-            f"Merci pour votre appel et à bientôt !"
         )
-        audio = tts_voice(final_msg)
-        vr.play(f"{BASE_URL}/{audio}")
-        vr.hangup()
-        reset_state()
+        if getattr(app.state, "client_nouveau_tmp", False):
+            final_msg += "Pour finir, puis-je avoir votre prénom afin de l'enregistrer pour vos prochaines visites ?"
+            audio = tts_voice(final_msg)
+            vr.play(f"{BASE_URL}/{audio}")
+            vr.gather(input="speech", speechTimeout="auto", action="/appel_nom_fin")
+        else:
+            final_msg += "Merci pour votre appel et à bientôt !"
+            audio = tts_voice(final_msg)
+            vr.play(f"{BASE_URL}/{audio}")
+            vr.hangup()
+            reset_state()
         return str(vr)
 
     if app.state.shampoing_tmp is None:
