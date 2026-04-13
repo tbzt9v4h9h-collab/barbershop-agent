@@ -83,6 +83,10 @@ PRIX_FEMME_COULEUR = {                           # À PERSONNALISER
 # ====================================================
 # CONFIG TECHNIQUE — NE PAS MODIFIER
 # ====================================================
+# Les prix ci-dessus sont les valeurs par défaut.
+# Au démarrage de chaque appel ils sont remplacés
+# dynamiquement par les données de la table "Service"
+# filtrée par salon_id (identifié via le numéro Twilio).
 
 openai.api_key = os.getenv("API_KEY")
 
@@ -124,7 +128,14 @@ app.state.couleur_detail_tmp = None
 app.state.gros_changement_tmp = False
 app.state.shampoing_tmp = False
 app.state.prix_tmp = None
-app.state.client_id_tmp = None  # ← nouveau : on garde l'id du client en cours d'appel
+app.state.client_id_tmp = None
+app.state.client_nouveau_tmp = False
+app.state.salon_id_tmp = None
+# Prix dynamiques (écrasés à chaque appel via load_prix_from_base44)
+app.state.prix_homme_coupe = None
+app.state.prix_homme_couleur = None
+app.state.prix_femme_coupe = None
+app.state.prix_femme_couleur = None
 
 JOURS_FR = {
     "lundi": 0, "mardi": 1, "mercredi": 2, "jeudi": 3,
@@ -287,6 +298,113 @@ def get_rdv_client(client_id: str) -> list:
     except Exception as e:
         print(f"Erreur Supabase get_rdv_client: {e}")
         return []
+
+
+# ====================================================
+# BASE44 — INTÉGRATION MULTI-SALON
+# ====================================================
+
+def get_salon_by_twilio(twilio_number: str) -> dict | None:
+    """Identifie le salon via son numéro Twilio. Retourne la fiche salon ou None."""
+    try:
+        result = supabase.table("Salon")\
+            .select("*")\
+            .eq("twilio_number", twilio_number)\
+            .limit(1)\
+            .execute()
+        return result.data[0] if result.data else None
+    except Exception as e:
+        print(f"Erreur get_salon_by_twilio: {e}")
+        return None
+
+
+def get_services_from_base44(salon_id: str) -> list:
+    """Récupère les services actifs d'un salon depuis Supabase table 'Service'.
+    Retourne une liste de dicts : name, price, duration_minutes, category.
+    """
+    try:
+        result = supabase.table("Service")\
+            .select("name, price, duration_minutes, category")\
+            .eq("salon_id", salon_id)\
+            .execute()
+        return result.data or []
+    except Exception as e:
+        print(f"Erreur get_services_from_base44: {e}")
+        return []
+
+
+def get_employees_from_base44(salon_id: str) -> list:
+    """Récupère les employés actifs d'un salon depuis Supabase table 'Employee'.
+    Retourne une liste de dicts : full_name, specialties, work_start, work_end, working_days.
+    """
+    try:
+        result = supabase.table("Employee")\
+            .select("full_name, specialties, work_start, work_end, working_days")\
+            .eq("salon_id", salon_id)\
+            .eq("is_active", True)\
+            .execute()
+        return result.data or []
+    except Exception as e:
+        print(f"Erreur get_employees_from_base44: {e}")
+        return []
+
+
+def load_prix_from_base44(salon_id: str):
+    """Charge les prix dynamiquement depuis Supabase et les stocke dans app.state.
+    Construit les 4 dicts de prix à partir de la table 'Service'.
+    Colonnes attendues : name (str), price (int), category (str).
+    """
+    services = get_services_from_base44(salon_id)
+    if not services:
+        return  # Garde les valeurs par défaut
+
+    homme_coupe = {}
+    homme_couleur = {}
+    femme_coupe = {}
+    femme_couleur = {}
+
+    for svc in services:
+        name = (svc.get("name") or "").lower().replace(" ", "_").replace("-", "_")
+        price = svc.get("price") or 0
+        category = (svc.get("category") or "").lower()
+
+        if "homme" in category and "coupe" in category:
+            homme_coupe[name] = price
+        elif "homme" in category and "couleur" in category:
+            homme_couleur[name] = price
+        elif "femme" in category and "coupe" in category:
+            femme_coupe[name] = price
+        elif "femme" in category and "couleur" in category:
+            femme_couleur[name] = price
+
+    if homme_coupe:
+        app.state.prix_homme_coupe = homme_coupe
+    if homme_couleur:
+        app.state.prix_homme_couleur = homme_couleur
+    if femme_coupe:
+        app.state.prix_femme_coupe = femme_coupe
+    if femme_couleur:
+        app.state.prix_femme_couleur = femme_couleur
+
+
+def sync_rdv_to_base44(rdv_data: dict):
+    """Écrit le RDV confirmé dans la table Supabase 'Appointment'.
+    rdv_data doit contenir : salon_id, client_name, client_phone,
+    employee_id, service_id, date, time.
+    """
+    try:
+        supabase.table("Appointment").insert({
+            "salon_id":     rdv_data.get("salon_id"),
+            "client_name":  rdv_data.get("client_name"),
+            "client_phone": rdv_data.get("client_phone"),
+            "employee_id":  rdv_data.get("employee_id"),
+            "service_id":   rdv_data.get("service_id"),
+            "date":         rdv_data.get("date"),
+            "time":         rdv_data.get("time"),
+            "status":       "confirmed",
+        }).execute()
+    except Exception as e:
+        print(f"Erreur sync_rdv_to_base44: {e}")
 
 
 # ====================================================
@@ -666,22 +784,29 @@ def calculer_duree_details(type_prestation, prestation, coupe_detail, couleur_de
 
 
 def calculer_prix_details(type_prestation, prestation, coupe_detail, couleur_detail):
+    # Utilise les prix dynamiques chargés depuis Supabase si disponibles,
+    # sinon retombe sur les constantes par défaut.
+    ph_coupe   = app.state.prix_homme_coupe   or PRIX_HOMME_COUPE
+    ph_couleur = app.state.prix_homme_couleur or PRIX_HOMME_COULEUR
+    pf_coupe   = app.state.prix_femme_coupe   or PRIX_FEMME_COUPE
+    pf_couleur = app.state.prix_femme_couleur or PRIX_FEMME_COULEUR
+
     coupe_prix = None
     couleur_prix = None
     if type_prestation == "homme":
         coupe_detail_norm = coupe_detail or "normale"
         couleur_detail_norm = couleur_detail or "classique"
         if prestation in {"coupe", "coupe_couleur"}:
-            coupe_prix = PRIX_HOMME_COUPE.get(coupe_detail_norm, 15)
+            coupe_prix = ph_coupe.get(coupe_detail_norm, 15)
         if prestation in {"couleur", "coupe_couleur"}:
-            couleur_prix = PRIX_HOMME_COULEUR.get(couleur_detail_norm, 30)
+            couleur_prix = ph_couleur.get(couleur_detail_norm, 30)
     else:
         coupe_detail_norm = coupe_detail or "coupe"
         couleur_detail_norm = couleur_detail or "couleur"
         if prestation in {"coupe", "coupe_couleur"}:
-            coupe_prix = PRIX_FEMME_COUPE.get(coupe_detail_norm, 30)
+            coupe_prix = pf_coupe.get(coupe_detail_norm, 30)
         if prestation in {"couleur", "coupe_couleur"}:
-            couleur_prix = PRIX_FEMME_COULEUR.get(couleur_detail_norm, 30)
+            couleur_prix = pf_couleur.get(couleur_detail_norm, 30)
     total = (coupe_prix or 0) + (couleur_prix or 0)
     return coupe_prix, couleur_prix, total
 
@@ -1091,6 +1216,12 @@ def reset_state():
     app.state.prix_tmp = None
     app.state.client_id_tmp = None
     app.state.client_nouveau_tmp = False
+    app.state.client_nom_tmp = None
+    app.state.salon_id_tmp = None
+    app.state.prix_homme_coupe = None
+    app.state.prix_homme_couleur = None
+    app.state.prix_femme_coupe = None
+    app.state.prix_femme_couleur = None
 
 
 # ====================================================
@@ -1099,17 +1230,27 @@ def reset_state():
 @app.post("/appel", response_class=PlainTextResponse)
 async def appel(
     SpeechResult: str = Form(None),
-    From: str = Form(None)
+    From: str = Form(None),
+    To: str = Form(None),
 ):
     vr = VoiceResponse()
 
-    # Début de l'appel — reconnaissance client
+    # Début de l'appel — identification salon + reconnaissance client
     if SpeechResult is None:
+        # Identifier le salon via le numéro Twilio composé
+        salon = get_salon_by_twilio(To) if To else None
+        if salon:
+            app.state.salon_id_tmp = salon.get("id")
+            load_prix_from_base44(app.state.salon_id_tmp)
+        else:
+            app.state.salon_id_tmp = None
+
         telephone = From or "console_test"
         client = get_or_create_client(telephone)
         app.state.client_id_tmp = client.get("id")
         nom = client.get("nom")
         app.state.client_nouveau_tmp = not bool(nom)
+        app.state.client_nom_tmp = nom
         msg = presentation(
             nom,
             client.get("derniere_prestation"),
@@ -1293,6 +1434,7 @@ async def appel_nom_fin(SpeechResult: str = Form(None)):
         client_id = app.state.client_id_tmp
         if client_id and prenom:
             mettre_a_jour_nom_client(client_id, prenom)
+            app.state.client_nom_tmp = prenom
         audio = tts_voice(f"Merci {prenom} ! À bientôt au {NOM_SALON}. Bonne journée !")
         vr.play(f"{BASE_URL}/{audio}")
         vr.hangup()
@@ -1472,6 +1614,16 @@ async def appel_prestation(SpeechResult: str = Form(None)):
             app.state.coupe_detail_tmp, app.state.couleur_detail_tmp,
             duree_max, prix_total, app.state.shampoing_tmp
         )
+        # Synchronisation Base44 — écriture dans table Appointment
+        sync_rdv_to_base44({
+            "salon_id":     app.state.salon_id_tmp,
+            "client_name":  getattr(app.state, "client_nom_tmp", None),
+            "client_phone": From,
+            "employee_id":  None,  # à renseigner si sélection employé ajoutée
+            "service_id":   None,  # à renseigner si mapping service ajouté
+            "date":         jour,
+            "time":         heure,
+        })
         if coupe_min is not None and couleur_min is not None:
             detail_duree = (
                 f"{format_plage_simple(coupe_min, coupe_max)} pour la coupe + "
