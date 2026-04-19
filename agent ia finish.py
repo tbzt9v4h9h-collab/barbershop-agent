@@ -86,7 +86,129 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+# Salon actif pour la session en cours (résolu depuis twilio_number)
+_session_salon_id: str | None = None
+
 BASE_URL = "https://concealingly-highly-felica.ngrok-free.dev"
+
+# ====================================================
+# TRACKING DES COÛTS OPENAI
+# ====================================================
+PRIX_INPUT_PER_MILLION = 2.50   # USD par million tokens input (GPT-4o)
+PRIX_OUTPUT_PER_MILLION = 10.00  # USD par million tokens output (GPT-4o)
+TAUX_EUR_USD = 0.92             # Conversion USD to EUR
+
+# Variables de session (remises à zéro pour chaque appel)
+session_tokens_input = 0
+session_tokens_output = 0
+session_tokens_total = 0
+session_nb_echanges = 0
+session_cout_usd = 0.0
+session_cout_eur = 0.0
+
+def calculer_cout(tokens_input: int, tokens_output: int) -> tuple:
+    """Calcule le coût en USD et EUR."""
+    cout_input = (tokens_input / 1_000_000) * PRIX_INPUT_PER_MILLION
+    cout_output = (tokens_output / 1_000_000) * PRIX_OUTPUT_PER_MILLION
+    cout_usd = cout_input + cout_output
+    cout_eur = cout_usd * TAUX_EUR_USD
+    return round(cout_usd, 6), round(cout_eur, 6)
+
+def enregistrer_usage(salon_id: str = None, salon_nom: str = None,
+                      twilio_number: str = None, tokens_input: int = 0,
+                      tokens_output: int = 0, nb_echanges: int = 0,
+                      appel_abouti: bool = False):
+    """Enregistre l'usage OpenAI dans Supabase pour le reporting."""
+    if not twilio_number or tokens_input == 0 and tokens_output == 0:
+        return
+
+    cout_usd, cout_eur = calculer_cout(tokens_input, tokens_output)
+    mois = datetime.now().strftime("%Y-%m")
+
+    try:
+        supabase.table("usage_logs").insert({
+            "salon_id": salon_id,
+            "salon_nom": salon_nom or NOM_SALON,
+            "twilio_number": twilio_number,
+            "mois": mois,
+            "tokens_input": tokens_input,
+            "tokens_output": tokens_output,
+            "tokens_total": tokens_input + tokens_output,
+            "cout_usd": cout_usd,
+            "cout_eur": cout_eur,
+            "nb_echanges": nb_echanges,
+            "appel_abouti": appel_abouti,
+        }).execute()
+        print(f"📊 [USAGE] {tokens_input + tokens_output} tokens | "
+              f"€{cout_eur:.4f} | {nb_echanges} échanges")
+    except Exception as e:
+        print(f"⚠️  [USAGE ERROR] {e}")
+
+def rapport_mensuel(mois: str = None):
+    """Génère un rapport des coûts par salon pour le mois."""
+    if not mois:
+        mois = datetime.now().strftime("%Y-%m")
+
+    try:
+        result = supabase.table("usage_logs")\
+            .select("*")\
+            .eq("mois", mois)\
+            .execute()
+
+        logs = result.data or []
+        if not logs:
+            print(f"\n❌ Aucune donnée pour {mois}\n")
+            return {}
+
+        # Grouper par salon
+        salons = {}
+        for log in logs:
+            nom = log.get("salon_nom") or log.get("twilio_number") or "Unknown"
+            if nom not in salons:
+                salons[nom] = {
+                    "nb_appels": 0,
+                    "tokens_total": 0,
+                    "cout_eur": 0.0,
+                    "cout_usd": 0.0,
+                    "appels_aboutis": 0,
+                    "nb_echanges": 0,
+                }
+            salons[nom]["nb_appels"] += 1
+            salons[nom]["tokens_total"] += log.get("tokens_total", 0)
+            salons[nom]["cout_eur"] += float(log.get("cout_eur", 0))
+            salons[nom]["cout_usd"] += float(log.get("cout_usd", 0))
+            salons[nom]["appels_aboutis"] += 1 if log.get("appel_abouti") else 0
+            salons[nom]["nb_echanges"] += log.get("nb_echanges", 0)
+
+        # Affichage
+        print(f"\n{'='*60}")
+        print(f"📊 RAPPORT USAGE OPENAI — {mois}")
+        print(f"{'='*60}")
+        total_eur = 0.0
+        total_tokens = 0
+
+        for nom, data in sorted(salons.items()):
+            taux = (data["appels_aboutis"] / data["nb_appels"] * 100) if data["nb_appels"] > 0 else 0
+            print(f"\n🏢 SALON : {nom}")
+            print(f"   Appels         : {data['nb_appels']}")
+            print(f"   Aboutis        : {data['appels_aboutis']} ({taux:.0f}%)")
+            print(f"   Tokens         : {data['tokens_total']:,}")
+            print(f"   Échanges       : {data['nb_echanges']}")
+            print(f"   💰 Coût mois   : €{data['cout_eur']:.4f} (${data['cout_usd']:.4f})")
+            total_eur += data['cout_eur']
+            total_tokens += data['tokens_total']
+
+        print(f"\n{'='*60}")
+        print(f"💰 TOTAL OPENAI — {mois}")
+        print(f"   Tokens totaux  : {total_tokens:,}")
+        print(f"   Coût total     : €{total_eur:.4f}")
+        print(f"{'='*60}\n")
+
+        return salons
+
+    except Exception as e:
+        print(f"⚠️  [RAPPORT ERROR] {e}")
+        return {}
 
 app = FastAPI()
 END_CALL_MESSAGE = "Merci pour votre appel. Bonne journée et à bientôt au salon."
@@ -212,6 +334,17 @@ def get_or_create_client(telephone: str) -> dict:
         print(f"Erreur Supabase get_or_create_client: {e}")
         return {"id": None, "telephone": telephone, "nom": None, "nb_visites": 0}
 
+def get_salon_by_twilio(twilio_number: str) -> dict | None:
+    """Identifie le salon via son numéro Twilio (table Salon, colonne twilio_number)."""
+    try:
+        result = supabase.table("salon").select("*")\
+            .eq("twilio_number", twilio_number).limit(1).execute()
+        return result.data[0] if result.data else None
+    except Exception as e:
+        print(f"Erreur get_salon_by_twilio: {e}")
+        return None
+
+
 def mettre_a_jour_nom_client(client_id: str, nom: str):
     """Met à jour le nom du client dans Supabase."""
     try:
@@ -224,11 +357,11 @@ def mettre_a_jour_nom_client(client_id: str, nom: str):
 
 def enregistrer_rdv(client_id, jour, heure, type_client,
                     prestation, coupe_detail, couleur_detail,
-                    duree_max, prix, avec_shampoing=False):
+                    duree_max, prix, avec_shampoing=False, salon_id=None):
     """Enregistre un RDV dans Supabase et incrémente le compteur de visites."""
     try:
         heure_fin = ajouter_minutes_hhmm(heure, duree_max)
-        supabase.table("rendez_vous").insert({
+        row = {
             "client_id":      client_id,
             "jour":           jour,
             "heure_debut":    heure,
@@ -240,7 +373,11 @@ def enregistrer_rdv(client_id, jour, heure, type_client,
             "avec_shampoing": avec_shampoing,
             "prix":           prix,
             "statut":         "confirme",
-        }).execute()
+        }
+        # Note : la table rendez_vous n'a pas de colonne salon_id
+        # Le salon_id est résolu via _session_salon_id pour usage futur (sync Base44, etc.)
+        _ = salon_id or _session_salon_id  # conservé pour sync externe si besoin
+        supabase.table("rendez_vous").insert(row).execute()
 
         if client_id:
             client = supabase.table("clients")\
@@ -673,9 +810,10 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
 def run_agent(message_user: str, telephone: str) -> str:
     """
     Exécute l'agent GPT-4o avec function calling (OPTIMISÉ)
-    BUG FIX 1 : Historique nettoyé
-    BUG FIX 2 : Agent moins rigide grâce au meilleur prompt
+    ÉTAPE 2 : Track des tokens OpenAI pour le reporting des coûts
     """
+    global session_tokens_input, session_tokens_output, session_tokens_total
+    global session_nb_echanges, session_cout_usd, session_cout_eur
 
     if not client_openai:
         return "⚠️ Erreur: API OpenAI non configurée. Vérifiez votre clé API."
@@ -699,6 +837,12 @@ def run_agent(message_user: str, telephone: str) -> str:
             temperature=0.7,
             max_tokens=500,
         )
+        # ÉTAPE 2 : Récupérer et accumuler les tokens
+        session_tokens_input += response.usage.prompt_tokens
+        session_tokens_output += response.usage.completion_tokens
+        session_tokens_total += response.usage.total_tokens
+        session_nb_echanges += 1
+
     except Exception as e:
         print(f"Erreur GPT-4o: {e}")
         return "Désolé, une erreur s'est produite. Pouvez-vous répéter?"
@@ -734,12 +878,23 @@ def run_agent(message_user: str, telephone: str) -> str:
         messages = [{"role": "system", "content": build_system_prompt(telephone)}] + get_conversation_history(telephone)
         messages = clean_messages(messages)
 
-        response = client_openai.chat.completions.create(
-            model="gpt-4o",
-            messages=messages,
-            temperature=0.7,
-            max_tokens=500,
-        )
+        try:
+            response = client_openai.chat.completions.create(
+                model="gpt-4o",
+                messages=messages,
+                temperature=0.7,
+                max_tokens=500,
+            )
+            # ÉTAPE 2 : Récupérer et accumuler les tokens du deuxième appel
+            session_tokens_input += response.usage.prompt_tokens
+            session_tokens_output += response.usage.completion_tokens
+            session_tokens_total += response.usage.total_tokens
+            session_nb_echanges += 1
+
+        except Exception as e:
+            print(f"Erreur GPT-4o (retry): {e}")
+            return "Désolé, une erreur s'est produite. Pouvez-vous répéter?"
+
         choice = response.choices[0]
 
     # Extraire la réponse texte
@@ -801,14 +956,64 @@ if __name__ == "__main__":
     print("\nTape 'quit' pour quitter\n")
     print("="*70 + "\n")
 
-    # Numéro de test
-    test_phone = "0600000000"
+    # Numéro de test — doit correspondre à twilio_number dans la table Salon
+    test_phone = "+16066497918"
+    # Note: _session_salon_id est défini au niveau du module
+    try:
+        salon = get_salon_by_twilio(test_phone)
+    except Exception as e:
+        print(f"⚠️  Erreur get_salon_by_twilio: {e}")
+        salon = None
+    if salon:
+        _session_salon_id = salon.get("id")
+        print(f"✅ Salon identifié : {salon.get('nom', salon.get('name', _session_salon_id))} (id={_session_salon_id})")
+    else:
+        _session_salon_id = None
+        print(f"⚠️  Aucun salon trouvé pour {test_phone} — le salon_id ne sera pas enregistré dans les RDV.")
 
     while True:
         user_input = input("👤 Vous: ").strip()
+
+        # ÉTAPE 6 : Commandes spéciales pour le tracking
         if user_input.lower() == "quit":
+            # Enregistrer l'usage avant de quitter
+            if session_tokens_total > 0:
+                cout_usd, cout_eur = calculer_cout(session_tokens_input, session_tokens_output)
+                enregistrer_usage(
+                    salon_id=_session_salon_id,
+                    salon_nom=NOM_SALON,
+                    twilio_number=test_phone,
+                    tokens_input=session_tokens_input,
+                    tokens_output=session_tokens_output,
+                    nb_echanges=session_nb_echanges,
+                    appel_abouti=session_nb_echanges > 0
+                )
             print("\n👋 Au revoir!")
             break
+
+        elif user_input.lower() == "cout":
+            # Afficher le coût de la session actuelle
+            cout_usd, cout_eur = calculer_cout(session_tokens_input, session_tokens_output)
+            print(f"\n💰 COÛT SESSION ACTUELLE")
+            print(f"   Tokens input  : {session_tokens_input}")
+            print(f"   Tokens output : {session_tokens_output}")
+            print(f"   Tokens total  : {session_tokens_total}")
+            print(f"   Coût USD      : ${cout_usd:.6f}")
+            print(f"   Coût EUR      : €{cout_eur:.6f}")
+            print(f"   Échanges      : {session_nb_echanges}\n")
+            continue
+
+        elif user_input.lower() == "rapport":
+            # Afficher le rapport du mois en cours
+            rapport_mensuel()
+            continue
+
+        elif user_input.lower().startswith("rapport "):
+            # Afficher le rapport d'un mois spécifique
+            mois = user_input.split(" ", 1)[1].strip()
+            rapport_mensuel(mois)
+            continue
+
         if not user_input:
             continue
 
