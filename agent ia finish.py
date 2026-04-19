@@ -1,6 +1,7 @@
 # ====================================================
-# AGENT IA COIFFEUR — VERSION GPT-4o AVEC FUNCTION CALLING
+# AGENT IA COIFFEUR — VERSION GPT-4o OPTIMISÉE
 # Avec intégration Supabase + configuration multi-salon
+# BUG FIXES : tool calls, rigidité agent, dates relatives
 # ====================================================
 
 import os
@@ -127,8 +128,8 @@ NOMS_MOIS = [
 # ====================================================
 # GESTION DES CONVERSATIONS (historique + contexte client)
 # ====================================================
-conversation_history = {}  # {phone: [{"role": "user/assistant", "content": "..."}]}
-client_context = {}        # {phone: {"nom": "...", "client_id": "..."}}
+conversation_history = {}  # {phone: [{"role": "user/assistant/tool", "content": "..."}]}
+client_context = {}        # {phone: {"nom": "...", "client_id": "...", "prenom": "..."}}
 
 def get_conversation_history(telephone: str):
     """Récupère l'historique de conversation pour ce numéro."""
@@ -141,6 +142,27 @@ def add_to_history(telephone: str, role: str, content: str):
     history = get_conversation_history(telephone)
     history.append({"role": role, "content": content})
 
+def add_assistant_message_with_tools(telephone: str, content: str = None, tool_calls: list = None):
+    """Ajoute un message assistant avec tool_calls."""
+    history = get_conversation_history(telephone)
+    msg = {"role": "assistant"}
+    if content:
+        msg["content"] = content
+    else:
+        msg["content"] = None
+    if tool_calls:
+        msg["tool_calls"] = tool_calls
+    history.append(msg)
+
+def add_tool_result(telephone: str, tool_call_id: str, result: str):
+    """Ajoute le résultat d'un tool call."""
+    history = get_conversation_history(telephone)
+    history.append({
+        "role": "tool",
+        "tool_call_id": tool_call_id,
+        "content": result
+    })
+
 def get_client_context(telephone: str):
     """Récupère le contexte client (nom, ID, etc)."""
     if telephone not in client_context:
@@ -152,12 +174,29 @@ def update_client_context(telephone: str, **kwargs):
     ctx = get_client_context(telephone)
     ctx.update(kwargs)
 
+def clean_messages(messages: list) -> list:
+    """
+    CORRECTION BUG 1 : Nettoie l'historique des messages orphelins
+    Supprime les messages 'tool' qui ne sont pas précédés
+    d'un message 'assistant' avec 'tool_calls'.
+    """
+    cleaned = []
+    for i, msg in enumerate(messages):
+        if msg.get('role') == 'tool':
+            # Vérifier que le message précédent est un assistant avec tool_calls
+            if cleaned and cleaned[-1].get('role') == 'assistant' and cleaned[-1].get('tool_calls'):
+                cleaned.append(msg)
+            # Sinon, ignorer ce message orphelin
+        else:
+            cleaned.append(msg)
+    return cleaned
+
 # ====================================================
 # SUPABASE — FONCTIONS CLIENT & RDV
 # ====================================================
 
 def get_or_create_client(telephone: str) -> dict:
-    """Cherche le client par son numéro. S'il existe → retourne sa fiche. S'il n'existe pas → crée une fiche vide."""
+    """Cherche le client par son numéro. S'il existe → retourne sa fiche."""
     try:
         result = supabase.table("clients")\
             .select("*")\
@@ -271,13 +310,16 @@ def tts_voice(message):
     path = f"audio/{audio_id}"
     os.makedirs("audio", exist_ok=True)
     with open(path, "wb") as f:
-        result = client_openai.audio.speech.create(
-            model="tts-1",
-            voice="alloy",
-            input=message,
-        )
-        audio_bytes = result.read() if hasattr(result, "read") else bytes(result)
-        f.write(audio_bytes)
+        try:
+            result = client_openai.audio.speech.create(
+                model="tts-1",
+                voice="alloy",
+                input=message,
+            )
+            audio_bytes = result.read() if hasattr(result, "read") else bytes(result)
+            f.write(audio_bytes)
+        except Exception as e:
+            print(f"Erreur TTS: {e}")
     return path
 
 # ====================================================
@@ -293,7 +335,7 @@ def date_du_jour():
     return datetime.now().date()
 
 def format_date_longue(date_obj):
-    return f"{NOMS_JOURS[date_obj.weekday()]} {date_obj.day} {NOMS_MOIS[date_obj.month - 1]} {date_obj.year}"
+    return f"{NOMS_JOURS[date_obj.weekday()]} {date_obj.day} {NOMS_MOIS[date_obj.month - 1]}"
 
 def parse_hhmm_en_minutes(hhmm):
     heures, minutes = hhmm.split(":")
@@ -321,7 +363,7 @@ def est_jour_ouvrable(date_iso):
         d = datetime.strptime(date_iso, "%Y-%m-%d").date()
     except ValueError:
         return False
-    return d.weekday() in [1, 2, 3, 4, 5]  # mardi(1) à samedi(5)
+    return d.weekday() in [1, 2, 3, 4, 5]
 
 def ajouter_minutes_hhmm(hhmm, minutes):
     heures, mins = hhmm.split(":")
@@ -341,38 +383,151 @@ def format_plage_duree(duree_min, duree_max):
     return f"{duree_min} - {duree_max} min"
 
 # ====================================================
-# PROMPT SYSTÈME POUR GPT-4o
+# OPTIMISATION 2 : Gestion intelligente des dates relatives
 # ====================================================
-def build_system_prompt():
-    """Construit le prompt système pour GPT-4o."""
-    return f"""Tu es une réceptionniste vocale professionnelle du salon "{NOM_SALON}".
+def parse_date_relative(texte_date: str) -> str:
+    """
+    OPTIMISATION 2 : Convertit une date relative en format YYYY-MM-DD
+    - "demain" -> date de demain
+    - "apres-demain" ou "après-demain" -> +2 jours
+    - "mardi prochain" -> prochain mardi
+    - "ce week-end" -> samedi
+    - "en debut de semaine" -> mardi
+    - "le plus tot possible" -> premier jour ouvrable
+    """
+    aujourd_hui = datetime.now().date()
+    texte = normaliser_texte(texte_date)
 
-RÈGLES DE COMPORTEMENT:
-1. Tu parles uniquement en français, de façon naturelle et chaleureuse
-2. Tu poses UNE SEULE question à la fois
-3. Tu retiens le prénom du client et l'utilises dès le 2ème message
-4. Tu comprends les expressions naturelles : "vers 15h", "demain matin", "mardi prochain"
-5. Si le client dit "pour un homme une coupe" en une phrase, tu comprends tout et tu ne redemandes pas "homme ou femme?"
-6. Tu ne raccroches que quand le RDV est confirmé ou si le client dit au revoir
-7. Tu gères les cas : RDV complet (propose autre créneau), salon fermé, hors horaires
-8. Tu ne mentionnes jamais que tu es une IA sauf si on te le demande directement
+    # Demain
+    if "demain" in texte and "apres" not in texte and "après" not in texte:
+        return (aujourd_hui + timedelta(days=1)).isoformat()
 
-INFORMATIONS DU SALON:
-- Nom: {NOM_SALON}
-- Téléphone: {TELEPHONE_SALON}
-- Adresse: {ADRESSE_SALON}
-- Site: {SITE_CLIENT}
-- Horaires: {HORAIRE_OUVERTURE} à {HORAIRE_FERMETURE}
-- Jours ouverts: {', '.join(JOURS_OUVERTS)}
+    # Après-demain
+    if "apres" in texte or "après" in texte:
+        if "demain" in texte:
+            return (aujourd_hui + timedelta(days=2)).isoformat()
 
-TÂCHES POSSIBLES (utilise les fonctions disponibles):
-1. Prendre un rendez-vous → appelle prendre_rdv()
-2. Vérifier la disponibilité → appelle verifier_disponibilite()
-3. Annuler un RDV → appelle annuler_rdv()
-4. Donner les services → appelle get_services()
-5. Récupérer info client → appelle get_client_info()
+    # Jours de la semaine
+    for jour_fr, jour_num in JOURS_FR.items():
+        if jour_fr in texte:
+            # "prochain" ou "ce"
+            if "prochain" in texte or "ce " in texte:
+                # Trouver le prochain occurrence du jour
+                jours_a_ajouter = (jour_num - aujourd_hui.weekday()) % 7
+                if jours_a_ajouter == 0:
+                    jours_a_ajouter = 7  # Si c'est aujourd'hui, prendre la semaine prochaine
+                return (aujourd_hui + timedelta(days=jours_a_ajouter)).isoformat()
+            else:
+                # Première occurrence (même semaine si possible)
+                jours_a_ajouter = (jour_num - aujourd_hui.weekday()) % 7
+                if jours_a_ajouter == 0:
+                    jours_a_ajouter = 7
+                return (aujourd_hui + timedelta(days=jours_a_ajouter)).isoformat()
 
-Sois toujours professionnel, courtois et aide le client de façon efficace."""
+    # Week-end
+    if "week" in texte or "fin de semaine" in texte:
+        # Samedi
+        jours_a_ajouter = (5 - aujourd_hui.weekday()) % 7
+        if jours_a_ajouter == 0:
+            jours_a_ajouter = 7
+        return (aujourd_hui + timedelta(days=jours_a_ajouter)).isoformat()
+
+    # Début de semaine
+    if "debut" in texte or "début" in texte:
+        # Mardi
+        jours_a_ajouter = (1 - aujourd_hui.weekday()) % 7
+        if jours_a_ajouter == 0:
+            jours_a_ajouter = 7
+        return (aujourd_hui + timedelta(days=jours_a_ajouter)).isoformat()
+
+    # Le plus tôt possible
+    if "tot" in texte or "tôt" in texte or "vite" in texte:
+        # Premier jour ouvrable
+        for i in range(1, 14):
+            date_candidate = aujourd_hui + timedelta(days=i)
+            if est_jour_ouvrable(date_candidate.isoformat()):
+                return date_candidate.isoformat()
+
+    # Si aucun match, retourner demain par défaut
+    return (aujourd_hui + timedelta(days=1)).isoformat()
+
+# ====================================================
+# PROMPT SYSTÈME AMÉLIORÉ
+# ====================================================
+def build_system_prompt(telephone: str = None) -> str:
+    """
+    OPTIMISATION 1 & 3 & 5 : Prompt système amélioré
+    - Inclus les règles absolues
+    - Gestion intelligente des infos
+    - Confirmation avant enregistrement
+    - Mémoire du client
+    """
+    aujourd_hui = datetime.now().date()
+    date_str = format_date_longue(aujourd_hui)
+
+    prompt = f"""Tu es une réceptionniste vocale professionnelle et chaleureuse du salon "{NOM_SALON}".
+
+📅 Nous sommes le {date_str}.
+🏢 Salon : {NOM_SALON}
+📞 Téléphone : {TELEPHONE_SALON}
+📍 Adresse : {ADRESSE_SALON}
+⏰ Horaires : {HORAIRE_OUVERTURE} à {HORAIRE_FERMETURE}, du mardi au samedi
+🕸️ Site : {SITE_CLIENT}
+
+RÈGLES ABSOLUES :
+1. Tu poses UNE SEULE question à la fois (très important)
+2. Tu extrais TOUTES les informations disponibles dans le message du client AVANT de poser des questions
+3. Si le client dit "coupe homme pour demain vers 14h", tu ne redemandes RIEN de tout ça
+4. Ordre des questions si manquantes : 1) Prestation, 2) Jour/heure, 3) Prénom (toujours en dernier)
+5. Tu acceptes les corrections sans te perdre
+6. Tu utilises le prénom du client dès qu'il te l'a donné
+7. Tu ne mentionnes JAMAIS que tu es une IA
+8. Tu ne raccroches que si le RDV est confirmé OU si le client dit au revoir explicitement
+9. Si un créneau n'est pas disponible, tu proposes AUTOMATIQUEMENT le suivant disponible
+10. Si le salon est fermé ce jour, tu dis pourquoi et tu proposes un autre jour
+11. Reste sous 2-3 phrases maximum par réponse
+
+COMPRÉHENSION DES DATES :
+- "vers 14h" = 14:00
+- "demain matin" = demain à 09:00 ou 10:00
+- "mardi prochain" = le prochain mardi
+- "en fin de semaine" = samedi
+- "le plus tôt possible" = premier créneau disponible
+
+FLOW DE PRISE DE RDV :
+1. Extraire : prestation, type (homme/femme si applicable), jour, heure
+2. Demander le PRÉNOM du client (toujours en dernier)
+3. CONFIRMER explicitement : "Parfait [Prénom] ! Je récapitule votre RDV :
+   - Prestation : [prestation]
+   - Date : [jour] [date] à [heure]
+   - Coiffeur : [coiffeur si connu]
+   Je confirme ?"
+4. Attendre "oui", "c'est bon", "parfait" ou similaire avant d'enregistrer
+5. Une fois enregistré : "Votre RDV est confirmé ! À bientôt !"
+
+GESTION DES CAS SPÉCIAUX :
+- Annulation : demander confirmation avant d'annuler
+- Modification : annuler l'ancien + créer le nouveau
+- Demande de prix : donner les prix, puis proposer un RDV
+- Salon fermé : proposer un autre jour immédiatement
+
+MÉMOIRE DU CLIENT :
+"""
+
+    # Ajouter les infos du client si connu
+    if telephone:
+        ctx = get_client_context(telephone)
+        if ctx.get("nom") or ctx.get("prenom"):
+            prenom = ctx.get("prenom") or ctx.get("nom", "").split()[0]
+            prompt += f"- Ce client s'appelle {prenom}\n"
+            rdvs = get_rdv_client(ctx.get("client_id")) if ctx.get("client_id") else []
+            if rdvs:
+                dernier_rdv = rdvs[-1] if rdvs else None
+                if dernier_rdv:
+                    prompt += f"- Dernière visite : {dernier_rdv.get('jour')} pour {dernier_rdv.get('prestation')}\n"
+            prompt += f"Accueille-le chaleureusement par son prénom.\n"
+
+    return prompt
 
 # ====================================================
 # FONCTIONS POUR GPT-4o (function calling)
@@ -466,7 +621,7 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
 
         # Vérifier la disponibilité
         if not est_creneau_disponible(jour, heure):
-            return f"Désolé, le créneau du {jour} à {heure} n'est pas disponible."
+            return f"Créneau indisponible. Merci de vérifier."
 
         # Récupérer/créer le client
         client = get_or_create_client(telephone)
@@ -485,40 +640,41 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
             prix=30,
             avec_shampoing=False
         )
-        return f"✅ RDV confirmé pour le {jour} à {heure} pour {prestation}. Merci!"
+        return f"RDV enregistré pour {jour} à {heure}."
 
     elif tool_name == "verifier_disponibilite":
         jour = tool_input.get("jour")
         heure = tool_input.get("heure")
         disponible = est_creneau_disponible(jour, heure)
-        return f"Le créneau du {jour} à {heure} est {'disponible' if disponible else 'occupé'}."
+        return f"Disponibilité : {'libre' if disponible else 'occupé'}"
 
     elif tool_name == "annuler_rdv":
         client_id = tool_input.get("client_id")
         rdv_id = tool_input.get("rdv_id")
         if annuler_rdv(client_id, rdv_id):
-            return "✅ Rendez-vous annulé avec succès."
-        return "❌ Erreur lors de l'annulation."
+            return "RDV annulé avec succès."
+        return "Erreur lors de l'annulation."
 
     elif tool_name == "get_services":
         services = get_services()
-        return f"Services disponibles: {', '.join(services)}"
+        return f"Services : {', '.join(services)}"
 
     elif tool_name == "get_client_info":
         client = get_or_create_client(telephone)
-        info = f"Nom: {client.get('nom', 'Non renseigné')}, Visites: {client.get('nb_visites', 0)}"
-        update_client_context(telephone, client_id=client.get("id"), nom=client.get("nom"))
-        return info
+        if client.get("nom"):
+            update_client_context(telephone, prenom=client.get("nom").split()[0], client_id=client.get("id"))
+        return f"Client trouvé : {client.get('nom', 'Nouveau client')}"
 
     return "Fonction inconnue."
 
 # ====================================================
-# AGENT PRINCIPAL AVEC GPT-4o
+# AGENT PRINCIPAL AVEC GPT-4o OPTIMISÉ
 # ====================================================
 def run_agent(message_user: str, telephone: str) -> str:
     """
-    Exécute l'agent GPT-4o avec function calling.
-    Prend le message utilisateur et retourne la réponse de l'agent.
+    Exécute l'agent GPT-4o avec function calling (OPTIMISÉ)
+    BUG FIX 1 : Historique nettoyé
+    BUG FIX 2 : Agent moins rigide grâce au meilleur prompt
     """
 
     if not client_openai:
@@ -528,7 +684,10 @@ def run_agent(message_user: str, telephone: str) -> str:
     add_to_history(telephone, "user", message_user)
 
     # Préparer les messages avec le system prompt en premier
-    messages = [{"role": "system", "content": build_system_prompt()}] + get_conversation_history(telephone)
+    messages = [{"role": "system", "content": build_system_prompt(telephone)}] + get_conversation_history(telephone)
+
+    # CORRECTION BUG 1 : Nettoyer l'historique des messages orphelins
+    messages = clean_messages(messages)
 
     # Appeler GPT-4o avec function calling
     try:
@@ -549,17 +708,32 @@ def run_agent(message_user: str, telephone: str) -> str:
 
     # Si GPT-4o veut appeler une fonction
     if choice.message.tool_calls:
-        # Exécuter les appels de fonction
+        # Ajouter le message assistant avec tool_calls
+        tool_calls_data = []
+        for tc in choice.message.tool_calls:
+            tool_calls_data.append({
+                "id": tc.id,
+                "type": "function",
+                "function": {
+                    "name": tc.function.name,
+                    "arguments": tc.function.arguments
+                }
+            })
+        add_assistant_message_with_tools(telephone, content=None, tool_calls=tool_calls_data)
+
+        # Exécuter les appels de fonction et ajouter les résultats
         for tool_call in choice.message.tool_calls:
             tool_name = tool_call.function.name
             tool_input = json.loads(tool_call.function.arguments)
             tool_result = process_tool_call(tool_name, tool_input, telephone)
 
-            # Ajouter le résultat à l'historique
-            add_to_history(telephone, "tool", f"{tool_name}: {tool_result}")
+            # Ajouter le résultat avec le tool_call_id
+            add_tool_result(telephone, tool_call.id, tool_result)
 
         # Relancer GPT-4o avec le résultat des fonctions
-        messages = [{"role": "system", "content": build_system_prompt()}] + get_conversation_history(telephone)
+        messages = [{"role": "system", "content": build_system_prompt(telephone)}] + get_conversation_history(telephone)
+        messages = clean_messages(messages)
+
         response = client_openai.chat.completions.create(
             model="gpt-4o",
             messages=messages,
@@ -618,14 +792,14 @@ def get_audio(filename: str):
 # MODE CONSOLE POUR TESTER
 # ====================================================
 if __name__ == "__main__":
-    print("\n" + "="*60)
-    print("🎤 AGENT BARBERSHOP — MODE CONSOLE")
-    print("="*60)
+    print("\n" + "="*70)
+    print("🎤 AGENT BARBERSHOP OPTIMISÉ — MODE CONSOLE")
+    print("="*70)
     print(f"Salon: {NOM_SALON}")
     print(f"Horaires: {HORAIRE_OUVERTURE} - {HORAIRE_FERMETURE}")
     print(f"Jours: {', '.join(JOURS_OUVERTS)}")
     print("\nTape 'quit' pour quitter\n")
-    print("="*60 + "\n")
+    print("="*70 + "\n")
 
     # Numéro de test
     test_phone = "0600000000"
