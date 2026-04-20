@@ -15,7 +15,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 import openai
 import uuid
 import re
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
@@ -28,6 +28,7 @@ load_dotenv(dotenv_path=dotenv_path)
 NOM_SALON = "Chez les fdp du dégradé"          # À PERSONNALISER
 TELEPHONE_SALON = "01 23 45 67 89"               # À PERSONNALISER
 ADRESSE_SALON = "12 rue Exemple, 75001 Paris"    # À PERSONNALISER
+
 SITE_CLIENT = "https://www.monsite-coiffure.com" # À PERSONNALISER
 
 HORAIRE_OUVERTURE = "09:00"                      # À PERSONNALISER
@@ -389,6 +390,25 @@ def enregistrer_rdv(client_id, jour, heure, type_client,
         result = supabase.table("rendez_vous").insert(row).execute()
         rdv_id = result.data[0]["id"] if result.data else None
 
+        # Écriture simultanée dans la table "appointment"
+        try:
+            salon_id_eff = salon_id or _session_salon_id
+            appt_row = {
+                "client_name":  client_nom or telephone or "Inconnu",
+                "client_phone": telephone or "",
+                "status":       "confirme",
+                "date":         jour,
+                "time":         heure + ":00" if len(heure) == 5 else heure,
+                "created_at":   datetime.now(timezone.utc).isoformat(),
+            }
+            if salon_id_eff:
+                appt_row["salon_id"] = salon_id_eff
+            appt_result = supabase.table("appointment").insert(appt_row).execute()
+            appt_id = appt_result.data[0]["id"] if appt_result.data else None
+            print(f"✅ [appointment] Ligne créée — id={appt_id}")
+        except Exception as e_appt:
+            print(f"⚠️  [appointment] Erreur insert : {e_appt}")
+
         if client_id:
             client_row = supabase.table("clients")\
                 .select("nb_visites")\
@@ -463,32 +483,42 @@ def _format_date_sms(date_iso: str) -> str:
         return date_iso
 
 
-def send_sms(to: str, body: str) -> bool:
-    """Envoie un SMS via Twilio. Retourne True si succès."""
+def send_sms(to: str, body: str) -> tuple[bool, str | None]:
+    """Envoie un SMS via Twilio. Retourne (succès, twilio_sid)."""
     if not twilio_client:
         print("⚠️  [SMS] Client Twilio non initialisé — SMS non envoyé.")
-        return False
+        return False, None
+    if to == TWILIO_NUMBER:
+        print(f"⚠️  [SMS] Numéro destinataire identique au numéro Twilio ({to}) — ignoré.")
+        return False, None
+    if not to or not to.startswith("+") or len(to) < 8:
+        print(f"⚠️  [SMS] Numéro invalide : {to} — ignoré.")
+        return False, None
     try:
         msg = twilio_client.messages.create(body=body, from_=TWILIO_NUMBER, to=to)
         print(f"✅  [SMS] Envoyé à {to} — SID {msg.sid}")
-        return True
+        return True, msg.sid
     except Exception as e:
         print(f"❌  [SMS] Erreur envoi à {to} : {e}")
-        return False
+        return False, None
 
 
 def save_rappel_sms(rdv_id: str | None, client_id: str | None,
-                    telephone: str, message: str, statut: str):
-    """Enregistre une entrée dans la table rappels_sms."""
+                    telephone: str, message: str, statut: str,
+                    twilio_sid: str | None = None):
+    """Enregistre une entrée dans la table rappels_sms.
+    Colonnes réelles : rdv_id, envoye_le, statut, message_texte, twilio_sid.
+    """
     try:
-        supabase.table("rappels_sms").insert({
-            "rendez_vous_id": rdv_id,
-            "client_id":      client_id,
-            "telephone":      telephone,
-            "message":        message,
-            "statut":         statut,
-            "date_envoi":     datetime.utcnow().isoformat(),
-        }).execute()
+        row = {
+            "rdv_id":        rdv_id,
+            "statut":        statut,
+            "message_texte": message,
+            "envoye_le":     datetime.now(timezone.utc).isoformat(),
+        }
+        if twilio_sid:
+            row["twilio_sid"] = twilio_sid
+        supabase.table("rappels_sms").insert(row).execute()
     except Exception as e:
         print(f"⚠️  [SMS] Erreur enregistrement rappels_sms : {e}")
 
@@ -506,9 +536,9 @@ def send_sms_confirmation(telephone: str, client_nom: str | None,
         f"{prestation} le {date_str} à {heure_str}. "
         f"Pour annuler, appelez le {TELEPHONE_SALON}. À bientôt !"
     )
-    ok = send_sms(telephone, message)
+    ok, sid = send_sms(telephone, message)
     save_rappel_sms(rdv_id, client_id, telephone, message,
-                    "envoye" if ok else "echec")
+                    "envoye" if ok else "echec", twilio_sid=sid)
 
 
 def send_rappels_sms():
@@ -569,9 +599,9 @@ def send_rappels_sms():
             f"{date_str} à {heure} pour {prestation}. "
             f"En cas d'empêchement, appelez le {TELEPHONE_SALON}. À demain !"
         )
-        ok = send_sms(telephone, message)
+        ok, sid = send_sms(telephone, message)
         save_rappel_sms(rdv_id, client_id, telephone, message,
-                        "envoye" if ok else "echec")
+                        "envoye" if ok else "echec", twilio_sid=sid)
 
     print(f"✅  [RAPPELS] Traitement terminé ({len(rdvs)} RDV).")
 
