@@ -10,10 +10,12 @@ import json
 from fastapi import FastAPI, Form
 from fastapi.responses import FileResponse, PlainTextResponse
 from twilio.twiml.voice_response import VoiceResponse
+from twilio.rest import Client as TwilioClient
+from apscheduler.schedulers.background import BackgroundScheduler
 import openai
 import uuid
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
@@ -85,6 +87,15 @@ except Exception as e:
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN  = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_NUMBER      = os.getenv("TWILIO_NUMBER", "+16066497918")
+try:
+    twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+except Exception as _e:
+    print(f"⚠️  Twilio non initialisé : {_e}")
+    twilio_client = None
 
 # Salon actif pour la session en cours (résolu depuis twilio_number)
 _session_salon_id: str | None = None
@@ -357,8 +368,9 @@ def mettre_a_jour_nom_client(client_id: str, nom: str):
 
 def enregistrer_rdv(client_id, jour, heure, type_client,
                     prestation, coupe_detail, couleur_detail,
-                    duree_max, prix, avec_shampoing=False, salon_id=None):
-    """Enregistre un RDV dans Supabase et incrémente le compteur de visites."""
+                    duree_max, prix, avec_shampoing=False, salon_id=None,
+                    telephone=None, client_nom=None):
+    """Enregistre un RDV dans Supabase, incrémente nb_visites, envoie SMS de confirmation."""
     try:
         heure_fin = ajouter_minutes_hhmm(heure, duree_max)
         row = {
@@ -374,22 +386,35 @@ def enregistrer_rdv(client_id, jour, heure, type_client,
             "prix":           prix,
             "statut":         "confirme",
         }
-        # Note : la table rendez_vous n'a pas de colonne salon_id
-        # Le salon_id est résolu via _session_salon_id pour usage futur (sync Base44, etc.)
-        _ = salon_id or _session_salon_id  # conservé pour sync externe si besoin
-        supabase.table("rendez_vous").insert(row).execute()
+        result = supabase.table("rendez_vous").insert(row).execute()
+        rdv_id = result.data[0]["id"] if result.data else None
 
         if client_id:
-            client = supabase.table("clients")\
+            client_row = supabase.table("clients")\
                 .select("nb_visites")\
                 .eq("id", client_id)\
                 .execute().data
-            if client:
+            if client_row:
                 supabase.table("clients").update({
-                    "nb_visites": client[0]["nb_visites"] + 1
+                    "nb_visites": client_row[0]["nb_visites"] + 1
                 }).eq("id", client_id).execute()
+
+        # SMS de confirmation immédiat
+        if telephone and telephone not in ("console_test",):
+            send_sms_confirmation(
+                telephone=telephone,
+                client_nom=client_nom,
+                prestation=prestation,
+                jour=jour,
+                heure=heure,
+                rdv_id=rdv_id,
+                client_id=client_id,
+            )
+        return rdv_id
+
     except Exception as e:
         print(f"Erreur Supabase enregistrer_rdv: {e}")
+        return None
 
 def est_creneau_disponible(jour: str, heure: str) -> bool:
     """Vérifie la disponibilité d'un créneau dans Supabase."""
@@ -420,6 +445,144 @@ def get_rdv_client(client_id: str) -> list:
     except Exception as e:
         print(f"Erreur Supabase get_rdv_client: {e}")
         return []
+
+# ====================================================
+# TWILIO SMS — CONFIRMATION & RAPPELS
+# ====================================================
+
+NOMS_JOURS_SMS = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
+NOMS_MOIS_SMS  = ["janvier", "février", "mars", "avril", "mai", "juin",
+                   "juillet", "août", "septembre", "octobre", "novembre", "décembre"]
+
+def _format_date_sms(date_iso: str) -> str:
+    """Convertit '2026-04-25' en 'vendredi 25 avril'."""
+    try:
+        d = datetime.strptime(date_iso, "%Y-%m-%d").date()
+        return f"{NOMS_JOURS_SMS[d.weekday()]} {d.day} {NOMS_MOIS_SMS[d.month - 1]}"
+    except Exception:
+        return date_iso
+
+
+def send_sms(to: str, body: str) -> bool:
+    """Envoie un SMS via Twilio. Retourne True si succès."""
+    if not twilio_client:
+        print("⚠️  [SMS] Client Twilio non initialisé — SMS non envoyé.")
+        return False
+    try:
+        msg = twilio_client.messages.create(body=body, from_=TWILIO_NUMBER, to=to)
+        print(f"✅  [SMS] Envoyé à {to} — SID {msg.sid}")
+        return True
+    except Exception as e:
+        print(f"❌  [SMS] Erreur envoi à {to} : {e}")
+        return False
+
+
+def save_rappel_sms(rdv_id: str | None, client_id: str | None,
+                    telephone: str, message: str, statut: str):
+    """Enregistre une entrée dans la table rappels_sms."""
+    try:
+        supabase.table("rappels_sms").insert({
+            "rendez_vous_id": rdv_id,
+            "client_id":      client_id,
+            "telephone":      telephone,
+            "message":        message,
+            "statut":         statut,
+            "date_envoi":     datetime.utcnow().isoformat(),
+        }).execute()
+    except Exception as e:
+        print(f"⚠️  [SMS] Erreur enregistrement rappels_sms : {e}")
+
+
+def send_sms_confirmation(telephone: str, client_nom: str | None,
+                          prestation: str, jour: str, heure: str,
+                          rdv_id: str | None, client_id: str | None):
+    """Envoie le SMS de confirmation immédiatement après enregistrement du RDV."""
+    prenom = (client_nom or "").split()[0] if client_nom else "vous"
+    date_str = _format_date_sms(jour)
+    # Heure sans secondes
+    heure_str = heure[:5] if heure else heure
+    message = (
+        f"Bonjour {prenom} ! Votre RDV est confirmé au {NOM_SALON} : "
+        f"{prestation} le {date_str} à {heure_str}. "
+        f"Pour annuler, appelez le {TELEPHONE_SALON}. À bientôt !"
+    )
+    ok = send_sms(telephone, message)
+    save_rappel_sms(rdv_id, client_id, telephone, message,
+                    "envoye" if ok else "echec")
+
+
+def send_rappels_sms():
+    """
+    TÂCHE 2 — Lance les SMS de rappel J-24h.
+    Lit les RDV de demain, envoie un SMS à chaque client,
+    enregistre le résultat dans rappels_sms.
+    Appelée automatiquement à 10h chaque matin par APScheduler.
+    """
+    demain = (date.today() + timedelta(days=1)).isoformat()
+    print(f"📨  [RAPPELS] Envoi des rappels pour le {demain}...")
+
+    try:
+        rdvs = supabase.table("rendez_vous")\
+            .select("id, client_id, jour, heure_debut, prestation")\
+            .eq("jour", demain)\
+            .eq("statut", "confirme")\
+            .execute().data or []
+    except Exception as e:
+        print(f"❌  [RAPPELS] Impossible de lire les RDV : {e}")
+        return
+
+    if not rdvs:
+        print(f"ℹ️   [RAPPELS] Aucun RDV pour demain ({demain}).")
+        return
+
+    for rdv in rdvs:
+        rdv_id    = rdv.get("id")
+        client_id = rdv.get("client_id")
+        jour      = rdv.get("jour", demain)
+        heure     = (rdv.get("heure_debut") or "")[:5]
+        prestation = rdv.get("prestation", "rendez-vous")
+
+        # Récupérer le téléphone du client
+        try:
+            client_row = supabase.table("clients")\
+                .select("telephone, nom")\
+                .eq("id", client_id)\
+                .limit(1).execute().data
+        except Exception as e:
+            print(f"⚠️  [RAPPELS] Client {client_id} introuvable : {e}")
+            continue
+
+        if not client_row:
+            continue
+
+        telephone  = client_row[0].get("telephone", "")
+        client_nom = client_row[0].get("nom")
+
+        if not telephone or telephone in ("console_test",):
+            print(f"ℹ️   [RAPPELS] Téléphone invalide pour client {client_id}, ignoré.")
+            continue
+
+        prenom = (client_nom or "").split()[0] if client_nom else "vous"
+        date_str = _format_date_sms(jour)
+        message = (
+            f"Rappel : Votre RDV au {NOM_SALON} est demain "
+            f"{date_str} à {heure} pour {prestation}. "
+            f"En cas d'empêchement, appelez le {TELEPHONE_SALON}. À demain !"
+        )
+        ok = send_sms(telephone, message)
+        save_rappel_sms(rdv_id, client_id, telephone, message,
+                        "envoye" if ok else "echec")
+
+    print(f"✅  [RAPPELS] Traitement terminé ({len(rdvs)} RDV).")
+
+
+# ── Scheduler rappels SMS J-24h (10h00 chaque matin) ──────────────────────
+scheduler = BackgroundScheduler(timezone="Europe/Paris")
+scheduler.add_job(send_rappels_sms, "cron", hour=10, minute=0,
+                  id="rappels_sms_quotidiens", replace_existing=True)
+scheduler.start()
+print("🕙  [SCHEDULER] Rappels SMS planifiés chaque jour à 10h00 (Europe/Paris).")
+
 
 def annuler_rdv(client_id: str, rdv_id: str) -> bool:
     """Annule un RDV en le marquant comme 'annule'."""
@@ -762,9 +925,10 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
 
         # Récupérer/créer le client
         client = get_or_create_client(telephone)
-        client_id = client.get("id")
+        client_id  = client.get("id")
+        client_nom = client.get("nom")
 
-        # Enregistrer le RDV
+        # Enregistrer le RDV (déclenche SMS de confirmation)
         enregistrer_rdv(
             client_id=client_id,
             jour=jour,
@@ -775,7 +939,9 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
             couleur_detail=None,
             duree_max=45,
             prix=30,
-            avec_shampoing=False
+            avec_shampoing=False,
+            telephone=telephone,
+            client_nom=client_nom,
         )
         return f"RDV enregistré pour {jour} à {heure}."
 
