@@ -1,0 +1,1233 @@
+# ====================================================
+# AGENT IA COIFFEUR — VERSION GPT-4o OPTIMISÉE
+# Avec intégration Supabase + configuration multi-salon
+# BUG FIXES : tool calls, rigidité agent, dates relatives
+# ====================================================
+
+import os
+import unicodedata
+import json
+from fastapi import FastAPI, Form
+from fastapi.responses import FileResponse, PlainTextResponse
+from twilio.twiml.voice_response import VoiceResponse
+from twilio.rest import Client as TwilioClient
+from apscheduler.schedulers.background import BackgroundScheduler
+import openai
+import uuid
+import re
+from datetime import datetime, timedelta, date, timezone
+from dotenv import load_dotenv
+from supabase import create_client, Client
+
+dotenv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env.py")
+load_dotenv(dotenv_path=dotenv_path)
+
+# ====================================================
+# ⚙️ CONFIGURATION DU SALON — À PERSONNALISER
+# ====================================================
+NOM_SALON = "Chez les fdp du dégradé"          # À PERSONNALISER
+TELEPHONE_SALON = "01 23 45 67 89"               # À PERSONNALISER
+ADRESSE_SALON = "12 rue Exemple, 75001 Paris"    # À PERSONNALISER
+
+SITE_CLIENT = "https://www.monsite-coiffure.com" # À PERSONNALISER
+
+HORAIRE_OUVERTURE = "09:00"                      # À PERSONNALISER
+HORAIRE_FERMETURE = "18:00"                      # À PERSONNALISER
+JOURS_OUVERTS = ["mardi", "mercredi", "jeudi", "vendredi", "samedi"] # À PERSONNALISER
+
+COIFFEURS = [                                    # À PERSONNALISER
+    {"nom": "Sophie", "specialites": "coupe femme, couleur"},
+    {"nom": "Marc",   "specialites": "coupe homme, barbe"},
+]
+
+PRIX_HOMME_COUPE = {                             # À PERSONNALISER
+    "normale":    15,
+    "travaillee": 20,
+}
+
+PRIX_HOMME_COULEUR = {                           # À PERSONNALISER
+    "classique":         30,
+    "decoloration":      40,
+    "meches_balayage":   30,
+    "fantaisie":         30,
+    "patine_ton_sur_ton": 20,
+}
+
+PRIX_FEMME_COUPE = {                             # À PERSONNALISER
+    "brushing":       30,
+    "carre":          25,
+    "carré":          25,
+    "frange":         10,
+    "degrade":        40,
+    "pixie":          35,
+    "coupe_courte":   35,
+    "longs_naturels": 30,
+    "coupe":          30,
+}
+
+PRIX_FEMME_COULEUR = {                           # À PERSONNALISER
+    "balayage":    60,
+    "mèches":      60,
+    "ombré hair":  70,
+    "décoloration": 80,
+    "ton sur ton": 30,
+    "couleur":     30,
+}
+
+# ====================================================
+# CONFIG TECHNIQUE — NE PAS MODIFIER
+# ====================================================
+
+openai.api_key = os.getenv("API_KEY")
+try:
+    client_openai = openai.OpenAI(api_key=openai.api_key)
+except Exception as e:
+    print(f"⚠️  Erreur initialisation OpenAI: {e}")
+    client_openai = None
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+def _clean_env(key, default=""):
+    return os.getenv(key, default).strip().strip('"').replace('\n', '').replace('\r', '').replace(' ', '')
+
+TWILIO_ACCOUNT_SID = _clean_env("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN  = _clean_env("TWILIO_AUTH_TOKEN")
+TWILIO_NUMBER      = _clean_env("TWILIO_NUMBER") or "+16066497918"
+try:
+    twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    print(f"✅ Twilio initialisé — SID={TWILIO_ACCOUNT_SID[:8]}… token_len={len(TWILIO_AUTH_TOKEN)}")
+except Exception as _e:
+    print(f"⚠️  Twilio non initialisé : {_e}")
+    twilio_client = None
+
+# Salon actif pour la session en cours (résolu depuis twilio_number)
+_session_salon_id: str | None = None
+
+BASE_URL = "https://concealingly-highly-felica.ngrok-free.dev"
+
+# ====================================================
+# TRACKING DES COÛTS OPENAI
+# ====================================================
+PRIX_INPUT_PER_MILLION = 2.50   # USD par million tokens input (GPT-4o)
+PRIX_OUTPUT_PER_MILLION = 10.00  # USD par million tokens output (GPT-4o)
+TAUX_EUR_USD = 0.92             # Conversion USD to EUR
+
+# Variables de session (remises à zéro pour chaque appel)
+session_tokens_input = 0
+session_tokens_output = 0
+session_tokens_total = 0
+session_nb_echanges = 0
+session_cout_usd = 0.0
+session_cout_eur = 0.0
+
+def calculer_cout(tokens_input: int, tokens_output: int) -> tuple:
+    """Calcule le coût en USD et EUR."""
+    cout_input = (tokens_input / 1_000_000) * PRIX_INPUT_PER_MILLION
+    cout_output = (tokens_output / 1_000_000) * PRIX_OUTPUT_PER_MILLION
+    cout_usd = cout_input + cout_output
+    cout_eur = cout_usd * TAUX_EUR_USD
+    return round(cout_usd, 6), round(cout_eur, 6)
+
+def enregistrer_usage(salon_id: str = None, salon_nom: str = None,
+                      twilio_number: str = None, tokens_input: int = 0,
+                      tokens_output: int = 0, nb_echanges: int = 0,
+                      appel_abouti: bool = False):
+    """Enregistre l'usage OpenAI dans Supabase pour le reporting."""
+    if not twilio_number or tokens_input == 0 and tokens_output == 0:
+        return
+
+    cout_usd, cout_eur = calculer_cout(tokens_input, tokens_output)
+    mois = datetime.now().strftime("%Y-%m")
+
+    try:
+        supabase.table("usage_logs").insert({
+            "salon_id": salon_id,
+            "salon_nom": salon_nom or NOM_SALON,
+            "twilio_number": twilio_number,
+            "mois": mois,
+            "tokens_input": tokens_input,
+            "tokens_output": tokens_output,
+            "tokens_total": tokens_input + tokens_output,
+            "cout_usd": cout_usd,
+            "cout_eur": cout_eur,
+            "nb_echanges": nb_echanges,
+            "appel_abouti": appel_abouti,
+        }).execute()
+        print(f"📊 [USAGE] {tokens_input + tokens_output} tokens | "
+              f"€{cout_eur:.4f} | {nb_echanges} échanges")
+    except Exception as e:
+        print(f"⚠️  [USAGE ERROR] {e}")
+
+def rapport_mensuel(mois: str = None):
+    """Génère un rapport des coûts par salon pour le mois."""
+    if not mois:
+        mois = datetime.now().strftime("%Y-%m")
+
+    try:
+        result = supabase.table("usage_logs")\
+            .select("*")\
+            .eq("mois", mois)\
+            .execute()
+
+        logs = result.data or []
+        if not logs:
+            print(f"\n❌ Aucune donnée pour {mois}\n")
+            return {}
+
+        # Grouper par salon
+        salons = {}
+        for log in logs:
+            nom = log.get("salon_nom") or log.get("twilio_number") or "Unknown"
+            if nom not in salons:
+                salons[nom] = {
+                    "nb_appels": 0,
+                    "tokens_total": 0,
+                    "cout_eur": 0.0,
+                    "cout_usd": 0.0,
+                    "appels_aboutis": 0,
+                    "nb_echanges": 0,
+                }
+            salons[nom]["nb_appels"] += 1
+            salons[nom]["tokens_total"] += log.get("tokens_total", 0)
+            salons[nom]["cout_eur"] += float(log.get("cout_eur", 0))
+            salons[nom]["cout_usd"] += float(log.get("cout_usd", 0))
+            salons[nom]["appels_aboutis"] += 1 if log.get("appel_abouti") else 0
+            salons[nom]["nb_echanges"] += log.get("nb_echanges", 0)
+
+        # Affichage
+        print(f"\n{'='*60}")
+        print(f"📊 RAPPORT USAGE OPENAI — {mois}")
+        print(f"{'='*60}")
+        total_eur = 0.0
+        total_tokens = 0
+
+        for nom, data in sorted(salons.items()):
+            taux = (data["appels_aboutis"] / data["nb_appels"] * 100) if data["nb_appels"] > 0 else 0
+            print(f"\n🏢 SALON : {nom}")
+            print(f"   Appels         : {data['nb_appels']}")
+            print(f"   Aboutis        : {data['appels_aboutis']} ({taux:.0f}%)")
+            print(f"   Tokens         : {data['tokens_total']:,}")
+            print(f"   Échanges       : {data['nb_echanges']}")
+            print(f"   💰 Coût mois   : €{data['cout_eur']:.4f} (${data['cout_usd']:.4f})")
+            total_eur += data['cout_eur']
+            total_tokens += data['tokens_total']
+
+        print(f"\n{'='*60}")
+        print(f"💰 TOTAL OPENAI — {mois}")
+        print(f"   Tokens totaux  : {total_tokens:,}")
+        print(f"   Coût total     : €{total_eur:.4f}")
+        print(f"{'='*60}\n")
+
+        return salons
+
+    except Exception as e:
+        print(f"⚠️  [RAPPORT ERROR] {e}")
+        return {}
+
+app = FastAPI()
+END_CALL_MESSAGE = "Merci pour votre appel. Bonne journée et à bientôt au salon."
+
+MESSAGE_HORAIRES = f"Le salon est ouvert du mardi au samedi de {HORAIRE_OUVERTURE} à {HORAIRE_FERMETURE}."
+MESSAGE_PRIX_BASE = "Les tarifs commencent à partir de 15 euros selon la prestation."
+
+PRESTATIONS_DUREE_PLAGE = {
+    "homme": {
+        "coupe":        (20, 30),
+        "couleur":      (60, 90),
+        "coupe_couleur": (120, 140),
+    },
+    "femme": {
+        "coupe":        (30, 45),
+        "couleur":      (90, 120),
+        "coupe_couleur": (180, 180),
+    },
+}
+
+JOURS_FR = {
+    "lundi": 0, "mardi": 1, "mercredi": 2, "jeudi": 3,
+    "vendredi": 4, "samedi": 5, "dimanche": 6,
+}
+
+MOIS_FR = {
+    "janvier": 1, "fevrier": 2, "février": 2, "mars": 3,
+    "avril": 4, "mai": 5, "juin": 6, "juillet": 7,
+    "aout": 8, "août": 8, "septembre": 9, "octobre": 10,
+    "novembre": 11, "decembre": 12, "décembre": 12,
+}
+
+NOMS_JOURS = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
+NOMS_MOIS = [
+    "janvier", "février", "mars", "avril", "mai", "juin",
+    "juillet", "août", "septembre", "octobre", "novembre", "décembre",
+]
+
+# ====================================================
+# GESTION DES CONVERSATIONS (historique + contexte client)
+# ====================================================
+conversation_history = {}  # {phone: [{"role": "user/assistant/tool", "content": "..."}]}
+client_context = {}        # {phone: {"nom": "...", "client_id": "...", "prenom": "..."}}
+
+def get_conversation_history(telephone: str):
+    """Récupère l'historique de conversation pour ce numéro."""
+    if telephone not in conversation_history:
+        conversation_history[telephone] = []
+    return conversation_history[telephone]
+
+def add_to_history(telephone: str, role: str, content: str):
+    """Ajoute un message à l'historique."""
+    history = get_conversation_history(telephone)
+    history.append({"role": role, "content": content})
+
+def add_assistant_message_with_tools(telephone: str, content: str = None, tool_calls: list = None):
+    """Ajoute un message assistant avec tool_calls."""
+    history = get_conversation_history(telephone)
+    msg = {"role": "assistant"}
+    if content:
+        msg["content"] = content
+    else:
+        msg["content"] = None
+    if tool_calls:
+        msg["tool_calls"] = tool_calls
+    history.append(msg)
+
+def add_tool_result(telephone: str, tool_call_id: str, result: str):
+    """Ajoute le résultat d'un tool call."""
+    history = get_conversation_history(telephone)
+    history.append({
+        "role": "tool",
+        "tool_call_id": tool_call_id,
+        "content": result
+    })
+
+def get_client_context(telephone: str):
+    """Récupère le contexte client (nom, ID, etc)."""
+    if telephone not in client_context:
+        client_context[telephone] = {}
+    return client_context[telephone]
+
+def update_client_context(telephone: str, **kwargs):
+    """Met à jour le contexte client."""
+    ctx = get_client_context(telephone)
+    ctx.update(kwargs)
+
+def clean_messages(messages: list) -> list:
+    """
+    CORRECTION BUG 1 : Nettoie l'historique des messages orphelins
+    Supprime les messages 'tool' qui ne sont pas précédés
+    d'un message 'assistant' avec 'tool_calls'.
+    """
+    cleaned = []
+    for i, msg in enumerate(messages):
+        if msg.get('role') == 'tool':
+            # Vérifier que le message précédent est un assistant avec tool_calls
+            if cleaned and cleaned[-1].get('role') == 'assistant' and cleaned[-1].get('tool_calls'):
+                cleaned.append(msg)
+            # Sinon, ignorer ce message orphelin
+        else:
+            cleaned.append(msg)
+    return cleaned
+
+# ====================================================
+# SUPABASE — FONCTIONS CLIENT & RDV
+# ====================================================
+
+def get_or_create_client(telephone: str) -> dict:
+    """Cherche le client par son numéro. S'il existe → retourne sa fiche."""
+    try:
+        result = supabase.table("clients")\
+            .select("*")\
+            .eq("telephone", telephone)\
+            .execute()
+        if result.data:
+            return result.data[0]
+        nouveau = supabase.table("clients")\
+            .insert({"telephone": telephone})\
+            .execute()
+        return nouveau.data[0]
+    except Exception as e:
+        print(f"Erreur Supabase get_or_create_client: {e}")
+        return {"id": None, "telephone": telephone, "nom": None, "nb_visites": 0}
+
+def get_salon_by_twilio(twilio_number: str) -> dict | None:
+    """Identifie le salon via son numéro Twilio (table Salon, colonne twilio_number)."""
+    try:
+        result = supabase.table("salon").select("*")\
+            .eq("twilio_number", twilio_number).limit(1).execute()
+        return result.data[0] if result.data else None
+    except Exception as e:
+        print(f"Erreur get_salon_by_twilio: {e}")
+        return None
+
+
+def mettre_a_jour_nom_client(client_id: str, nom: str):
+    """Met à jour le nom du client dans Supabase."""
+    try:
+        supabase.table("clients")\
+            .update({"nom": nom})\
+            .eq("id", client_id)\
+            .execute()
+    except Exception as e:
+        print(f"Erreur Supabase mettre_a_jour_nom_client: {e}")
+
+def enregistrer_rdv(client_id, jour, heure, type_client,
+                    prestation, coupe_detail, couleur_detail,
+                    duree_max, prix, avec_shampoing=False, salon_id=None,
+                    telephone=None, client_nom=None):
+    """Enregistre un RDV dans Supabase, incrémente nb_visites, envoie SMS de confirmation."""
+    try:
+        heure_fin = ajouter_minutes_hhmm(heure, duree_max)
+        row = {
+            "client_id":      client_id,
+            "jour":           jour,
+            "heure_debut":    heure,
+            "heure_fin":      heure_fin,
+            "prestation":     prestation,
+            "type_client":    type_client,
+            "coupe_detail":   coupe_detail,
+            "couleur_detail": couleur_detail,
+            "avec_shampoing": avec_shampoing,
+            "prix":           prix,
+            "statut":         "confirme",
+        }
+        result = supabase.table("rendez_vous").insert(row).execute()
+        rdv_id = result.data[0]["id"] if result.data else None
+
+        # Écriture simultanée dans la table "appointment"
+        try:
+            salon_id_eff = salon_id or _session_salon_id
+            appt_row = {
+                "client_name":  client_nom or telephone or "Inconnu",
+                "client_phone": telephone or "",
+                "status":       "confirme",
+                "date":         jour,
+                "time":         heure + ":00" if len(heure) == 5 else heure,
+                "created_at":   datetime.now(timezone.utc).isoformat(),
+            }
+            if salon_id_eff:
+                appt_row["salon_id"] = salon_id_eff
+            appt_result = supabase.table("appointment").insert(appt_row).execute()
+            appt_id = appt_result.data[0]["id"] if appt_result.data else None
+            print(f"✅ [appointment] Ligne créée — id={appt_id}")
+        except Exception as e_appt:
+            print(f"⚠️  [appointment] Erreur insert : {e_appt}")
+
+        if client_id:
+            client_row = supabase.table("clients")\
+                .select("nb_visites")\
+                .eq("id", client_id)\
+                .execute().data
+            if client_row:
+                supabase.table("clients").update({
+                    "nb_visites": client_row[0]["nb_visites"] + 1
+                }).eq("id", client_id).execute()
+
+        # SMS de confirmation immédiat
+        if telephone and telephone not in ("console_test",):
+            send_sms_confirmation(
+                telephone=telephone,
+                client_nom=client_nom,
+                prestation=prestation,
+                jour=jour,
+                heure=heure,
+                rdv_id=rdv_id,
+                client_id=client_id,
+            )
+        return rdv_id
+
+    except Exception as e:
+        print(f"Erreur Supabase enregistrer_rdv: {e}")
+        return None
+
+def est_creneau_disponible(jour: str, heure: str) -> bool:
+    """Vérifie la disponibilité d'un créneau dans Supabase."""
+    try:
+        result = supabase.table("rendez_vous")\
+            .select("id")\
+            .eq("jour", jour)\
+            .eq("heure_debut", heure)\
+            .eq("statut", "confirme")\
+            .execute()
+        return len(result.data) == 0
+    except Exception as e:
+        print(f"Erreur Supabase est_creneau_disponible: {e}")
+        return True
+
+def get_rdv_client(client_id: str) -> list:
+    """Récupère les RDV à venir d'un client."""
+    try:
+        today = datetime.now().date().isoformat()
+        result = supabase.table("rendez_vous")\
+            .select("*")\
+            .eq("client_id", client_id)\
+            .eq("statut", "confirme")\
+            .gte("jour", today)\
+            .order("jour")\
+            .execute()
+        return result.data or []
+    except Exception as e:
+        print(f"Erreur Supabase get_rdv_client: {e}")
+        return []
+
+# ====================================================
+# TWILIO SMS — CONFIRMATION & RAPPELS
+# ====================================================
+
+NOMS_JOURS_SMS = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
+NOMS_MOIS_SMS  = ["janvier", "février", "mars", "avril", "mai", "juin",
+                   "juillet", "août", "septembre", "octobre", "novembre", "décembre"]
+
+def _format_date_sms(date_iso: str) -> str:
+    """Convertit '2026-04-25' en 'vendredi 25 avril'."""
+    try:
+        d = datetime.strptime(date_iso, "%Y-%m-%d").date()
+        return f"{NOMS_JOURS_SMS[d.weekday()]} {d.day} {NOMS_MOIS_SMS[d.month - 1]}"
+    except Exception:
+        return date_iso
+
+
+def send_sms(to: str, body: str) -> tuple[bool, str | None]:
+    """Envoie un SMS via Twilio. Retourne (succès, twilio_sid)."""
+    if not twilio_client:
+        print("⚠️  [SMS] Client Twilio non initialisé — SMS non envoyé.")
+        return False, None
+    if to == TWILIO_NUMBER:
+        print(f"⚠️  [SMS] Numéro destinataire identique au numéro Twilio ({to}) — ignoré.")
+        return False, None
+    if not to or not to.startswith("+") or len(to) < 8:
+        print(f"⚠️  [SMS] Numéro invalide : {to} — ignoré.")
+        return False, None
+    try:
+        msg = twilio_client.messages.create(body=body, from_=TWILIO_NUMBER, to=to)
+        print(f"✅  [SMS] Envoyé à {to} — SID {msg.sid}")
+        return True, msg.sid
+    except Exception as e:
+        print(f"❌  [SMS] Erreur envoi à {to} : {e}")
+        return False, None
+
+
+def save_rappel_sms(rdv_id: str | None, client_id: str | None,
+                    telephone: str, message: str, statut: str,
+                    twilio_sid: str | None = None):
+    """Enregistre une entrée dans la table rappels_sms.
+    Colonnes réelles : rdv_id, envoye_le, statut, message_texte, twilio_sid.
+    """
+    try:
+        row = {
+            "rdv_id":        rdv_id,
+            "statut":        statut,
+            "message_texte": message,
+            "envoye_le":     datetime.now(timezone.utc).isoformat(),
+        }
+        if twilio_sid:
+            row["twilio_sid"] = twilio_sid
+        supabase.table("rappels_sms").insert(row).execute()
+    except Exception as e:
+        print(f"⚠️  [SMS] Erreur enregistrement rappels_sms : {e}")
+
+
+def send_sms_confirmation(telephone: str, client_nom: str | None,
+                          prestation: str, jour: str, heure: str,
+                          rdv_id: str | None, client_id: str | None):
+    """Envoie le SMS de confirmation immédiatement après enregistrement du RDV."""
+    prenom = (client_nom or "").split()[0] if client_nom else "vous"
+    date_str = _format_date_sms(jour)
+    # Heure sans secondes
+    heure_str = heure[:5] if heure else heure
+    message = (
+        f"Bonjour {prenom} ! Votre RDV est confirmé au {NOM_SALON} : "
+        f"{prestation} le {date_str} à {heure_str}. "
+        f"Pour annuler, appelez le {TELEPHONE_SALON}. À bientôt !"
+    )
+    ok, sid = send_sms(telephone, message)
+    save_rappel_sms(rdv_id, client_id, telephone, message,
+                    "envoye" if ok else "echec", twilio_sid=sid)
+
+
+def send_rappels_sms():
+    """
+    TÂCHE 2 — Lance les SMS de rappel J-24h.
+    Lit les RDV de demain, envoie un SMS à chaque client,
+    enregistre le résultat dans rappels_sms.
+    Appelée automatiquement à 10h chaque matin par APScheduler.
+    """
+    demain = (date.today() + timedelta(days=1)).isoformat()
+    print(f"📨  [RAPPELS] Envoi des rappels pour le {demain}...")
+
+    try:
+        rdvs = supabase.table("rendez_vous")\
+            .select("id, client_id, jour, heure_debut, prestation")\
+            .eq("jour", demain)\
+            .eq("statut", "confirme")\
+            .execute().data or []
+    except Exception as e:
+        print(f"❌  [RAPPELS] Impossible de lire les RDV : {e}")
+        return
+
+    if not rdvs:
+        print(f"ℹ️   [RAPPELS] Aucun RDV pour demain ({demain}).")
+        return
+
+    for rdv in rdvs:
+        rdv_id    = rdv.get("id")
+        client_id = rdv.get("client_id")
+        jour      = rdv.get("jour", demain)
+        heure     = (rdv.get("heure_debut") or "")[:5]
+        prestation = rdv.get("prestation", "rendez-vous")
+
+        # Récupérer le téléphone du client
+        try:
+            client_row = supabase.table("clients")\
+                .select("telephone, nom")\
+                .eq("id", client_id)\
+                .limit(1).execute().data
+        except Exception as e:
+            print(f"⚠️  [RAPPELS] Client {client_id} introuvable : {e}")
+            continue
+
+        if not client_row:
+            continue
+
+        telephone  = client_row[0].get("telephone", "")
+        client_nom = client_row[0].get("nom")
+
+        if not telephone or telephone in ("console_test",):
+            print(f"ℹ️   [RAPPELS] Téléphone invalide pour client {client_id}, ignoré.")
+            continue
+
+        prenom = (client_nom or "").split()[0] if client_nom else "vous"
+        date_str = _format_date_sms(jour)
+        message = (
+            f"Rappel : Votre RDV au {NOM_SALON} est demain "
+            f"{date_str} à {heure} pour {prestation}. "
+            f"En cas d'empêchement, appelez le {TELEPHONE_SALON}. À demain !"
+        )
+        ok, sid = send_sms(telephone, message)
+        save_rappel_sms(rdv_id, client_id, telephone, message,
+                        "envoye" if ok else "echec", twilio_sid=sid)
+
+    print(f"✅  [RAPPELS] Traitement terminé ({len(rdvs)} RDV).")
+
+
+# ── Scheduler rappels SMS J-24h (10h00 chaque matin) ──────────────────────
+scheduler = BackgroundScheduler(timezone="Europe/Paris")
+scheduler.add_job(send_rappels_sms, "cron", hour=10, minute=0,
+                  id="rappels_sms_quotidiens", replace_existing=True)
+scheduler.start()
+print("🕙  [SCHEDULER] Rappels SMS planifiés chaque jour à 10h00 (Europe/Paris).")
+
+
+def annuler_rdv(client_id: str, rdv_id: str) -> bool:
+    """Annule un RDV en le marquant comme 'annule'."""
+    try:
+        supabase.table("rendez_vous")\
+            .update({"statut": "annule"})\
+            .eq("id", rdv_id)\
+            .eq("client_id", client_id)\
+            .execute()
+        return True
+    except Exception as e:
+        print(f"Erreur Supabase annuler_rdv: {e}")
+        return False
+
+def get_services(salon_id: str = None) -> list:
+    """Retourne la liste des services disponibles."""
+    return ["coupe homme", "coupe femme", "couleur", "brushing", "permanente", "mise en plis", "lissage", "soin"]
+
+# ====================================================
+# UTILITAIRE : Convertir texte → voix naturelle (mp3)
+# ====================================================
+def tts_voice(message):
+    """Convertit un message texte en voix MP3."""
+    audio_id = str(uuid.uuid4()) + ".mp3"
+    path = f"audio/{audio_id}"
+    os.makedirs("audio", exist_ok=True)
+    with open(path, "wb") as f:
+        try:
+            result = client_openai.audio.speech.create(
+                model="tts-1",
+                voice="alloy",
+                input=message,
+            )
+            audio_bytes = result.read() if hasattr(result, "read") else bytes(result)
+            f.write(audio_bytes)
+        except Exception as e:
+            print(f"Erreur TTS: {e}")
+    return path
+
+# ====================================================
+# UTILITAIRES : Texte, date, heure
+# ====================================================
+def normaliser_texte(texte):
+    texte = (texte or "").lower()
+    texte = unicodedata.normalize("NFD", texte)
+    texte = "".join(ch for ch in texte if unicodedata.category(ch) != "Mn")
+    return re.sub(r"\s+", " ", texte).strip()
+
+def date_du_jour():
+    return datetime.now().date()
+
+def format_date_longue(date_obj):
+    return f"{NOMS_JOURS[date_obj.weekday()]} {date_obj.day} {NOMS_MOIS[date_obj.month - 1]}"
+
+def parse_hhmm_en_minutes(hhmm):
+    heures, minutes = hhmm.split(":")
+    return int(heures) * 60 + int(minutes)
+
+def heure_valide_format(hhmm):
+    return bool(re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", hhmm or ""))
+
+def normaliser_heure(hhmm):
+    if not hhmm:
+        return None
+    if re.fullmatch(r"([01]?\d|2[0-3]):[0-5]\d", hhmm):
+        heures, minutes = hhmm.split(":")
+        return f"{int(heures):02d}:{minutes}"
+    return None
+
+def est_horaire_ouverture(hhmm):
+    if not heure_valide_format(hhmm):
+        return False
+    valeur = parse_hhmm_en_minutes(hhmm)
+    return parse_hhmm_en_minutes(HORAIRE_OUVERTURE) <= valeur <= parse_hhmm_en_minutes(HORAIRE_FERMETURE)
+
+def est_jour_ouvrable(date_iso):
+    try:
+        d = datetime.strptime(date_iso, "%Y-%m-%d").date()
+    except ValueError:
+        return False
+    return d.weekday() in [1, 2, 3, 4, 5]
+
+def ajouter_minutes_hhmm(hhmm, minutes):
+    heures, mins = hhmm.split(":")
+    total = int(heures) * 60 + int(mins) + minutes
+    total = total % (24 * 60)
+    return f"{total // 60:02d}:{total % 60:02d}"
+
+def format_plage_duree(duree_min, duree_max):
+    if duree_min == duree_max:
+        heures = duree_min // 60
+        minutes = duree_min % 60
+        if heures and minutes:
+            return f"{heures}h{minutes:02d}"
+        if heures:
+            return f"{heures}h"
+        return f"{minutes} min"
+    return f"{duree_min} - {duree_max} min"
+
+# ====================================================
+# OPTIMISATION 2 : Gestion intelligente des dates relatives
+# ====================================================
+def parse_date_relative(texte_date: str) -> str:
+    """
+    OPTIMISATION 2 : Convertit une date relative en format YYYY-MM-DD
+    - "demain" -> date de demain
+    - "apres-demain" ou "après-demain" -> +2 jours
+    - "mardi prochain" -> prochain mardi
+    - "ce week-end" -> samedi
+    - "en debut de semaine" -> mardi
+    - "le plus tot possible" -> premier jour ouvrable
+    """
+    aujourd_hui = datetime.now().date()
+    texte = normaliser_texte(texte_date)
+
+    # Demain
+    if "demain" in texte and "apres" not in texte and "après" not in texte:
+        return (aujourd_hui + timedelta(days=1)).isoformat()
+
+    # Après-demain
+    if "apres" in texte or "après" in texte:
+        if "demain" in texte:
+            return (aujourd_hui + timedelta(days=2)).isoformat()
+
+    # Jours de la semaine
+    for jour_fr, jour_num in JOURS_FR.items():
+        if jour_fr in texte:
+            # "prochain" ou "ce"
+            if "prochain" in texte or "ce " in texte:
+                # Trouver le prochain occurrence du jour
+                jours_a_ajouter = (jour_num - aujourd_hui.weekday()) % 7
+                if jours_a_ajouter == 0:
+                    jours_a_ajouter = 7  # Si c'est aujourd'hui, prendre la semaine prochaine
+                return (aujourd_hui + timedelta(days=jours_a_ajouter)).isoformat()
+            else:
+                # Première occurrence (même semaine si possible)
+                jours_a_ajouter = (jour_num - aujourd_hui.weekday()) % 7
+                if jours_a_ajouter == 0:
+                    jours_a_ajouter = 7
+                return (aujourd_hui + timedelta(days=jours_a_ajouter)).isoformat()
+
+    # Week-end
+    if "week" in texte or "fin de semaine" in texte:
+        # Samedi
+        jours_a_ajouter = (5 - aujourd_hui.weekday()) % 7
+        if jours_a_ajouter == 0:
+            jours_a_ajouter = 7
+        return (aujourd_hui + timedelta(days=jours_a_ajouter)).isoformat()
+
+    # Début de semaine
+    if "debut" in texte or "début" in texte:
+        # Mardi
+        jours_a_ajouter = (1 - aujourd_hui.weekday()) % 7
+        if jours_a_ajouter == 0:
+            jours_a_ajouter = 7
+        return (aujourd_hui + timedelta(days=jours_a_ajouter)).isoformat()
+
+    # Le plus tôt possible
+    if "tot" in texte or "tôt" in texte or "vite" in texte:
+        # Premier jour ouvrable
+        for i in range(1, 14):
+            date_candidate = aujourd_hui + timedelta(days=i)
+            if est_jour_ouvrable(date_candidate.isoformat()):
+                return date_candidate.isoformat()
+
+    # Si aucun match, retourner demain par défaut
+    return (aujourd_hui + timedelta(days=1)).isoformat()
+
+# ====================================================
+# PROMPT SYSTÈME AMÉLIORÉ
+# ====================================================
+def build_system_prompt(telephone: str = None) -> str:
+    """
+    OPTIMISATION 1 & 3 & 5 : Prompt système amélioré
+    - Inclus les règles absolues
+    - Gestion intelligente des infos
+    - Confirmation avant enregistrement
+    - Mémoire du client
+    """
+    aujourd_hui = datetime.now().date()
+    date_str = format_date_longue(aujourd_hui)
+
+    prompt = f"""Tu es une réceptionniste vocale professionnelle et chaleureuse du salon "{NOM_SALON}".
+
+📅 Nous sommes le {date_str}.
+🏢 Salon : {NOM_SALON}
+📞 Téléphone : {TELEPHONE_SALON}
+📍 Adresse : {ADRESSE_SALON}
+⏰ Horaires : {HORAIRE_OUVERTURE} à {HORAIRE_FERMETURE}, du mardi au samedi
+🕸️ Site : {SITE_CLIENT}
+
+RÈGLES ABSOLUES :
+1. Tu poses UNE SEULE question à la fois (très important)
+2. Tu extrais TOUTES les informations disponibles dans le message du client AVANT de poser des questions
+3. Si le client dit "coupe homme pour demain vers 14h", tu ne redemandes RIEN de tout ça
+4. Ordre des questions si manquantes : 1) Prestation, 2) Jour/heure, 3) Prénom (toujours en dernier)
+5. Tu acceptes les corrections sans te perdre
+6. Tu utilises le prénom du client dès qu'il te l'a donné
+7. Tu ne mentionnes JAMAIS que tu es une IA
+8. Tu ne raccroches que si le RDV est confirmé OU si le client dit au revoir explicitement
+9. Si un créneau n'est pas disponible, tu proposes AUTOMATIQUEMENT le suivant disponible
+10. Si le salon est fermé ce jour, tu dis pourquoi et tu proposes un autre jour
+11. Reste sous 2-3 phrases maximum par réponse
+
+COMPRÉHENSION DES DATES :
+- "vers 14h" = 14:00
+- "demain matin" = demain à 09:00 ou 10:00
+- "mardi prochain" = le prochain mardi
+- "en fin de semaine" = samedi
+- "le plus tôt possible" = premier créneau disponible
+
+FLOW DE PRISE DE RDV :
+1. Extraire : prestation, type (homme/femme si applicable), jour, heure
+2. Demander le PRÉNOM du client (toujours en dernier)
+3. CONFIRMER explicitement : "Parfait [Prénom] ! Je récapitule votre RDV :
+   - Prestation : [prestation]
+   - Date : [jour] [date] à [heure]
+   - Coiffeur : [coiffeur si connu]
+   Je confirme ?"
+4. Attendre "oui", "c'est bon", "parfait" ou similaire avant d'enregistrer
+5. Une fois enregistré : "Votre RDV est confirmé ! À bientôt !"
+
+GESTION DES CAS SPÉCIAUX :
+- Annulation : demander confirmation avant d'annuler
+- Modification : annuler l'ancien + créer le nouveau
+- Demande de prix : donner les prix, puis proposer un RDV
+- Salon fermé : proposer un autre jour immédiatement
+
+MÉMOIRE DU CLIENT :
+"""
+
+    # Ajouter les infos du client si connu
+    if telephone:
+        ctx = get_client_context(telephone)
+        if ctx.get("nom") or ctx.get("prenom"):
+            prenom = ctx.get("prenom") or ctx.get("nom", "").split()[0]
+            prompt += f"- Ce client s'appelle {prenom}\n"
+            rdvs = get_rdv_client(ctx.get("client_id")) if ctx.get("client_id") else []
+            if rdvs:
+                dernier_rdv = rdvs[-1] if rdvs else None
+                if dernier_rdv:
+                    prompt += f"- Dernière visite : {dernier_rdv.get('jour')} pour {dernier_rdv.get('prestation')}\n"
+            prompt += f"Accueille-le chaleureusement par son prénom.\n"
+
+    return prompt
+
+# ====================================================
+# FONCTIONS POUR GPT-4o (function calling)
+# ====================================================
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "prendre_rdv",
+            "description": "Enregistre un rendez-vous pour le client",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "jour": {"type": "string", "description": "Date au format YYYY-MM-DD (ex: 2026-04-20)"},
+                    "heure": {"type": "string", "description": "Heure au format HH:MM (ex: 14:00)"},
+                    "prestation": {"type": "string", "description": "Type de prestation (coupe, couleur, coupe_couleur, etc)"},
+                    "type_client": {"type": "string", "description": "homme ou femme"},
+                    "coiffeur": {"type": "string", "description": "Nom du coiffeur (optionnel)"},
+                },
+                "required": ["jour", "heure", "prestation", "type_client"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "verifier_disponibilite",
+            "description": "Vérifie si un créneau est disponible",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "jour": {"type": "string", "description": "Date au format YYYY-MM-DD"},
+                    "heure": {"type": "string", "description": "Heure au format HH:MM"},
+                },
+                "required": ["jour", "heure"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "annuler_rdv",
+            "description": "Annule un rendez-vous existant",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "client_id": {"type": "string", "description": "ID du client"},
+                    "rdv_id": {"type": "string", "description": "ID du rendez-vous à annuler"},
+                },
+                "required": ["client_id", "rdv_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_services",
+            "description": "Retourne la liste des services disponibles",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "salon_id": {"type": "string", "description": "ID du salon (optionnel)"},
+                },
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_client_info",
+            "description": "Récupère les informations du client",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "telephone": {"type": "string", "description": "Numéro de téléphone du client"},
+                },
+                "required": ["telephone"]
+            }
+        }
+    },
+]
+
+def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
+    """Exécute une fonction appelée par GPT-4o et retourne le résultat."""
+
+    if tool_name == "prendre_rdv":
+        jour = tool_input.get("jour")
+        heure = tool_input.get("heure")
+        prestation = tool_input.get("prestation", "coupe")
+        type_client = tool_input.get("type_client", "homme")
+
+        # Vérifier la disponibilité
+        if not est_creneau_disponible(jour, heure):
+            return f"Créneau indisponible. Merci de vérifier."
+
+        # Récupérer/créer le client
+        client = get_or_create_client(telephone)
+        client_id  = client.get("id")
+        client_nom = client.get("nom")
+
+        # Enregistrer le RDV (déclenche SMS de confirmation)
+        enregistrer_rdv(
+            client_id=client_id,
+            jour=jour,
+            heure=heure,
+            type_client=type_client,
+            prestation=prestation,
+            coupe_detail=None,
+            couleur_detail=None,
+            duree_max=45,
+            prix=30,
+            avec_shampoing=False,
+            telephone=telephone,
+            client_nom=client_nom,
+        )
+        return f"RDV enregistré pour {jour} à {heure}."
+
+    elif tool_name == "verifier_disponibilite":
+        jour = tool_input.get("jour")
+        heure = tool_input.get("heure")
+        disponible = est_creneau_disponible(jour, heure)
+        return f"Disponibilité : {'libre' if disponible else 'occupé'}"
+
+    elif tool_name == "annuler_rdv":
+        client_id = tool_input.get("client_id")
+        rdv_id = tool_input.get("rdv_id")
+        if annuler_rdv(client_id, rdv_id):
+            return "RDV annulé avec succès."
+        return "Erreur lors de l'annulation."
+
+    elif tool_name == "get_services":
+        services = get_services()
+        return f"Services : {', '.join(services)}"
+
+    elif tool_name == "get_client_info":
+        client = get_or_create_client(telephone)
+        if client.get("nom"):
+            update_client_context(telephone, prenom=client.get("nom").split()[0], client_id=client.get("id"))
+        return f"Client trouvé : {client.get('nom', 'Nouveau client')}"
+
+    return "Fonction inconnue."
+
+# ====================================================
+# AGENT PRINCIPAL AVEC GPT-4o OPTIMISÉ
+# ====================================================
+def run_agent(message_user: str, telephone: str) -> str:
+    """
+    Exécute l'agent GPT-4o avec function calling (OPTIMISÉ)
+    ÉTAPE 2 : Track des tokens OpenAI pour le reporting des coûts
+    """
+    global session_tokens_input, session_tokens_output, session_tokens_total
+    global session_nb_echanges, session_cout_usd, session_cout_eur
+
+    if not client_openai:
+        return "⚠️ Erreur: API OpenAI non configurée. Vérifiez votre clé API."
+
+    # Ajouter le message utilisateur à l'historique
+    add_to_history(telephone, "user", message_user)
+
+    # Préparer les messages avec le system prompt en premier
+    messages = [{"role": "system", "content": build_system_prompt(telephone)}] + get_conversation_history(telephone)
+
+    # CORRECTION BUG 1 : Nettoyer l'historique des messages orphelins
+    messages = clean_messages(messages)
+
+    # Appeler GPT-4o avec function calling
+    try:
+        response = client_openai.chat.completions.create(
+            model="gpt-4o",
+            messages=messages,
+            tools=TOOLS,
+            tool_choice="auto",
+            temperature=0.7,
+            max_tokens=500,
+        )
+        # ÉTAPE 2 : Récupérer et accumuler les tokens
+        session_tokens_input += response.usage.prompt_tokens
+        session_tokens_output += response.usage.completion_tokens
+        session_tokens_total += response.usage.total_tokens
+        session_nb_echanges += 1
+
+    except Exception as e:
+        print(f"Erreur GPT-4o: {e}")
+        return "Désolé, une erreur s'est produite. Pouvez-vous répéter?"
+
+    # Traiter la réponse
+    choice = response.choices[0]
+
+    # Si GPT-4o veut appeler une fonction
+    if choice.message.tool_calls:
+        # Ajouter le message assistant avec tool_calls
+        tool_calls_data = []
+        for tc in choice.message.tool_calls:
+            tool_calls_data.append({
+                "id": tc.id,
+                "type": "function",
+                "function": {
+                    "name": tc.function.name,
+                    "arguments": tc.function.arguments
+                }
+            })
+        add_assistant_message_with_tools(telephone, content=None, tool_calls=tool_calls_data)
+
+        # Exécuter les appels de fonction et ajouter les résultats
+        for tool_call in choice.message.tool_calls:
+            tool_name = tool_call.function.name
+            tool_input = json.loads(tool_call.function.arguments)
+            tool_result = process_tool_call(tool_name, tool_input, telephone)
+
+            # Ajouter le résultat avec le tool_call_id
+            add_tool_result(telephone, tool_call.id, tool_result)
+
+        # Relancer GPT-4o avec le résultat des fonctions
+        messages = [{"role": "system", "content": build_system_prompt(telephone)}] + get_conversation_history(telephone)
+        messages = clean_messages(messages)
+
+        try:
+            response = client_openai.chat.completions.create(
+                model="gpt-4o",
+                messages=messages,
+                temperature=0.7,
+                max_tokens=500,
+            )
+            # ÉTAPE 2 : Récupérer et accumuler les tokens du deuxième appel
+            session_tokens_input += response.usage.prompt_tokens
+            session_tokens_output += response.usage.completion_tokens
+            session_tokens_total += response.usage.total_tokens
+            session_nb_echanges += 1
+
+        except Exception as e:
+            print(f"Erreur GPT-4o (retry): {e}")
+            return "Désolé, une erreur s'est produite. Pouvez-vous répéter?"
+
+        choice = response.choices[0]
+
+    # Extraire la réponse texte
+    response_text = choice.message.content
+
+    # Ajouter la réponse à l'historique
+    add_to_history(telephone, "assistant", response_text)
+
+    return response_text
+
+# ====================================================
+# ENDPOINTS RACINE
+# ====================================================
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "Barbershop Agent S&B"}
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+# ====================================================
+# ENDPOINT PRINCIPAL
+# ====================================================
+@app.post("/appel", response_class=PlainTextResponse)
+def handle_sms(From: str = Form(...), Body: str = Form(...)):
+    """Endpoint unique qui traite tous les appels/SMS."""
+    telephone = From.replace("+", "").replace(" ", "")
+    message = Body.strip()
+
+    # Exécuter l'agent
+    response = run_agent(message, telephone)
+
+    # Générer la voix
+    audio_path = tts_voice(response)
+
+    # Créer la réponse Twilio
+    twiml = VoiceResponse()
+    twiml.play(f"{BASE_URL}/audio/{audio_path.split('/')[-1]}")
+    twiml.gather(
+        num_digits=1,
+        action="/appel",
+        method="POST",
+        timeout=10,
+    )
+
+    return str(twiml)
+
+# ====================================================
+# ENDPOINT POUR SERVIR LES FICHIERS AUDIO
+# ====================================================
+@app.get("/audio/{filename}")
+def get_audio(filename: str):
+    """Retourne le fichier audio MP3."""
+    path = f"audio/{filename}"
+    if os.path.exists(path):
+        return FileResponse(path, media_type="audio/mpeg")
+    return {"error": "Fichier non trouvé"}
+
+# ====================================================
+# MODE CONSOLE POUR TESTER
+# ====================================================
+if __name__ == "__main__":
+    print("\n" + "="*70)
+    print("🎤 AGENT BARBERSHOP OPTIMISÉ — MODE CONSOLE")
+    print("="*70)
+    print(f"Salon: {NOM_SALON}")
+    print(f"Horaires: {HORAIRE_OUVERTURE} - {HORAIRE_FERMETURE}")
+    print(f"Jours: {', '.join(JOURS_OUVERTS)}")
+    print("\nTape 'quit' pour quitter\n")
+    print("="*70 + "\n")
+
+    # Numéro de test — doit correspondre à twilio_number dans la table Salon
+    test_phone = "+16066497918"
+    # Note: _session_salon_id est défini au niveau du module
+    try:
+        salon = get_salon_by_twilio(test_phone)
+    except Exception as e:
+        print(f"⚠️  Erreur get_salon_by_twilio: {e}")
+        salon = None
+    if salon:
+        _session_salon_id = salon.get("id")
+        print(f"✅ Salon identifié : {salon.get('nom', salon.get('name', _session_salon_id))} (id={_session_salon_id})")
+    else:
+        _session_salon_id = None
+        print(f"⚠️  Aucun salon trouvé pour {test_phone} — le salon_id ne sera pas enregistré dans les RDV.")
+
+    while True:
+        user_input = input("👤 Vous: ").strip()
+
+        # ÉTAPE 6 : Commandes spéciales pour le tracking
+        if user_input.lower() == "quit":
+            # Enregistrer l'usage avant de quitter
+            if session_tokens_total > 0:
+                cout_usd, cout_eur = calculer_cout(session_tokens_input, session_tokens_output)
+                enregistrer_usage(
+                    salon_id=_session_salon_id,
+                    salon_nom=NOM_SALON,
+                    twilio_number=test_phone,
+                    tokens_input=session_tokens_input,
+                    tokens_output=session_tokens_output,
+                    nb_echanges=session_nb_echanges,
+                    appel_abouti=session_nb_echanges > 0
+                )
+            print("\n👋 Au revoir!")
+            break
+
+        elif user_input.lower() == "cout":
+            # Afficher le coût de la session actuelle
+            cout_usd, cout_eur = calculer_cout(session_tokens_input, session_tokens_output)
+            print(f"\n💰 COÛT SESSION ACTUELLE")
+            print(f"   Tokens input  : {session_tokens_input}")
+            print(f"   Tokens output : {session_tokens_output}")
+            print(f"   Tokens total  : {session_tokens_total}")
+            print(f"   Coût USD      : ${cout_usd:.6f}")
+            print(f"   Coût EUR      : €{cout_eur:.6f}")
+            print(f"   Échanges      : {session_nb_echanges}\n")
+            continue
+
+        elif user_input.lower() == "rapport":
+            # Afficher le rapport du mois en cours
+            rapport_mensuel()
+            continue
+
+        elif user_input.lower().startswith("rapport "):
+            # Afficher le rapport d'un mois spécifique
+            mois = user_input.split(" ", 1)[1].strip()
+            rapport_mensuel(mois)
+            continue
+
+        if not user_input:
+            continue
+
+        # Exécuter l'agent
+        response = run_agent(user_input, test_phone)
+        print(f"🤖 Agent: {response}\n")
