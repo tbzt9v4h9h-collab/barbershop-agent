@@ -89,11 +89,15 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH_TOKEN  = os.getenv("TWILIO_AUTH_TOKEN")
-TWILIO_NUMBER      = os.getenv("TWILIO_NUMBER", "+16066497918")
+def _clean_env(key, default=""):
+    return os.getenv(key, default).strip().strip('"').replace('\n', '').replace('\r', '').replace(' ', '')
+
+TWILIO_ACCOUNT_SID = _clean_env("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN  = _clean_env("TWILIO_AUTH_TOKEN")
+TWILIO_NUMBER      = _clean_env("TWILIO_NUMBER") or "+16066497918"
 try:
     twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    print(f"✅ Twilio initialisé — SID={TWILIO_ACCOUNT_SID[:8]}… token_len={len(TWILIO_AUTH_TOKEN)}")
 except Exception as _e:
     print(f"⚠️  Twilio non initialisé : {_e}")
     twilio_client = None
@@ -1100,6 +1104,17 @@ def run_agent(message_user: str, telephone: str) -> str:
     add_to_history(telephone, "assistant", response_text)
 
     return response_text
+
+# ====================================================
+# ENDPOINTS RACINE
+# ====================================================
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "Barbershop Agent S&B"}
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
 # ====================================================
 # ENDPOINT PRINCIPAL
