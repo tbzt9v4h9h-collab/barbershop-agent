@@ -831,6 +831,7 @@ def build_system_prompt(telephone: str = None) -> str:
 
 RÈGLES ABSOLUES :
 0. Tu réponds TOUJOURS en français, peu importe la langue du message reçu. Ne jamais répondre en anglais.
+0b. Dès que le client donne son prénom, appelle IMMÉDIATEMENT get_client_info avec son numéro de téléphone pour enregistrer le contexte, avant même de continuer la conversation.
 1. Tu poses UNE SEULE question à la fois (très important)
 2. Tu extrais TOUTES les informations disponibles dans le message du client AVANT de poser des questions
 3. Si le client dit "coupe homme pour demain vers 14h", tu ne redemandes RIEN de tout ça
@@ -999,11 +1000,15 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
         client_id  = client.get("id")
         client_nom = client.get("nom")
 
-        # Sauvegarder le nom si fourni dans tool_input et pas encore en base
+        # Sauvegarder le nom depuis le contexte session si absent en base
+        if not client_nom:
+            ctx = get_client_context(telephone)
+            client_nom = ctx.get("prenom") or ctx.get("nom")
         nom_fourni = tool_input.get("client_nom") or tool_input.get("prenom")
-        if nom_fourni and client_id and not client_nom:
-            mettre_a_jour_nom_client(client_id, nom_fourni)
+        if nom_fourni and not client_nom:
             client_nom = nom_fourni
+        if client_nom and client_id:
+            mettre_a_jour_nom_client(client_id, client_nom)
 
         # Enregistrer le RDV (déclenche SMS de confirmation)
         enregistrer_rdv(
@@ -1041,10 +1046,16 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
 
     elif tool_name == "get_client_info":
         client = get_or_create_client(telephone)
-        if client.get("nom"):
-            update_client_context(telephone, prenom=client.get("nom").split()[0], client_id=client.get("id"))
-            return f"Client trouvé : {client.get('nom')}"
-        # Pas de nom trouvé par téléphone — signaler pour que l'agent puisse demander
+        client_id = client.get("id")
+        client_nom = client.get("nom", "")
+        update_client_context(
+            telephone,
+            prenom=client_nom.split()[0] if client_nom else None,
+            client_id=client_id,
+            nom=client_nom or None,
+        )
+        if client_nom:
+            return f"Client trouvé : {client_nom}"
         return "Client nouveau ou sans nom enregistré."
 
     elif tool_name == "rechercher_client_par_nom":
@@ -1055,8 +1066,14 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
             result = supabase.table("clients").select("*").ilike("nom", f"%{nom}%").execute()
             if result.data:
                 c = result.data[0]
-                update_client_context(telephone, prenom=c.get("nom", "").split()[0], client_id=c.get("id"))
-                return f"Client trouvé par nom : {c.get('nom')} — tél : {c.get('telephone', 'inconnu')}"
+                c_nom = c.get("nom", "")
+                update_client_context(
+                    telephone,
+                    prenom=c_nom.split()[0] if c_nom else None,
+                    client_id=c.get("id"),
+                    nom=c_nom or None,
+                )
+                return f"Client trouvé par nom : {c_nom} — tél : {c.get('telephone', 'inconnu')}"
             return f"Aucun client nommé '{nom}' trouvé."
         except Exception as e:
             return f"Erreur recherche client : {e}"
