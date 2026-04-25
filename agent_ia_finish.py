@@ -20,6 +20,7 @@ from dotenv import load_dotenv
 from supabase import create_client, Client
 
 load_dotenv()
+print("🔵 [BOOT 1/8] load_dotenv OK")
 
 # ====================================================
 # ⚙️ CONFIGURATION DU SALON — À PERSONNALISER
@@ -77,17 +78,21 @@ PRIX_FEMME_COULEUR = {                           # À PERSONNALISER
 # CONFIG TECHNIQUE — NE PAS MODIFIER
 # ====================================================
 
+print("🔵 [BOOT 2/8] Initialisation OpenAI…")
 openai.api_key = os.getenv("API_KEY")
 try:
     client_openai = openai.OpenAI(api_key=openai.api_key)
+    print("🔵 [BOOT 2/8] OpenAI OK")
 except Exception as e:
     print(f"⚠️  Erreur initialisation OpenAI: {e}")
     client_openai = None
 
+print("🔵 [BOOT 3/8] Initialisation Supabase…")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 try:
     supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    print("🔵 [BOOT 3/8] Supabase OK")
 except Exception as _e_sb:
     print(f"⚠️  Supabase non initialisé : {_e_sb}")
     supabase = None
@@ -95,12 +100,13 @@ except Exception as _e_sb:
 def _clean_env(key, default=""):
     return os.getenv(key, default).strip().strip('"').replace('\n', '').replace('\r', '').replace(' ', '')
 
+print("🔵 [BOOT 4/8] Initialisation Twilio…")
 TWILIO_ACCOUNT_SID = _clean_env("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN  = _clean_env("TWILIO_AUTH_TOKEN")
 TWILIO_NUMBER      = _clean_env("TWILIO_NUMBER") or "+16066497918"
 try:
     twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-    print(f"✅ Twilio initialisé — SID={TWILIO_ACCOUNT_SID[:8]}… token_len={len(TWILIO_AUTH_TOKEN)}")
+    print(f"🔵 [BOOT 4/8] Twilio OK — SID={TWILIO_ACCOUNT_SID[:8]}… token_len={len(TWILIO_AUTH_TOKEN)}")
 except Exception as _e:
     print(f"⚠️  Twilio non initialisé : {_e}")
     twilio_client = None
@@ -110,7 +116,9 @@ _session_salon_id: str | None = None
 
 BASE_URL = "https://barbershop-agent.onrender.com"
 
+print("🔵 [BOOT 5/8] Création dossier audio…")
 os.makedirs("audio", exist_ok=True)
+print("🔵 [BOOT 5/8] Dossier audio OK")
 
 # ====================================================
 # TRACKING DES COÛTS OPENAI
@@ -231,7 +239,9 @@ def rapport_mensuel(mois: str = None):
         print(f"⚠️  [RAPPORT ERROR] {e}")
         return {}
 
+print("🔵 [BOOT 6/8] Création application FastAPI…")
 app = FastAPI()
+print("🔵 [BOOT 6/8] FastAPI OK")
 END_CALL_MESSAGE = "Merci pour votre appel. Bonne journée et à bientôt au salon."
 
 MESSAGE_HORAIRES = f"Le salon est ouvert du mardi au samedi de {HORAIRE_OUVERTURE} à {HORAIRE_FERMETURE}."
@@ -616,14 +626,17 @@ def send_rappels_sms():
 
 
 # ── Scheduler rappels SMS J-24h (10h00 chaque matin) ──────────────────────
+print("🔵 [BOOT 7/8] Démarrage APScheduler…")
 try:
     scheduler = BackgroundScheduler(timezone="Europe/Paris")
     scheduler.add_job(send_rappels_sms, "cron", hour=10, minute=0,
                       id="rappels_sms_quotidiens", replace_existing=True)
     scheduler.start()
-    print("🕙  [SCHEDULER] Rappels SMS planifiés chaque jour à 10h00 (Europe/Paris).")
+    print("🔵 [BOOT 7/8] Scheduler OK — rappels 10h00 Europe/Paris")
 except Exception as _e_sched:
-    print(f"⚠️  Scheduler non démarré : {_e_sched}")
+    print(f"⚠️  [BOOT 7/8] Scheduler non démarré : {_e_sched}")
+
+print("🟢 [BOOT 8/8] Module chargé — uvicorn prêt à écouter sur $PORT")
 
 
 def annuler_rdv(client_id: str, rdv_id: str) -> bool:
