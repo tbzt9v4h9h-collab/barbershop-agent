@@ -19,8 +19,7 @@ from datetime import datetime, timedelta, date, timezone
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
-dotenv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env.py")
-load_dotenv(dotenv_path=dotenv_path)
+load_dotenv()
 
 # ====================================================
 # ⚙️ CONFIGURATION DU SALON — À PERSONNALISER
@@ -85,9 +84,13 @@ except Exception as e:
     print(f"⚠️  Erreur initialisation OpenAI: {e}")
     client_openai = None
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+try:
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+except Exception as _e_sb:
+    print(f"⚠️  Supabase non initialisé : {_e_sb}")
+    supabase = None
 
 def _clean_env(key, default=""):
     return os.getenv(key, default).strip().strip('"').replace('\n', '').replace('\r', '').replace(' ', '')
@@ -106,6 +109,8 @@ except Exception as _e:
 _session_salon_id: str | None = None
 
 BASE_URL = "https://barbershop-agent.onrender.com"
+
+os.makedirs("audio", exist_ok=True)
 
 # ====================================================
 # TRACKING DES COÛTS OPENAI
