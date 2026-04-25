@@ -105,7 +105,7 @@ except Exception as _e:
 # Salon actif pour la session en cours (résolu depuis twilio_number)
 _session_salon_id: str | None = None
 
-BASE_URL = "https://concealingly-highly-felica.ngrok-free.dev"
+BASE_URL = "https://barbershop-agent.onrender.com"
 
 # ====================================================
 # TRACKING DES COÛTS OPENAI
@@ -1120,26 +1120,46 @@ def health():
 # ENDPOINT PRINCIPAL
 # ====================================================
 @app.post("/appel", response_class=PlainTextResponse)
-def handle_sms(From: str = Form(...), Body: str = Form(...)):
-    """Endpoint unique qui traite tous les appels/SMS."""
-    telephone = From.replace("+", "").replace(" ", "")
-    message = Body.strip()
-
-    # Exécuter l'agent
-    response = run_agent(message, telephone)
-
-    # Générer la voix
-    audio_path = tts_voice(response)
-
-    # Créer la réponse Twilio
+def handle_appel(
+    From: str = Form(default=""),
+    Called: str = Form(default=""),
+    SpeechResult: str = Form(default=""),
+):
     twiml = VoiceResponse()
-    twiml.play(f"{BASE_URL}/audio/{audio_path.split('/')[-1]}")
-    twiml.gather(
-        num_digits=1,
+
+    if not SpeechResult:
+        gather = twiml.gather(
+            input="speech",
+            action="/appel",
+            method="POST",
+            language="fr-FR",
+            speech_timeout="auto",
+            timeout=5,
+        )
+        gather.say(
+            "Bonjour, bienvenue au salon. Comment puis-je vous aider ?",
+            language="fr-FR",
+        )
+        return str(twiml)
+
+    telephone = From or Called
+    response_text = run_agent(SpeechResult, telephone)
+
+    audio_path = tts_voice(response_text)
+    filename = audio_path.split("/")[-1]
+
+    gather = twiml.gather(
+        input="speech",
         action="/appel",
         method="POST",
-        timeout=10,
+        language="fr-FR",
+        speech_timeout="auto",
+        timeout=8,
     )
+    gather.play(f"{BASE_URL}/audio/{filename}")
+
+    twiml.say("Merci pour votre appel. À bientôt !", language="fr-FR")
+    twiml.hangup()
 
     return str(twiml)
 
