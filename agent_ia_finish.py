@@ -26,7 +26,7 @@ print("🔵 [BOOT 1/8] load_dotenv OK")
 # ⚙️ CONFIGURATION DU SALON — À PERSONNALISER
 # ====================================================
 NOM_SALON = "Chez les fdp du dégradé"          # À PERSONNALISER
-TELEPHONE_SALON = "01 23 45 67 89"               # À PERSONNALISER
+TELEPHONE_SALON = "+33939245880"                  # À PERSONNALISER
 ADRESSE_SALON = "12 rue Exemple, 75001 Paris"    # À PERSONNALISER
 
 SITE_CLIENT = "https://www.monsite-coiffure.com" # À PERSONNALISER
@@ -668,7 +668,7 @@ def tts_voice(message):
         try:
             result = client_openai.audio.speech.create(
                 model="tts-1",
-                voice="nova",
+                voice="shimmer",
                 input=message,
             )
             audio_bytes = result.read() if hasattr(result, "read") else bytes(result)
@@ -841,6 +841,7 @@ RÈGLES ABSOLUES :
 9. Si un créneau n'est pas disponible, tu proposes AUTOMATIQUEMENT le suivant disponible
 10. Si le salon est fermé ce jour, tu dis pourquoi et tu proposes un autre jour
 11. Reste sous 2-3 phrases maximum par réponse
+12. Dès que le client donne son prénom, appelle immédiatement get_client_info pour vérifier s'il existe déjà, puis utilise rechercher_client_par_nom si aucun nom n'est trouvé par téléphone
 
 COMPRÉHENSION DES DATES :
 - "vers 14h" = 14:00
@@ -953,13 +954,27 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "get_client_info",
-            "description": "Récupère les informations du client",
+            "description": "Récupère les informations du client par téléphone",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "telephone": {"type": "string", "description": "Numéro de téléphone du client"},
                 },
                 "required": ["telephone"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "rechercher_client_par_nom",
+            "description": "Recherche un client par son prénom ou nom dans la base de données",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "nom": {"type": "string", "description": "Prénom ou nom du client à rechercher"},
+                },
+                "required": ["nom"]
             }
         }
     },
@@ -982,6 +997,12 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
         client = get_or_create_client(telephone)
         client_id  = client.get("id")
         client_nom = client.get("nom")
+
+        # Sauvegarder le nom si fourni dans tool_input et pas encore en base
+        nom_fourni = tool_input.get("client_nom") or tool_input.get("prenom")
+        if nom_fourni and client_id and not client_nom:
+            mettre_a_jour_nom_client(client_id, nom_fourni)
+            client_nom = nom_fourni
 
         # Enregistrer le RDV (déclenche SMS de confirmation)
         enregistrer_rdv(
@@ -1021,7 +1042,23 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
         client = get_or_create_client(telephone)
         if client.get("nom"):
             update_client_context(telephone, prenom=client.get("nom").split()[0], client_id=client.get("id"))
-        return f"Client trouvé : {client.get('nom', 'Nouveau client')}"
+            return f"Client trouvé : {client.get('nom')}"
+        # Pas de nom trouvé par téléphone — signaler pour que l'agent puisse demander
+        return "Client nouveau ou sans nom enregistré."
+
+    elif tool_name == "rechercher_client_par_nom":
+        nom = tool_input.get("nom", "").strip()
+        if not nom or not supabase:
+            return "Recherche impossible."
+        try:
+            result = supabase.table("clients").select("*").ilike("nom", f"%{nom}%").execute()
+            if result.data:
+                c = result.data[0]
+                update_client_context(telephone, prenom=c.get("nom", "").split()[0], client_id=c.get("id"))
+                return f"Client trouvé par nom : {c.get('nom')} — tél : {c.get('telephone', 'inconnu')}"
+            return f"Aucun client nommé '{nom}' trouvé."
+        except Exception as e:
+            return f"Erreur recherche client : {e}"
 
     return "Fonction inconnue."
 
@@ -1166,6 +1203,9 @@ def handle_appel(
     telephone = From or Called
     response_text = run_agent(SpeechResult, telephone)
 
+    audio_path = tts_voice(response_text)
+    filename = audio_path.split("/")[-1]
+
     gather = twiml.gather(
         input="speech",
         action="/appel",
@@ -1174,7 +1214,7 @@ def handle_appel(
         speech_timeout="auto",
         timeout=8,
     )
-    gather.say(response_text, language="fr-FR", voice="Polly.Lea")
+    gather.play(f"{BASE_URL}/audio/{filename}")
 
     twiml.say("Merci pour votre appel. À bientôt !", language="fr-FR")
     twiml.hangup()
