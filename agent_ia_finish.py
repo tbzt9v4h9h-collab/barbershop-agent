@@ -844,6 +844,8 @@ RÈGLES ABSOLUES :
 10. Si le salon est fermé ce jour, tu dis pourquoi et tu proposes un autre jour
 11. Reste sous 2-3 phrases maximum par réponse
 12. Dès que le client donne son prénom, appelle immédiatement get_client_info pour vérifier s'il existe déjà, puis utilise rechercher_client_par_nom si aucun nom n'est trouvé par téléphone
+13. Au début de chaque appel, mentionne toujours le nom du salon dans le message de bienvenue.
+14. Si le client demande des conseils (coloration, coupe conseillée, soin, entretien, etc.), appelle immédiatement demander_rappel_conseil puis dis au client : "Bien sûr ! Un de nos experts va vous rappeler dans les plus brefs délais au [numéro client]. Puis-je faire autre chose pour vous ?"
 
 COMPRÉHENSION DES DATES :
 - "vers 14h" = 14:00
@@ -855,9 +857,11 @@ COMPRÉHENSION DES DATES :
 FLOW DE PRISE DE RDV :
 1. Extraire : prestation, type (homme/femme si applicable), jour, heure
 2. Demander le PRÉNOM du client (toujours en dernier)
+3b. Demander : "Souhaitez-vous un shampoing ?" avant de confirmer le récapitulatif.
 3. CONFIRMER explicitement : "Parfait [Prénom] ! Je récapitule votre RDV :
    - Prestation : [prestation]
    - Date : [jour] [date] à [heure]
+   - Shampoing : [oui/non]
    - Coiffeur : [coiffeur si connu]
    Je confirme ?"
 4. Attendre "oui", "c'est bon", "parfait" ou similaire avant d'enregistrer
@@ -880,10 +884,17 @@ MÉMOIRE DU CLIENT :
             prompt += f"- Ce client s'appelle {prenom}\n"
             rdvs = get_rdv_client(ctx.get("client_id")) if ctx.get("client_id") else []
             if rdvs:
-                dernier_rdv = rdvs[-1] if rdvs else None
-                if dernier_rdv:
-                    prompt += f"- Dernière visite : {dernier_rdv.get('jour')} pour {dernier_rdv.get('prestation')}\n"
-            prompt += f"Accueille-le chaleureusement par son prénom.\n"
+                dernier_rdv = rdvs[-1]
+                derniere_prestation = dernier_rdv.get("prestation", "")
+                prompt += f"- Dernière visite : {dernier_rdv.get('jour')} pour {derniere_prestation}\n"
+                prompt += (
+                    f"Accueille-le chaleureusement : "
+                    f"'Bonjour {prenom} ! Ravi de vous retrouver. "
+                    f"Que puis-je faire pour vous aujourd'hui ? "
+                    f"Souhaitez-vous reprendre une prestation similaire à votre dernière visite ({derniere_prestation}) ?'\n"
+                )
+            else:
+                prompt += f"Accueille-le chaleureusement par son prénom.\n"
 
     return prompt
 
@@ -904,6 +915,8 @@ TOOLS = [
                     "prestation": {"type": "string", "description": "Type de prestation (coupe, couleur, coupe_couleur, etc)"},
                     "type_client": {"type": "string", "description": "homme ou femme"},
                     "coiffeur": {"type": "string", "description": "Nom du coiffeur (optionnel)"},
+                    "avec_shampoing": {"type": "boolean", "description": "true si le client souhaite un shampoing"},
+                    "client_nom": {"type": "string", "description": "Prénom ou nom du client"},
                 },
                 "required": ["jour", "heure", "prestation", "type_client"]
             }
@@ -969,6 +982,21 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "demander_rappel_conseil",
+            "description": "Envoie un SMS au coiffeur quand un client demande des conseils personnalisés (coloration, coupe conseillée, soin, etc.)",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "nom_client": {"type": "string", "description": "Nom du client si connu"},
+                    "telephone_client": {"type": "string", "description": "Numéro de téléphone du client"},
+                },
+                "required": ["telephone_client"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "rechercher_client_par_nom",
             "description": "Recherche un client par son prénom ou nom dans la base de données",
             "parameters": {
@@ -990,6 +1018,7 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
         heure = tool_input.get("heure")
         prestation = tool_input.get("prestation", "coupe")
         type_client = tool_input.get("type_client", "homme")
+        avec_shampoing = bool(tool_input.get("avec_shampoing", False))
 
         # Vérifier la disponibilité
         if not est_creneau_disponible(jour, heure):
@@ -1021,7 +1050,7 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
             couleur_detail=None,
             duree_max=45,
             prix=30,
-            avec_shampoing=False,
+            avec_shampoing=avec_shampoing,
             telephone=telephone,
             client_nom=client_nom,
         )
@@ -1057,6 +1086,21 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
         if client_nom:
             return f"Client trouvé : {client_nom}"
         return "Client nouveau ou sans nom enregistré."
+
+    elif tool_name == "demander_rappel_conseil":
+        nom_client = tool_input.get("nom_client") or "inconnu"
+        telephone_client = tool_input.get("telephone_client") or telephone
+        if not twilio_client:
+            return "SMS non envoyé (Twilio non configuré)."
+        try:
+            twilio_client.messages.create(
+                to="+33782989198",
+                from_=TWILIO_NUMBER,
+                body=f"Veuillez rappeler ce monsieur/madame {nom_client} au {telephone_client} pour des besoins de conseils.",
+            )
+            return f"SMS envoyé au coiffeur pour rappeler {nom_client} au {telephone_client}."
+        except Exception as e:
+            return f"Erreur envoi SMS conseil : {e}"
 
     elif tool_name == "rechercher_client_par_nom":
         nom = tool_input.get("nom", "").strip()
@@ -1214,7 +1258,7 @@ def handle_appel(
             timeout=5,
         )
         gather.say(
-            "Bonjour, bienvenue au salon. Comment puis-je vous aider ?",
+            f"Bonjour et bienvenue chez {NOM_SALON}, comment puis-je vous aider ?",
             language="fr-FR",
             voice="Polly.Lea",
         )
