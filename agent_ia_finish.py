@@ -830,6 +830,7 @@ def build_system_prompt(telephone: str = None) -> str:
 🕸️ Site : {SITE_CLIENT}
 
 RÈGLES ABSOLUES :
+0. Tu réponds TOUJOURS en français, peu importe la langue du message reçu. Ne jamais répondre en anglais.
 1. Tu poses UNE SEULE question à la fois (très important)
 2. Tu extrais TOUTES les informations disponibles dans le message du client AVANT de poser des questions
 3. Si le client dit "coupe homme pour demain vers 14h", tu ne redemandes RIEN de tout ça
@@ -1192,19 +1193,18 @@ def handle_appel(
             method="POST",
             language="fr-FR",
             speech_timeout="auto",
+            speech_model="phone_call",
             timeout=5,
         )
         gather.say(
             "Bonjour, bienvenue au salon. Comment puis-je vous aider ?",
             language="fr-FR",
+            voice="Polly.Lea",
         )
         return str(twiml)
 
     telephone = From or Called
     response_text = run_agent(SpeechResult, telephone)
-
-    audio_path = tts_voice(response_text)
-    filename = audio_path.split("/")[-1]
 
     gather = twiml.gather(
         input="speech",
@@ -1212,11 +1212,12 @@ def handle_appel(
         method="POST",
         language="fr-FR",
         speech_timeout="auto",
+        speech_model="phone_call",
         timeout=8,
     )
-    gather.play(f"{BASE_URL}/audio/{filename}")
+    gather.say(response_text, language="fr-FR", voice="Polly.Lea")
 
-    twiml.say("Merci pour votre appel. À bientôt !", language="fr-FR")
+    twiml.say("Merci pour votre appel. À bientôt !", language="fr-FR", voice="Polly.Lea")
     twiml.hangup()
 
     return str(twiml)
