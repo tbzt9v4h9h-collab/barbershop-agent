@@ -616,11 +616,14 @@ def send_rappels_sms():
 
 
 # ── Scheduler rappels SMS J-24h (10h00 chaque matin) ──────────────────────
-scheduler = BackgroundScheduler(timezone="Europe/Paris")
-scheduler.add_job(send_rappels_sms, "cron", hour=10, minute=0,
-                  id="rappels_sms_quotidiens", replace_existing=True)
-scheduler.start()
-print("🕙  [SCHEDULER] Rappels SMS planifiés chaque jour à 10h00 (Europe/Paris).")
+try:
+    scheduler = BackgroundScheduler(timezone="Europe/Paris")
+    scheduler.add_job(send_rappels_sms, "cron", hour=10, minute=0,
+                      id="rappels_sms_quotidiens", replace_existing=True)
+    scheduler.start()
+    print("🕙  [SCHEDULER] Rappels SMS planifiés chaque jour à 10h00 (Europe/Paris).")
+except Exception as _e_sched:
+    print(f"⚠️  Scheduler non démarré : {_e_sched}")
 
 
 def annuler_rdv(client_id: str, rdv_id: str) -> bool:

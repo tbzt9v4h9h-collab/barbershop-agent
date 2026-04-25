@@ -6,3 +6,5 @@ python-dotenv
 supabase
 python-multipart
 apscheduler
+pytz
+tzdata
