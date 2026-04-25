@@ -668,7 +668,7 @@ def tts_voice(message):
         try:
             result = client_openai.audio.speech.create(
                 model="tts-1",
-                voice="alloy",
+                voice="nova",
                 input=message,
             )
             audio_bytes = result.read() if hasattr(result, "read") else bytes(result)
@@ -1166,9 +1166,6 @@ def handle_appel(
     telephone = From or Called
     response_text = run_agent(SpeechResult, telephone)
 
-    audio_path = tts_voice(response_text)
-    filename = audio_path.split("/")[-1]
-
     gather = twiml.gather(
         input="speech",
         action="/appel",
@@ -1177,7 +1174,7 @@ def handle_appel(
         speech_timeout="auto",
         timeout=8,
     )
-    gather.play(f"{BASE_URL}/audio/{filename}")
+    gather.say(response_text, language="fr-FR", voice="Polly.Lea")
 
     twiml.say("Merci pour votre appel. À bientôt !", language="fr-FR")
     twiml.hangup()
