@@ -725,7 +725,7 @@ def est_jour_ouvrable(date_iso):
         d = datetime.strptime(date_iso, "%Y-%m-%d").date()
     except ValueError:
         return False
-    return d.weekday() in [1, 2, 3, 4, 5]
+    return NOMS_JOURS[d.weekday()] in JOURS_OUVERTS
 
 def ajouter_minutes_hhmm(hhmm, minutes):
     heures, mins = hhmm.split(":")
@@ -849,10 +849,13 @@ RÈGLES ABSOLUES :
 8. Tu ne raccroches que si le RDV est confirmé OU si le client dit au revoir explicitement
 9. Si un créneau n'est pas disponible, tu proposes AUTOMATIQUEMENT le suivant disponible
 10. Si le salon est fermé ce jour, tu dis pourquoi et tu proposes un autre jour
-11. Reste sous 2-3 phrases maximum par réponse
-12. Dès que le client donne son prénom, appelle immédiatement get_client_info pour vérifier s'il existe déjà, puis utilise rechercher_client_par_nom si aucun nom n'est trouvé par téléphone
-13. Au début de chaque appel, mentionne toujours le nom du salon dans le message de bienvenue.
-14. Si le client demande des conseils (coloration, coupe conseillée, soin, entretien, etc.), appelle immédiatement demander_rappel_conseil puis dis au client : "Bien sûr ! Un de nos experts va vous rappeler dans les plus brefs délais au [numéro client]. Puis-je faire autre chose pour vous ?"
+11. Réponds en maximum 1-2 phrases courtes. Sois direct et concis. Pas de phrases longues.
+12. Dès que le client donne son prénom, appelle immédiatement get_client_info pour vérifier s'il existe déjà, puis utilise rechercher_client_par_nom si aucun nom n'est trouvé par téléphone.
+13. Si le client demande des conseils (coloration, coupe conseillée, soin, entretien, etc.), appelle immédiatement demander_rappel_conseil puis dis au client : "Bien sûr [prénom] ! Un expert vous rappelle au [numéro] dans les plus brefs délais."
+14. Quand le client donne son prénom, répète-le UNE SEULE FOIS pour confirmer ("Parfait [Prénom] !") puis CONTINUE IMMÉDIATEMENT avec la suite. Ne redemande JAMAIS le prénom si tu l'as déjà reçu dans cette conversation. Si tu as déjà le prénom dans l'historique, utilise-le directement sans le redemander.
+15. Ne redemande JAMAIS une information déjà donnée dans la conversation.
+16. Si le client répète son prénom, dis simplement "Oui je vous ai bien noté [Prénom]" et continue.
+17. Maximum 2 phrases par réponse, toujours.
 
 COMPRÉHENSION DES DATES :
 - "vers 14h" = 14:00
@@ -863,16 +866,15 @@ COMPRÉHENSION DES DATES :
 
 FLOW DE PRISE DE RDV :
 1. Extraire : prestation, type (homme/femme si applicable), jour, heure
-2. Demander le PRÉNOM du client (toujours en dernier)
-3b. Demander : "Souhaitez-vous un shampoing ?" avant de confirmer le récapitulatif.
-3. CONFIRMER explicitement : "Parfait [Prénom] ! Je récapitule votre RDV :
+2. Demander le PRÉNOM du client (toujours en dernier, UNE SEULE FOIS)
+3. Demander : "Souhaitez-vous un shampoing ?" (UNE SEULE FOIS, avant le récapitulatif)
+4. CONFIRMER explicitement : "Parfait [Prénom] ! Je récapitule votre RDV :
    - Prestation : [prestation]
    - Date : [jour] [date] à [heure]
    - Shampoing : [oui/non]
-   - Coiffeur : [coiffeur si connu]
    Je confirme ?"
-4. Attendre "oui", "c'est bon", "parfait" ou similaire avant d'enregistrer
-5. Une fois enregistré : "Votre RDV est confirmé ! À bientôt !"
+5. Attendre "oui", "c'est bon", "parfait" ou similaire avant d'enregistrer
+6. Une fois enregistré : "Votre RDV est confirmé ! À bientôt !"
 
 GESTION DES CAS SPÉCIAUX :
 - Annulation : demander confirmation avant d'annuler
@@ -1095,17 +1097,22 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
         return "Client nouveau ou sans nom enregistré."
 
     elif tool_name == "demander_rappel_conseil":
-        nom_client = tool_input.get("nom_client") or "inconnu"
         telephone_client = tool_input.get("telephone_client") or telephone
+        # Récupérer le prénom depuis le contexte si pas fourni
+        ctx = get_client_context(telephone)
+        nom_client = (tool_input.get("nom_client")
+                      or ctx.get("prenom")
+                      or ctx.get("nom", "").split()[0]
+                      or "inconnu")
         if not twilio_client:
-            return "SMS non envoyé (Twilio non configuré)."
+            return f"SMS non envoyé (Twilio non configuré). Prénom: {nom_client}"
         try:
             twilio_client.messages.create(
                 to="+33782989198",
                 from_=TWILIO_NUMBER,
-                body=f"Veuillez rappeler ce monsieur/madame {nom_client} au {telephone_client} pour des besoins de conseils.",
+                body=f"Veuillez rappeler {nom_client} au {telephone_client} qui souhaite des conseils.",
             )
-            return f"SMS envoyé au coiffeur pour rappeler {nom_client} au {telephone_client}."
+            return f"SMS envoyé. Prénom={nom_client}, tél={telephone_client}."
         except Exception as e:
             return f"Erreur envoi SMS conseil : {e}"
 
@@ -1148,6 +1155,13 @@ def run_agent(message_user: str, telephone: str) -> str:
     # Ajouter le message utilisateur à l'historique
     add_to_history(telephone, "user", message_user)
 
+    # Détecter prénom dans un message court (probablement une réponse de prénom)
+    ctx = get_client_context(telephone)
+    if not ctx.get("prenom") and 1 <= len(message_user.strip().split()) <= 3:
+        prenom_candidat = message_user.strip().split()[0].capitalize()
+        if prenom_candidat.isalpha():
+            update_client_context(telephone, prenom=prenom_candidat)
+
     # Préparer les messages avec le system prompt en premier
     messages = [{"role": "system", "content": build_system_prompt(telephone)}] + get_conversation_history(telephone)
 
@@ -1161,8 +1175,8 @@ def run_agent(message_user: str, telephone: str) -> str:
             messages=messages,
             tools=TOOLS,
             tool_choice="auto",
-            temperature=0.7,
-            max_tokens=500,
+            temperature=0.3,
+            max_tokens=150,
         )
         # ÉTAPE 2 : Récupérer et accumuler les tokens
         session_tokens_input += response.usage.prompt_tokens
@@ -1249,7 +1263,7 @@ async def sync_config(request: Request):
         data = await request.json()
 
         global NOM_SALON, TELEPHONE_SALON, HORAIRE_OUVERTURE
-        global HORAIRE_FERMETURE, TWILIO_NUMBER
+        global HORAIRE_FERMETURE, TWILIO_NUMBER, JOURS_OUVERTS
 
         if data.get("salon_name"):
             NOM_SALON = data["salon_name"]
@@ -1260,6 +1274,14 @@ async def sync_config(request: Request):
             HORAIRE_OUVERTURE = data["open_time"]
         if data.get("close_time"):
             HORAIRE_FERMETURE = data["close_time"]
+        if data.get("open_days"):
+            jours_map = {
+                "Lundi": "lundi", "Mardi": "mardi",
+                "Mercredi": "mercredi", "Jeudi": "jeudi",
+                "Vendredi": "vendredi", "Samedi": "samedi",
+                "Dimanche": "dimanche",
+            }
+            JOURS_OUVERTS = [jours_map.get(j, j.lower()) for j in data["open_days"]]
 
         print(f"✅ [SYNC] Config mise à jour : {NOM_SALON}")
         return {"status": "ok", "salon": NOM_SALON}
@@ -1290,7 +1312,7 @@ def handle_appel(
             timeout=5,
         )
         gather.say(
-            f"Bonjour et bienvenue chez {NOM_SALON}, comment puis-je vous aider ?",
+            "Bonjour ! Comment puis-je vous aider ?",
             language="fr-FR",
             voice="Polly.Lea",
         )
