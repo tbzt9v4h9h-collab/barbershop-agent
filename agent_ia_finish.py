@@ -7,7 +7,7 @@
 import os
 import unicodedata
 import json
-from fastapi import FastAPI, Form, Request
+from fastapi import FastAPI, Form, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse
 from twilio.twiml.voice_response import VoiceResponse
@@ -1243,34 +1243,30 @@ def root():
 def health():
     return {"status": "ok"}
 
-@app.post("/sync-config", response_class=PlainTextResponse)
+@app.post("/sync-config")
 async def sync_config(request: Request):
     try:
         data = await request.json()
 
-        global NOM_SALON, TELEPHONE_SALON, ADRESSE_SALON
-        global HORAIRE_OUVERTURE, HORAIRE_FERMETURE
-        global TWILIO_NUMBER
+        global NOM_SALON, TELEPHONE_SALON, HORAIRE_OUVERTURE
+        global HORAIRE_FERMETURE, TWILIO_NUMBER
 
-        if data.get("nom_salon"):
-            NOM_SALON = data["nom_salon"]
-        if data.get("telephone"):
-            TELEPHONE_SALON = data["telephone"]
-        if data.get("adresse"):
-            ADRESSE_SALON = data["adresse"]
-        if data.get("horaire_ouverture"):
-            HORAIRE_OUVERTURE = data["horaire_ouverture"]
-        if data.get("horaire_fermeture"):
-            HORAIRE_FERMETURE = data["horaire_fermeture"]
-        if data.get("twilio_number"):
-            TWILIO_NUMBER = data["twilio_number"]
+        if data.get("salon_name"):
+            NOM_SALON = data["salon_name"]
+        if data.get("twilio_phone"):
+            TELEPHONE_SALON = data["twilio_phone"]
+            TWILIO_NUMBER = data["twilio_phone"]
+        if data.get("open_time"):
+            HORAIRE_OUVERTURE = data["open_time"]
+        if data.get("close_time"):
+            HORAIRE_FERMETURE = data["close_time"]
 
         print(f"✅ [SYNC] Config mise à jour : {NOM_SALON}")
-        return "OK"
+        return {"status": "ok", "salon": NOM_SALON}
 
     except Exception as e:
         print(f"❌ [SYNC] Erreur : {e}")
-        return "Erreur"
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ====================================================
 # ENDPOINT PRINCIPAL
