@@ -1243,7 +1243,7 @@ def root():
 def health():
     return {"status": "ok"}
 
-@app.post("/sync-config")
+@app.post("/update-config")
 async def sync_config(request: Request):
     try:
         data = await request.json()
