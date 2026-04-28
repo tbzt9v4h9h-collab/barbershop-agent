@@ -7,7 +7,7 @@
 import os
 import unicodedata
 import json
-from fastapi import FastAPI, Form
+from fastapi import FastAPI, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse
 from twilio.twiml.voice_response import VoiceResponse
@@ -1242,6 +1242,35 @@ def root():
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+@app.post("/sync-config", response_class=PlainTextResponse)
+async def sync_config(request: Request):
+    try:
+        data = await request.json()
+
+        global NOM_SALON, TELEPHONE_SALON, ADRESSE_SALON
+        global HORAIRE_OUVERTURE, HORAIRE_FERMETURE
+        global TWILIO_NUMBER
+
+        if data.get("nom_salon"):
+            NOM_SALON = data["nom_salon"]
+        if data.get("telephone"):
+            TELEPHONE_SALON = data["telephone"]
+        if data.get("adresse"):
+            ADRESSE_SALON = data["adresse"]
+        if data.get("horaire_ouverture"):
+            HORAIRE_OUVERTURE = data["horaire_ouverture"]
+        if data.get("horaire_fermeture"):
+            HORAIRE_FERMETURE = data["horaire_fermeture"]
+        if data.get("twilio_number"):
+            TWILIO_NUMBER = data["twilio_number"]
+
+        print(f"✅ [SYNC] Config mise à jour : {NOM_SALON}")
+        return "OK"
+
+    except Exception as e:
+        print(f"❌ [SYNC] Erreur : {e}")
+        return "Erreur"
 
 # ====================================================
 # ENDPOINT PRINCIPAL
