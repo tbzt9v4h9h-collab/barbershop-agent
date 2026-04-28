@@ -8,6 +8,7 @@ import os
 import unicodedata
 import json
 from fastapi import FastAPI, Form
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse
 from twilio.twiml.voice_response import VoiceResponse
 from twilio.rest import Client as TwilioClient
@@ -241,6 +242,12 @@ def rapport_mensuel(mois: str = None):
 
 print("🔵 [BOOT 6/8] Création application FastAPI…")
 app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 print("🔵 [BOOT 6/8] FastAPI OK")
 END_CALL_MESSAGE = "Merci pour votre appel. Bonne journée et à bientôt au salon."
 
