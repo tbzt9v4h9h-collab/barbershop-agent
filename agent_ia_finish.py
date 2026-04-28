@@ -356,18 +356,31 @@ def clean_messages(messages: list) -> list:
 # ====================================================
 
 def get_or_create_client(telephone: str) -> dict:
-    """Cherche le client par son numéro. S'il existe → retourne sa fiche."""
+    """Cherche le client par son numéro. S'il existe → retourne sa fiche + enrichit le contexte."""
     try:
         result = supabase.table("clients")\
             .select("*")\
             .eq("telephone", telephone)\
             .execute()
         if result.data:
-            return result.data[0]
-        nouveau = supabase.table("clients")\
-            .insert({"telephone": telephone})\
-            .execute()
-        return nouveau.data[0]
+            client = result.data[0]
+        else:
+            nouveau = supabase.table("clients")\
+                .insert({"telephone": telephone})\
+                .execute()
+            client = nouveau.data[0]
+        # Enrichir le contexte avec les RDVs passés
+        try:
+            rdvs = supabase.table("rendez_vous")\
+                .select("*")\
+                .eq("client_id", client.get("id"))\
+                .order("jour", desc=True).limit(5).execute().data or []
+            update_client_context(telephone,
+                nb_visites=client.get("nb_visites", 0),
+                derniere_visite=rdvs[0] if rdvs else None)
+        except Exception:
+            pass
+        return client
     except Exception as e:
         print(f"Erreur Supabase get_or_create_client: {e}")
         return {"id": None, "telephone": telephone, "nom": None, "nb_visites": 0}
@@ -632,14 +645,77 @@ def send_rappels_sms():
     print(f"✅  [RAPPELS] Traitement terminé ({len(rdvs)} RDV).")
 
 
+def send_rappel_1h(rdv_id, telephone, client_nom, jour, heure, prestation):
+    """Envoie un rappel SMS 1h avant le RDV."""
+    prenom = (client_nom or "").split()[0] if client_nom else ""
+    salut = f"Bonjour {prenom} ! " if prenom else "Bonjour ! "
+    message = (f"{salut}Rappel : votre RDV au {NOM_SALON} "
+               f"est dans 1 heure à {heure[:5]} pour {prestation}. À tout à l'heure !")
+    ok, sid = send_sms(telephone, message)
+    save_rappel_sms(rdv_id, None, telephone, message, "envoye" if ok else "echec", twilio_sid=sid)
+
+def check_rappels_1h():
+    """Tourne toutes les heures — envoie rappels pour les RDV dans ~1h."""
+    if not supabase:
+        return
+    try:
+        maintenant = datetime.now()
+        dans_1h = (maintenant + timedelta(hours=1)).strftime("%H:%M")
+        aujourdhui = maintenant.date().isoformat()
+        rdvs = supabase.table("rendez_vous").select("*")\
+            .eq("jour", aujourdhui).eq("statut", "confirme")\
+            .eq("heure_debut", dans_1h + ":00").execute().data or []
+        for rdv in rdvs:
+            client_id = rdv.get("client_id")
+            telephone = None
+            nom = None
+            if client_id and supabase:
+                try:
+                    c = supabase.table("clients").select("telephone,nom").eq("id", client_id).execute()
+                    if c.data:
+                        telephone = c.data[0].get("telephone")
+                        nom = c.data[0].get("nom")
+                except Exception:
+                    pass
+            if telephone:
+                send_rappel_1h(rdv.get("id"), telephone, nom,
+                               rdv.get("jour"), rdv.get("heure_debut", dans_1h),
+                               rdv.get("prestation", ""))
+    except Exception as e:
+        print(f"⚠️ check_rappels_1h erreur : {e}")
+
+def send_rapport_hebdo():
+    """Envoie un rapport SMS hebdomadaire au salon chaque lundi à 8h."""
+    if not supabase or not twilio_client:
+        return
+    try:
+        lundi = (date.today() - timedelta(days=date.today().weekday())).isoformat()
+        dimanche = (date.today() - timedelta(days=date.today().weekday() - 6)).isoformat()
+        rdvs = supabase.table("rendez_vous").select("*")\
+            .gte("jour", lundi).lte("jour", dimanche).eq("statut", "confirme").execute().data or []
+        nb_rdv = len(rdvs)
+        ca_estime = nb_rdv * 30
+        # Nouveaux clients cette semaine
+        nouveaux = supabase.table("clients").select("id")\
+            .gte("created_at", lundi + "T00:00:00").execute().data or []
+        msg = (f"📊 Rapport semaine :\nRDV pris : {nb_rdv}\n"
+               f"CA estimé : {ca_estime}€\nNouveaux clients : {len(nouveaux)}\nBonne semaine !")
+        twilio_client.messages.create(to=TELEPHONE_SALON, from_=TWILIO_NUMBER, body=msg)
+    except Exception as e:
+        print(f"⚠️ send_rapport_hebdo erreur : {e}")
+
 # ── Scheduler rappels SMS J-24h (10h00 chaque matin) ──────────────────────
 print("🔵 [BOOT 7/8] Démarrage APScheduler…")
 try:
     scheduler = BackgroundScheduler(timezone="Europe/Paris")
     scheduler.add_job(send_rappels_sms, "cron", hour=10, minute=0,
                       id="rappels_sms_quotidiens", replace_existing=True)
+    scheduler.add_job(check_rappels_1h, "cron", minute=0,
+                      id="rappels_1h", replace_existing=True)
+    scheduler.add_job(send_rapport_hebdo, "cron", day_of_week="mon", hour=8,
+                      id="rapport_hebdo", replace_existing=True)
     scheduler.start()
-    print("🔵 [BOOT 7/8] Scheduler OK — rappels 10h00 Europe/Paris")
+    print("🔵 [BOOT 7/8] Scheduler OK — rappels 10h00, rappels 1h, rapport lundi 8h")
 except Exception as _e_sched:
     print(f"⚠️  [BOOT 7/8] Scheduler non démarré : {_e_sched}")
 
@@ -658,6 +734,21 @@ def annuler_rdv(client_id: str, rdv_id: str) -> bool:
     except Exception as e:
         print(f"Erreur Supabase annuler_rdv: {e}")
         return False
+
+def get_prochains_creneaux_disponibles(jour: str, heure_souhaitee: str, nb: int = 3) -> list:
+    """Retourne les nb prochains créneaux libres à partir de l'heure souhaitée."""
+    creneaux = []
+    heure_courante = heure_souhaitee or HORAIRE_OUVERTURE
+    for _ in range(20):
+        if heure_valide_format(heure_courante) and est_horaire_ouverture(heure_courante):
+            if est_creneau_disponible(jour, heure_courante):
+                creneaux.append(heure_courante)
+                if len(creneaux) >= nb:
+                    break
+        heure_courante = ajouter_minutes_hhmm(heure_courante, 30)
+        if not est_horaire_ouverture(heure_courante):
+            break
+    return creneaux
 
 def get_services(salon_id: str = None) -> list:
     """Retourne la liste des services disponibles."""
@@ -879,8 +970,27 @@ FLOW DE PRISE DE RDV :
 GESTION DES CAS SPÉCIAUX :
 - Annulation : demander confirmation avant d'annuler
 - Modification : annuler l'ancien + créer le nouveau
-- Demande de prix : donner les prix, puis proposer un RDV
+- Demande de prix : donner les prix, puis proposer un RDV. Calcule le total en direct : "Pour [prestation], le total sera [X]€. Je vous propose le [jour] à [heure], ça vous convient ?"
 - Salon fermé : proposer un autre jour immédiatement
+- Créneau indisponible : appelle proposer_creneaux et présente les 3 options en une phrase
+- RDV récurrent ("tous les mois", "chaque semaine") : confirme et enregistre les 3 prochains RDV automatiquement
+
+ADAPTATION DU TON :
+- Si le client semble pressé ("vite", "rapidement", "j'ai pas le temps") : sois ultra concis, propose le prochain créneau directement
+- Si le client semble stressé ou hésitant : sois rassurant, doux, prends le temps
+- Si le client est détendu et bavard : sois chaleureux et sympathique
+- Adapte-toi en permanence au style de communication du client
+
+UPSELL NATUREL (une seule fois, accepte le refus sans insister) :
+- Après coupe homme : "Souhaitez-vous également une retouche barbe ?"
+- Après coupe femme : "On peut ajouter un soin hydratant, votre cheveu sera encore plus brillant !"
+- Si couleur : "Je vous conseille d'ajouter un soin protecteur après coloration."
+
+TRANSFERT HUMAIN :
+- Si le client dit "je veux parler à quelqu'un", "passez-moi un humain", "je veux parler au coiffeur" : dis "Bien sûr, je vous transfère immédiatement." puis appelle le tool transfert_humain.
+
+URGENCES :
+- Si le client mentionne un événement urgent (mariage, cérémonie, enterrement, soirée ce soir) : priorité absolue aux créneaux du jour même, dis "C'est une occasion importante, nous allons faire notre possible !" et envoie SMS au salon via transfert_humain avec mention de l'urgence.
 
 MÉMOIRE DU CLIENT :
 """
@@ -895,12 +1005,12 @@ MÉMOIRE DU CLIENT :
             if rdvs:
                 dernier_rdv = rdvs[-1]
                 derniere_prestation = dernier_rdv.get("prestation", "")
-                prompt += f"- Dernière visite : {dernier_rdv.get('jour')} pour {derniere_prestation}\n"
+                derniere_date = dernier_rdv.get("jour", "")
+                prompt += f"- Dernière visite : {derniere_date} pour {derniere_prestation}\n"
                 prompt += (
-                    f"Accueille-le chaleureusement : "
-                    f"'Bonjour {prenom} ! Ravi de vous retrouver. "
-                    f"Que puis-je faire pour vous aujourd'hui ? "
-                    f"Souhaitez-vous reprendre une prestation similaire à votre dernière visite ({derniere_prestation}) ?'\n"
+                    f"Accueille-le : 'Bonjour {prenom} ! Comment allez-vous depuis la dernière fois ? "
+                    f"Je vois que vous étiez venu(e) pour {derniere_prestation} le {derniere_date}. "
+                    f"Souhaitez-vous reprendre la même chose ?'\n"
                 )
             else:
                 prompt += f"Accueille-le chaleureusement par son prénom.\n"
@@ -1017,6 +1127,50 @@ TOOLS = [
             }
         }
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "proposer_creneaux",
+            "description": "Propose les 3 prochains créneaux disponibles à partir d'une heure souhaitée",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "jour": {"type": "string", "description": "Date au format YYYY-MM-DD"},
+                    "heure_souhaitee": {"type": "string", "description": "Heure souhaitée au format HH:MM"},
+                },
+                "required": ["jour", "heure_souhaitee"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ajouter_liste_attente",
+            "description": "Ajoute le client en liste d'attente si le salon est complet",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "jour_souhaite": {"type": "string", "description": "Date souhaitée YYYY-MM-DD"},
+                    "prestation": {"type": "string", "description": "Prestation souhaitée"},
+                    "client_nom": {"type": "string", "description": "Nom du client"},
+                },
+                "required": ["jour_souhaite", "prestation"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "transfert_humain",
+            "description": "Transfère l'appel vers un humain en envoyant un SMS d'alerte au salon",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "raison": {"type": "string", "description": "Raison du transfert (ex: demande client, urgence, etc.)"},
+                },
+            }
+        }
+    },
 ]
 
 def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
@@ -1063,7 +1217,23 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
             telephone=telephone,
             client_nom=client_nom,
         )
-        return f"RDV enregistré pour {jour} à {heure}."
+        # Sauvegarder préférences dans la table clients
+        if client_id and supabase:
+            try:
+                prefs = {"derniere_coupe": prestation,
+                         "coiffeur_habituel": tool_input.get("coiffeur"),
+                         "avec_shampoing": avec_shampoing}
+                supabase.table("clients").update({"preferences": json.dumps(prefs)}).eq("id", client_id).execute()
+            except Exception:
+                pass
+        # Message fidélité
+        nb_v = client.get("nb_visites", 0) + 1
+        fidelite = ""
+        if nb_v == 5:
+            fidelite = " C'est votre 5ème visite, vous bénéficiez d'une remise de 10% !"
+        elif nb_v == 10:
+            fidelite = " 10ème visite ! Une prestation offerte vous attend !"
+        return f"RDV enregistré pour {jour} à {heure}.{fidelite}"
 
     elif tool_name == "verifier_disponibilite":
         jour = tool_input.get("jour")
@@ -1136,6 +1306,47 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
         except Exception as e:
             return f"Erreur recherche client : {e}"
 
+    elif tool_name == "proposer_creneaux":
+        jour = tool_input.get("jour")
+        heure_souhaitee = tool_input.get("heure_souhaitee", HORAIRE_OUVERTURE)
+        creneaux = get_prochains_creneaux_disponibles(jour, heure_souhaitee)
+        if creneaux:
+            return f"Créneaux disponibles le {jour} : {', '.join(creneaux)}."
+        return f"Aucun créneau disponible le {jour}."
+
+    elif tool_name == "ajouter_liste_attente":
+        client = get_or_create_client(telephone)
+        client_id = client.get("id")
+        client_nom_tool = tool_input.get("client_nom") or client.get("nom") or telephone
+        if supabase:
+            try:
+                supabase.table("liste_attente").insert({
+                    "client_id": client_id,
+                    "telephone": telephone,
+                    "nom": client_nom_tool,
+                    "jour_souhaite": tool_input.get("jour_souhaite"),
+                    "prestation": tool_input.get("prestation"),
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                }).execute()
+            except Exception as e:
+                return f"Erreur liste d'attente : {e}"
+        return f"Client ajouté en liste d'attente pour le {tool_input.get('jour_souhaite')}."
+
+    elif tool_name == "transfert_humain":
+        raison = tool_input.get("raison", "demande du client")
+        ctx = get_client_context(telephone)
+        nom = ctx.get("prenom") or ctx.get("nom") or telephone
+        if twilio_client:
+            try:
+                twilio_client.messages.create(
+                    to=TELEPHONE_SALON,
+                    from_=TWILIO_NUMBER,
+                    body=f"⚠️ Transfert demandé par {nom} ({telephone}). Raison : {raison}. Rappeler immédiatement.",
+                )
+            except Exception as e:
+                print(f"SMS transfert erreur : {e}")
+        return f"Transfert initié. SMS envoyé au salon pour rappeler {nom}."
+
     return "Fonction inconnue."
 
 # ====================================================
@@ -1155,6 +1366,10 @@ def run_agent(message_user: str, telephone: str) -> str:
     # Ajouter le message utilisateur à l'historique
     add_to_history(telephone, "user", message_user)
 
+    # Détection langue anglaise
+    mots_anglais = ["hello", "hi", "appointment", "booking", "please", "thank", "yes", "no", "hair", "cut"]
+    est_anglais = any(mot in message_user.lower() for mot in mots_anglais)
+
     # Détecter prénom dans un message court (probablement une réponse de prénom)
     ctx = get_client_context(telephone)
     if not ctx.get("prenom") and 1 <= len(message_user.strip().split()) <= 3:
@@ -1162,8 +1377,13 @@ def run_agent(message_user: str, telephone: str) -> str:
         if prenom_candidat.isalpha():
             update_client_context(telephone, prenom=prenom_candidat)
 
+    # Construire le system prompt (avec langue si anglais détecté)
+    sys_prompt = build_system_prompt(telephone)
+    if est_anglais:
+        sys_prompt += "\nLe client parle anglais. Réponds en anglais mais garde les données en français dans Supabase."
+
     # Préparer les messages avec le system prompt en premier
-    messages = [{"role": "system", "content": build_system_prompt(telephone)}] + get_conversation_history(telephone)
+    messages = [{"role": "system", "content": sys_prompt}] + get_conversation_history(telephone)
 
     # CORRECTION BUG 1 : Nettoyer l'historique des messages orphelins
     messages = clean_messages(messages)
@@ -1216,15 +1436,15 @@ def run_agent(message_user: str, telephone: str) -> str:
             add_tool_result(telephone, tool_call.id, tool_result)
 
         # Relancer GPT-4o avec le résultat des fonctions
-        messages = [{"role": "system", "content": build_system_prompt(telephone)}] + get_conversation_history(telephone)
+        messages = [{"role": "system", "content": sys_prompt}] + get_conversation_history(telephone)
         messages = clean_messages(messages)
 
         try:
             response = client_openai.chat.completions.create(
                 model="gpt-4o",
                 messages=messages,
-                temperature=0.7,
-                max_tokens=500,
+                temperature=0.3,
+                max_tokens=150,
             )
             # ÉTAPE 2 : Récupérer et accumuler les tokens du deuxième appel
             session_tokens_input += response.usage.prompt_tokens
@@ -1244,6 +1464,22 @@ def run_agent(message_user: str, telephone: str) -> str:
     # Ajouter la réponse à l'historique
     add_to_history(telephone, "assistant", response_text)
 
+    # Alerte patron si agent bloqué (pas de RDV après 3+ échanges)
+    ctx2 = get_client_context(telephone)
+    if not ctx2.get("rdv_pris"):
+        nb_echecs = ctx2.get("nb_echecs", 0) + 1
+        update_client_context(telephone, nb_echecs=nb_echecs)
+        if nb_echecs >= 3 and twilio_client:
+            try:
+                twilio_client.messages.create(
+                    to=TELEPHONE_SALON, from_=TWILIO_NUMBER,
+                    body=f"⚠️ L'agent est bloqué avec {telephone}. Rappeler ce client !")
+                update_client_context(telephone, nb_echecs=0)
+            except Exception:
+                pass
+    else:
+        update_client_context(telephone, nb_echecs=0)
+
     return response_text
 
 # ====================================================
@@ -1262,14 +1498,17 @@ async def sync_config(request: Request):
     try:
         data = await request.json()
 
-        global NOM_SALON, TELEPHONE_SALON, HORAIRE_OUVERTURE
-        global HORAIRE_FERMETURE, TWILIO_NUMBER, JOURS_OUVERTS
+        global NOM_SALON, TELEPHONE_SALON, ADRESSE_SALON
+        global HORAIRE_OUVERTURE, HORAIRE_FERMETURE, JOURS_OUVERTS
+        global COIFFEURS, BASE_URL, TWILIO_NUMBER
 
         if data.get("salon_name"):
             NOM_SALON = data["salon_name"]
         if data.get("twilio_phone"):
             TELEPHONE_SALON = data["twilio_phone"]
             TWILIO_NUMBER = data["twilio_phone"]
+        if data.get("address"):
+            ADRESSE_SALON = data["address"]
         if data.get("open_time"):
             HORAIRE_OUVERTURE = data["open_time"]
         if data.get("close_time"):
@@ -1282,8 +1521,13 @@ async def sync_config(request: Request):
                 "Dimanche": "dimanche",
             }
             JOURS_OUVERTS = [jours_map.get(j, j.lower()) for j in data["open_days"]]
+        if data.get("staff"):
+            COIFFEURS = [{"nom": c.get("name"), "specialites": c.get("specialties", "")}
+                         for c in data["staff"]]
+        if data.get("render_url"):
+            BASE_URL = data["render_url"]
 
-        print(f"✅ [SYNC] Config mise à jour : {NOM_SALON}")
+        print(f"✅ [SYNC COMPLÈTE] {NOM_SALON} | {HORAIRE_OUVERTURE}-{HORAIRE_FERMETURE} | Jours: {JOURS_OUVERTS}")
         return {"status": "ok", "salon": NOM_SALON}
 
     except Exception as e:
@@ -1300,6 +1544,24 @@ def handle_appel(
     SpeechResult: str = Form(default=""),
 ):
     twiml = VoiceResponse()
+
+    # Anti-spam : bloquer si +10 appels en 24h
+    def est_spam(tel: str) -> bool:
+        if not supabase or not tel:
+            return False
+        try:
+            hier = (datetime.now() - timedelta(days=1)).isoformat()
+            result = supabase.table("usage_logs").select("id")\
+                .eq("twilio_number", tel).gte("created_at", hier).execute()
+            return len(result.data or []) > 10
+        except Exception:
+            return False
+
+    telephone_appelant = From or Called
+    if est_spam(telephone_appelant):
+        twiml.say("Ce numéro a été temporairement suspendu.", language="fr-FR", voice="Polly.Lea")
+        twiml.hangup()
+        return str(twiml)
 
     if not SpeechResult:
         gather = twiml.gather(
@@ -1318,7 +1580,7 @@ def handle_appel(
         )
         return str(twiml)
 
-    telephone = From or Called
+    telephone = telephone_appelant
     response_text = run_agent(SpeechResult, telephone)
 
     gather = twiml.gather(
