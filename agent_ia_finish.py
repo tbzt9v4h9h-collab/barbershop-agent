@@ -1544,6 +1544,9 @@ def handle_appel(
     Called: str = Form(default=""),
     SpeechResult: str = Form(default=""),
 ):
+    global NOM_SALON, TELEPHONE_SALON, ADRESSE_SALON
+    global HORAIRE_OUVERTURE, HORAIRE_FERMETURE, JOURS_OUVERTS, TWILIO_NUMBER
+
     twiml = VoiceResponse()
 
     # Charger la config salon depuis Supabase (persistance entre redémarrages)
@@ -1553,8 +1556,6 @@ def handle_appel(
             .eq("twilio_number", called).limit(1).execute()
         if salon_data.data:
             s = salon_data.data[0]
-            global NOM_SALON, TELEPHONE_SALON, ADRESSE_SALON
-            global HORAIRE_OUVERTURE, HORAIRE_FERMETURE, JOURS_OUVERTS, TWILIO_NUMBER
             if s.get("nom"):               NOM_SALON = s["nom"]
             if s.get("telephone"):         TELEPHONE_SALON = s["telephone"]
             if s.get("adresse"):           ADRESSE_SALON = s["adresse"]
