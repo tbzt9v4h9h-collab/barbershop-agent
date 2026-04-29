@@ -979,6 +979,7 @@ MÉMOIRE DU CLIENT :
             else:
                 prompt += f"Accueille-le chaleureusement par son prénom.\n"
 
+    print(f"🧠 [PROMPT] Jours dans prompt : {JOURS_OUVERTS}")
     return prompt
 
 # ====================================================
@@ -1505,10 +1506,14 @@ async def sync_config(request: Request):
         if data.get("render_url"):
             BASE_URL = data["render_url"]
 
+        print(f"🔄 [UPDATE-CONFIG] Reçu : {data}")
+        print(f"🔄 [UPDATE-CONFIG] JOURS_OUVERTS après update : {JOURS_OUVERTS}")
+        print(f"🔄 [UPDATE-CONFIG] HORAIRE : {HORAIRE_OUVERTURE}-{HORAIRE_FERMETURE}")
+
         # Persistance dans Supabase
         if supabase:
             try:
-                supabase.table("salon").upsert({
+                salon_row = {
                     "twilio_number": TWILIO_NUMBER,
                     "nom": NOM_SALON,
                     "telephone": TELEPHONE_SALON,
@@ -1516,8 +1521,10 @@ async def sync_config(request: Request):
                     "horaire_ouverture": HORAIRE_OUVERTURE,
                     "horaire_fermeture": HORAIRE_FERMETURE,
                     "jours_ouverts": json.dumps(JOURS_OUVERTS),
-                }, on_conflict="twilio_number").execute()
-                print(f"✅ [SYNC SUPABASE] Config sauvegardée pour {TWILIO_NUMBER}")
+                }
+                print(f"💾 [UPSERT] Sauvegarde : {salon_row}")
+                supabase.table("salon").upsert(salon_row, on_conflict="twilio_number").execute()
+                print(f"💾 [UPSERT] OK")
             except Exception as e_db:
                 print(f"⚠️ [SYNC SUPABASE] Erreur persistance : {e_db}")
 
@@ -1540,23 +1547,32 @@ def handle_appel(
     twiml = VoiceResponse()
 
     # Charger la config salon depuis Supabase (persistance entre redémarrages)
-    if supabase:
-        try:
-            called_number = Called or TWILIO_NUMBER
-            salon_row = supabase.table("salon").select("*")\
-                .eq("twilio_number", called_number).limit(1).execute()
-            if salon_row.data:
-                s = salon_row.data[0]
-                global NOM_SALON, TELEPHONE_SALON, ADRESSE_SALON
-                global HORAIRE_OUVERTURE, HORAIRE_FERMETURE, JOURS_OUVERTS
-                if s.get("nom"):               NOM_SALON = s["nom"]
-                if s.get("telephone"):         TELEPHONE_SALON = s["telephone"]
-                if s.get("adresse"):           ADRESSE_SALON = s["adresse"]
-                if s.get("horaire_ouverture"): HORAIRE_OUVERTURE = s["horaire_ouverture"]
-                if s.get("horaire_fermeture"): HORAIRE_FERMETURE = s["horaire_fermeture"]
-                if s.get("jours_ouverts"):     JOURS_OUVERTS = json.loads(s["jours_ouverts"])
-        except Exception as _e_cfg:
-            print(f"⚠️ [CONFIG] Erreur chargement salon : {_e_cfg}")
+    try:
+        called = Called or TWILIO_NUMBER
+        salon_data = supabase.table("salon").select("*")\
+            .eq("twilio_number", called).limit(1).execute()
+        if salon_data.data:
+            s = salon_data.data[0]
+            global NOM_SALON, TELEPHONE_SALON, ADRESSE_SALON
+            global HORAIRE_OUVERTURE, HORAIRE_FERMETURE, JOURS_OUVERTS, TWILIO_NUMBER
+            if s.get("nom"):               NOM_SALON = s["nom"]
+            if s.get("telephone"):         TELEPHONE_SALON = s["telephone"]
+            if s.get("adresse"):           ADRESSE_SALON = s["adresse"]
+            if s.get("horaire_ouverture"): HORAIRE_OUVERTURE = s["horaire_ouverture"]
+            if s.get("horaire_fermeture"): HORAIRE_FERMETURE = s["horaire_fermeture"]
+            if s.get("jours_ouverts"):
+                try:
+                    jours = json.loads(s["jours_ouverts"])
+                    if isinstance(jours, list) and len(jours) > 0:
+                        JOURS_OUVERTS = jours
+                        print(f"✅ [APPEL] Jours chargés : {JOURS_OUVERTS}")
+                except Exception as e_j:
+                    print(f"⚠️ [APPEL] Erreur parse jours : {e_j}")
+        print(f"📞 [APPEL] NOM_SALON={NOM_SALON}")
+        print(f"📞 [APPEL] JOURS_OUVERTS={JOURS_OUVERTS}")
+        print(f"📞 [APPEL] HORAIRES={HORAIRE_OUVERTURE}-{HORAIRE_FERMETURE}")
+    except Exception as e:
+        print(f"⚠️ [APPEL] Erreur chargement config : {e}")
 
     # Anti-spam : bloquer si +10 appels en 24h
     def est_spam(tel: str) -> bool:
