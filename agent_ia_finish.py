@@ -948,49 +948,12 @@ RÈGLES ABSOLUES :
 16. Si le client répète son prénom, dis simplement "Oui je vous ai bien noté [Prénom]" et continue.
 17. Maximum 2 phrases par réponse, toujours.
 
-COMPRÉHENSION DES DATES :
-- "vers 14h" = 14:00
-- "demain matin" = demain à 09:00 ou 10:00
-- "mardi prochain" = le prochain mardi
-- "en fin de semaine" = samedi
-- "le plus tôt possible" = premier créneau disponible
-
-FLOW DE PRISE DE RDV :
-1. Extraire : prestation, type (homme/femme si applicable), jour, heure
-2. Demander le PRÉNOM du client (toujours en dernier, UNE SEULE FOIS)
-3. Demander : "Souhaitez-vous un shampoing ?" (UNE SEULE FOIS, avant le récapitulatif)
-4. CONFIRMER explicitement : "Parfait [Prénom] ! Je récapitule votre RDV :
-   - Prestation : [prestation]
-   - Date : [jour] [date] à [heure]
-   - Shampoing : [oui/non]
-   Je confirme ?"
-5. Attendre "oui", "c'est bon", "parfait" ou similaire avant d'enregistrer
-6. Une fois enregistré : "Votre RDV est confirmé ! À bientôt !"
-
-GESTION DES CAS SPÉCIAUX :
-- Annulation : demander confirmation avant d'annuler
-- Modification : annuler l'ancien + créer le nouveau
-- Demande de prix : donner les prix, puis proposer un RDV. Calcule le total en direct : "Pour [prestation], le total sera [X]€. Je vous propose le [jour] à [heure], ça vous convient ?"
-- Salon fermé : proposer un autre jour immédiatement
-- Créneau indisponible : appelle proposer_creneaux et présente les 3 options en une phrase
-- RDV récurrent ("tous les mois", "chaque semaine") : confirme et enregistre les 3 prochains RDV automatiquement
-
-ADAPTATION DU TON :
-- Si le client semble pressé ("vite", "rapidement", "j'ai pas le temps") : sois ultra concis, propose le prochain créneau directement
-- Si le client semble stressé ou hésitant : sois rassurant, doux, prends le temps
-- Si le client est détendu et bavard : sois chaleureux et sympathique
-- Adapte-toi en permanence au style de communication du client
-
-UPSELL NATUREL (une seule fois, accepte le refus sans insister) :
-- Après coupe homme : "Souhaitez-vous également une retouche barbe ?"
-- Après coupe femme : "On peut ajouter un soin hydratant, votre cheveu sera encore plus brillant !"
-- Si couleur : "Je vous conseille d'ajouter un soin protecteur après coloration."
-
-TRANSFERT HUMAIN :
-- Si le client dit "je veux parler à quelqu'un", "passez-moi un humain", "je veux parler au coiffeur" : dis "Bien sûr, je vous transfère immédiatement." puis appelle le tool transfert_humain.
-
-URGENCES :
-- Si le client mentionne un événement urgent (mariage, cérémonie, enterrement, soirée ce soir) : priorité absolue aux créneaux du jour même, dis "C'est une occasion importante, nous allons faire notre possible !" et envoie SMS au salon via transfert_humain avec mention de l'urgence.
+FLOW RDV : 1) Extraire prestation+jour+heure → 2) Demander prénom (1 fois) → 3) Demander shampoing (1 fois) → 4) Récapituler et confirmer → 5) Enregistrer → "RDV confirmé !"
+Si créneau indisponible : appelle proposer_creneaux, présente les 3 options en 1 phrase.
+Si demande de prix : calcule total et propose un créneau dans la même phrase.
+Si "parler à quelqu'un" / "humain" : appelle transfert_humain.
+Si événement urgent (mariage, cérémonie) : priorité créneaux du jour, appelle transfert_humain.
+Après coupe homme : propose barbe (1 fois). Après coupe femme : propose soin (1 fois).
 
 MÉMOIRE DU CLIENT :
 """
@@ -1363,6 +1326,20 @@ def run_agent(message_user: str, telephone: str) -> str:
     if not client_openai:
         return "⚠️ Erreur: API OpenAI non configurée. Vérifiez votre clé API."
 
+    # Cache réponses fréquentes (évite un appel GPT)
+    CACHE_REPONSES = {
+        "horaires": f"Nous sommes ouverts de {HORAIRE_OUVERTURE} à {HORAIRE_FERMETURE}.",
+        "adresse":  f"Nous sommes situés au {ADRESSE_SALON}.",
+        "prix":     "Les tarifs commencent à 15€ pour une coupe homme.",
+    }
+    message_lower = message_user.lower()
+    if "horaire" in message_lower or ("heure" in message_lower and "rendez" not in message_lower):
+        return CACHE_REPONSES["horaires"]
+    if "adresse" in message_lower or ("où" in message_lower and "situé" in message_lower):
+        return CACHE_REPONSES["adresse"]
+    if "prix" in message_lower or "tarif" in message_lower or "coût" in message_lower or "combien" in message_lower:
+        return CACHE_REPONSES["prix"]
+
     # Ajouter le message utilisateur à l'historique
     add_to_history(telephone, "user", message_user)
 
@@ -1391,7 +1368,7 @@ def run_agent(message_user: str, telephone: str) -> str:
     # Appeler GPT-4o avec function calling
     try:
         response = client_openai.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-4o-mini",
             messages=messages,
             tools=TOOLS,
             tool_choice="auto",
@@ -1441,7 +1418,7 @@ def run_agent(message_user: str, telephone: str) -> str:
 
         try:
             response = client_openai.chat.completions.create(
-                model="gpt-4o",
+                model="gpt-4o-mini",
                 messages=messages,
                 temperature=0.3,
                 max_tokens=150,
@@ -1574,7 +1551,7 @@ def handle_appel(
             timeout=5,
         )
         gather.say(
-            "Bonjour ! Comment puis-je vous aider ?",
+            f"Bonjour et bienvenue chez {NOM_SALON}, comment puis-je vous aider ?",
             language="fr-FR",
             voice="Polly.Lea",
         )
