@@ -114,6 +114,7 @@ except Exception as _e:
 
 # Salon actif pour la session en cours (résolu depuis twilio_number)
 _session_salon_id: str | None = None
+PRESTATIONS_SALON: list = []  # Liste des prestations chargées depuis Supabase
 
 BASE_URL = "https://barbershop-agent.onrender.com"
 
@@ -354,6 +355,29 @@ def clean_messages(messages: list) -> list:
 # ====================================================
 # SUPABASE — FONCTIONS CLIENT & RDV
 # ====================================================
+
+def load_salon_data(twilio_number: str = None):
+    """Charge depuis Supabase l'équipe et les prestations du salon."""
+    global COIFFEURS, PRESTATIONS_SALON
+    if not supabase or not _session_salon_id:
+        return
+    try:
+        staff = supabase.table("employee").select("*")\
+            .eq("salon_id", _session_salon_id).eq("is_active", True).execute()
+        if staff.data:
+            COIFFEURS = [{"nom": e.get("name"), "id": e.get("id"),
+                          "specialites": e.get("specialties", "")} for e in staff.data]
+            print(f"✅ [DATA] {len(COIFFEURS)} coiffeurs chargés")
+    except Exception as e:
+        print(f"⚠️ [DATA] Erreur chargement équipe : {e}")
+    try:
+        services = supabase.table("service").select("*")\
+            .eq("salon_id", _session_salon_id).execute()
+        if services.data:
+            PRESTATIONS_SALON = services.data
+            print(f"✅ [DATA] {len(PRESTATIONS_SALON)} prestations chargées")
+    except Exception as e:
+        print(f"⚠️ [DATA] Erreur chargement prestations : {e}")
 
 def get_or_create_client(telephone: str) -> dict:
     """Cherche le client par son numéro. S'il existe → retourne sa fiche + enrichit le contexte."""
@@ -735,6 +759,18 @@ def annuler_rdv(client_id: str, rdv_id: str) -> bool:
         print(f"Erreur Supabase annuler_rdv: {e}")
         return False
 
+def get_coiffeurs_disponibles(jour: str, heure: str, duree: int = 45) -> list:
+    """Retourne la liste des coiffeurs disponibles à l'heure demandée."""
+    try:
+        rdvs = supabase.table("rendez_vous").select("coiffeur")\
+            .eq("jour", jour).eq("heure_debut", heure).eq("statut", "confirme").execute()
+        coiffeurs_pris = [r.get("coiffeur") for r in (rdvs.data or [])]
+        disponibles = [c for c in COIFFEURS if c["nom"] not in coiffeurs_pris]
+        return disponibles if disponibles else COIFFEURS
+    except Exception as e:
+        print(f"⚠️ Erreur disponibilité coiffeur : {e}")
+        return COIFFEURS
+
 def get_prochains_creneaux_disponibles(jour: str, heure_souhaitee: str, nb: int = 3) -> list:
     """Retourne les nb prochains créneaux libres à partir de l'heure souhaitée."""
     creneaux = []
@@ -949,12 +985,27 @@ RÈGLES ABSOLUES :
 16. Si le client répète son prénom, dis simplement "Oui je vous ai bien noté [Prénom]" et continue.
 17. Maximum 2 phrases par réponse, toujours.
 
-FLOW RDV : 1) Extraire prestation+jour+heure → 2) Demander prénom (1 fois) → 3) Demander shampoing (1 fois) → 4) Récapituler et confirmer → 5) Enregistrer → "RDV confirmé !"
+FLOW RDV : 1) Extraire prestation+jour+heure → 2) Demander coiffeur (préférence) → 3) Demander prénom (1 fois) → 4) Demander shampoing (1 fois) → 5) Récapituler et confirmer → 6) Enregistrer → "RDV confirmé !"
 Si créneau indisponible : appelle proposer_creneaux, présente les 3 options en 1 phrase.
-Si demande de prix : calcule total et propose un créneau dans la même phrase.
+Si demande de prix : calcule total et propose un créneau dans la même phrase. Donne le prix AVANT de confirmer.
 Si "parler à quelqu'un" / "humain" : appelle transfert_humain.
 Si événement urgent (mariage, cérémonie) : priorité créneaux du jour, appelle transfert_humain.
 Après coupe homme : propose barbe (1 fois). Après coupe femme : propose soin (1 fois).
+
+GESTION COIFFEURS :
+- Toujours demander préférence coiffeur après prestation/heure
+- Appelle verifier_coiffeur_disponible pour confirmer la disponibilité
+- Si coiffeur non dispo : propose heure alternative OU autre coiffeur
+- Si pas de préférence : attribue le premier disponible
+
+GESTION PRESTATIONS :
+- Enregistre le nom EXACT de la prestation comme demandé par le client
+- Si prestation inconnue : explique et propose de lister les prestations disponibles
+
+CONSEILS :
+- Quand client demande conseil, utilise son prénom connu ou demande-le
+- Appelle demander_rappel_conseil avec prénom ET numéro appelant
+- Confirme : "Un expert vous rappelle au [numéro] dans les plus brefs délais"
 
 MÉMOIRE DU CLIENT :
 """
@@ -978,6 +1029,18 @@ MÉMOIRE DU CLIENT :
                 )
             else:
                 prompt += f"Accueille-le chaleureusement par son prénom.\n"
+
+    # Ajouter les prestations chargées depuis Supabase
+    if PRESTATIONS_SALON:
+        noms_prestations = [p.get("name", "") for p in PRESTATIONS_SALON if p.get("name")]
+        prompt += f"\nPRESTATIONS DISPONIBLES : {', '.join(noms_prestations)}\n"
+        prompt += ("Si client demande une prestation non listée : "
+                   "explique qu'elle n'est pas disponible et propose de lister par genre.\n")
+
+    # Ajouter les coiffeurs disponibles
+    if COIFFEURS:
+        noms_coiffeurs = [c.get("nom", "") for c in COIFFEURS if c.get("nom")]
+        prompt += f"ÉQUIPE : {', '.join(noms_coiffeurs)}\n"
 
     print(f"🧠 [PROMPT] Jours dans prompt : {JOURS_OUVERTS}")
     return prompt
@@ -1095,6 +1158,22 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "verifier_coiffeur_disponible",
+            "description": "Vérifie si un coiffeur est disponible et retourne les alternatives",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "jour": {"type": "string", "description": "Date YYYY-MM-DD"},
+                    "heure": {"type": "string", "description": "Heure HH:MM"},
+                    "coiffeur_souhaite": {"type": "string", "description": "Nom du coiffeur souhaité (optionnel)"},
+                },
+                "required": ["jour", "heure"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "proposer_creneaux",
             "description": "Propose les 3 prochains créneaux disponibles à partir d'une heure souhaitée",
             "parameters": {
@@ -1147,6 +1226,18 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
         prestation = tool_input.get("prestation", "coupe")
         type_client = tool_input.get("type_client", "homme")
         avec_shampoing = bool(tool_input.get("avec_shampoing", False))
+        coiffeur_choisi = tool_input.get("coiffeur")
+
+        # Vérifier que la prestation existe (si liste chargée)
+        if PRESTATIONS_SALON:
+            prestation_valide = any(
+                p.get("name", "").lower() in prestation.lower()
+                or prestation.lower() in p.get("name", "").lower()
+                for p in PRESTATIONS_SALON
+            )
+            if not prestation_valide:
+                noms = ', '.join(p.get("name", "") for p in PRESTATIONS_SALON)
+                return f"Prestation '{prestation}' non disponible. Prestations : {noms}"
 
         # Vérifier la disponibilité
         if not est_creneau_disponible(jour, heure):
@@ -1174,7 +1265,7 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
             heure=heure,
             type_client=type_client,
             prestation=prestation,
-            coupe_detail=None,
+            coupe_detail=coiffeur_choisi,
             couleur_detail=None,
             duree_max=45,
             prix=30,
@@ -1210,6 +1301,11 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
         client_id = tool_input.get("client_id")
         rdv_id = tool_input.get("rdv_id")
         if annuler_rdv(client_id, rdv_id):
+            client = get_or_create_client(telephone)
+            prenom = (client.get("nom") or "").split()[0] or "vous"
+            message = (f"Bonjour {prenom}, votre rendez-vous au {NOM_SALON} a bien été annulé. "
+                       f"Pour reprendre un RDV appelez le {TELEPHONE_SALON}. À bientôt !")
+            send_sms(telephone, message)
             return "RDV annulé avec succès."
         return "Erreur lors de l'annulation."
 
@@ -1232,24 +1328,23 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
         return "Client nouveau ou sans nom enregistré."
 
     elif tool_name == "demander_rappel_conseil":
-        telephone_client = tool_input.get("telephone_client") or telephone
-        # Récupérer le prénom depuis le contexte si pas fourni
         ctx = get_client_context(telephone)
-        nom_client = (tool_input.get("nom_client")
-                      or ctx.get("prenom")
-                      or ctx.get("nom", "").split()[0]
-                      or "inconnu")
-        if not twilio_client:
-            return f"SMS non envoyé (Twilio non configuré). Prénom: {nom_client}"
-        try:
-            twilio_client.messages.create(
-                to="+33782989198",
-                from_=TWILIO_NUMBER,
-                body=f"Veuillez rappeler {nom_client} au {telephone_client} qui souhaite des conseils.",
-            )
-            return f"SMS envoyé. Prénom={nom_client}, tél={telephone_client}."
-        except Exception as e:
-            return f"Erreur envoi SMS conseil : {e}"
+        prenom = (tool_input.get("nom_client")
+                  or ctx.get("prenom")
+                  or ctx.get("nom", "").split()[0]
+                  or "Client inconnu")
+        numero_client = telephone
+        message_salon = (f"📞 Rappel conseils : {prenom} au {numero_client} "
+                         f"souhaite des conseils. Merci de le rappeler dans les plus brefs délais.")
+        ok, _ = send_sms("+33782989198", message_salon)
+        if not ok and twilio_client:
+            try:
+                twilio_client.messages.create(to="+33782989198", from_=TWILIO_NUMBER, body=message_salon)
+            except Exception as e:
+                print(f"SMS conseil erreur : {e}")
+        return (f"Bien sûr ! Un expert de {NOM_SALON} va vous rappeler "
+                f"au {numero_client} dans les plus brefs délais. "
+                f"Y a-t-il autre chose pour vous ?")
 
     elif tool_name == "rechercher_client_par_nom":
         nom = tool_input.get("nom", "").strip()
@@ -1270,6 +1365,32 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
             return f"Aucun client nommé '{nom}' trouvé."
         except Exception as e:
             return f"Erreur recherche client : {e}"
+
+    elif tool_name == "verifier_coiffeur_disponible":
+        jour = tool_input.get("jour")
+        heure = tool_input.get("heure")
+        coiffeur_souhaite = tool_input.get("coiffeur_souhaite")
+        disponibles = get_coiffeurs_disponibles(jour, heure)
+        if coiffeur_souhaite:
+            coiffeur_libre = any(c["nom"].lower() == coiffeur_souhaite.lower() for c in disponibles)
+            if coiffeur_libre:
+                return f"{coiffeur_souhaite} est disponible à {heure}."
+            # Trouver prochains créneaux pour ce coiffeur
+            creneaux_coiffeur = []
+            heure_test = heure
+            for _ in range(8):
+                heure_test = ajouter_minutes_hhmm(heure_test, 30)
+                dispo = get_coiffeurs_disponibles(jour, heure_test)
+                if any(c["nom"].lower() == coiffeur_souhaite.lower() for c in dispo):
+                    creneaux_coiffeur.append(heure_test)
+                if len(creneaux_coiffeur) >= 2:
+                    break
+            noms_dispo = [c["nom"] for c in disponibles]
+            return (f"{coiffeur_souhaite} est pris à {heure}. "
+                    f"Disponible : {', '.join(creneaux_coiffeur) or 'plus tard'}. "
+                    f"Autres coiffeurs libres : {', '.join(noms_dispo) or 'aucun'}.")
+        noms = [c["nom"] for c in disponibles]
+        return f"Coiffeurs disponibles à {heure} : {', '.join(noms) or 'aucun'}."
 
     elif tool_name == "proposer_creneaux":
         jour = tool_input.get("jour")
@@ -1574,6 +1695,9 @@ def handle_appel(
         print(f"📞 [APPEL] HORAIRES={HORAIRE_OUVERTURE}-{HORAIRE_FERMETURE}")
     except Exception as e:
         print(f"⚠️ [APPEL] Erreur chargement config : {e}")
+
+    # Charger équipe et prestations depuis Supabase
+    load_salon_data()
 
     # Anti-spam : bloquer si +10 appels en 24h
     def est_spam(tel: str) -> bool:
