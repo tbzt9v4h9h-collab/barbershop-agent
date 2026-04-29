@@ -457,20 +457,25 @@ def enregistrer_rdv(client_id, jour, heure, type_client,
         try:
             salon_id_eff = salon_id or _session_salon_id
             appt_row = {
-                "client_name":  client_nom or telephone or "Inconnu",
+                "salon_id":    salon_id_eff,
+                "client_name": client_nom or telephone or "Inconnu",
                 "client_phone": telephone or "",
-                "status":       "confirme",
-                "date":         jour,
-                "time":         heure + ":00" if len(heure) == 5 else heure,
-                "created_at":   datetime.now(timezone.utc).isoformat(),
+                "status":      "confirme",
+                "date":        jour,
+                "time":        heure + ":00" if len(heure) == 5 else heure,
+                "service":     prestation,
+                "staff_name":  coupe_detail or "",
+                "price":       prix or 0,
+                "created_at":  datetime.now(timezone.utc).isoformat(),
             }
-            if salon_id_eff:
-                appt_row["salon_id"] = salon_id_eff
-            appt_result = supabase.table("appointment").insert(appt_row).execute()
-            appt_id = appt_result.data[0]["id"] if appt_result.data else None
-            print(f"✅ [appointment] Ligne créée — id={appt_id}")
+            print(f"💾 [APPOINTMENT] Insertion : {appt_row}")
+            appt_result = supabase.table("appointment")\
+                .insert(appt_row).execute()
+            appt_id = appt_result.data[0]["id"] \
+                      if appt_result.data else None
+            print(f"✅ [APPOINTMENT] id={appt_id}")
         except Exception as e_appt:
-            print(f"⚠️  [appointment] Erreur insert : {e_appt}")
+            print(f"⚠️ [APPOINTMENT] Erreur : {e_appt}")
 
         if client_id:
             client_row = supabase.table("clients")\
@@ -498,6 +503,19 @@ def enregistrer_rdv(client_id, jour, heure, type_client,
     except Exception as e:
         print(f"Erreur Supabase enregistrer_rdv: {e}")
         return None
+
+def sync_appointment_columns():
+    """Vérifie les colonnes disponibles dans la table appointment (debug)."""
+    if not supabase:
+        print("⚠️ [APPOINTMENT] Supabase non initialisé")
+        return
+    try:
+        result = supabase.table("appointment")\
+            .select("*").limit(1).execute()
+        colonnes = list(result.data[0].keys()) if result.data else "table vide"
+        print(f"📋 [APPOINTMENT] Colonnes disponibles : {colonnes}")
+    except Exception as e:
+        print(f"⚠️ [APPOINTMENT] Erreur lecture colonnes : {e}")
 
 def est_creneau_disponible(jour: str, heure: str) -> bool:
     """Vérifie la disponibilité d'un créneau dans Supabase."""
@@ -744,6 +762,12 @@ except Exception as _e_sched:
     print(f"⚠️  [BOOT 7/8] Scheduler non démarré : {_e_sched}")
 
 print("🟢 [BOOT 8/8] Module chargé — uvicorn prêt à écouter sur $PORT")
+
+# Vérification des colonnes de la table appointment au démarrage
+try:
+    sync_appointment_columns()
+except Exception as _e_sync:
+    print(f"⚠️ [BOOT] sync_appointment_columns : {_e_sync}")
 
 
 def annuler_rdv(client_id: str, rdv_id: str) -> bool:
