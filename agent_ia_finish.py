@@ -1007,6 +1007,13 @@ CONSEILS :
 - Appelle demander_rappel_conseil avec prénom ET numéro appelant
 - Confirme : "Un expert vous rappelle au [numéro] dans les plus brefs délais"
 
+ANNULATION RDV :
+1. Appelle get_rdv_client_actif avec le numéro du client
+2. Liste les RDV trouvés au client
+3. Demande confirmation : "Voulez-vous annuler votre RDV du [date] à [heure] pour [prestation] ?"
+4. Si oui : appelle annuler_rdv avec client_id et rdv_id
+5. Le SMS de confirmation est envoyé automatiquement
+
 MÉMOIRE DU CLIENT :
 """
 
@@ -1096,6 +1103,20 @@ TOOLS = [
                     "rdv_id": {"type": "string", "description": "ID du rendez-vous à annuler"},
                 },
                 "required": ["client_id", "rdv_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_rdv_client_actif",
+            "description": "Récupère les RDV à venir du client pour pouvoir les annuler",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "telephone": {"type": "string", "description": "numéro du client"},
+                },
+                "required": ["telephone"]
             }
         }
     },
@@ -1300,14 +1321,43 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
     elif tool_name == "annuler_rdv":
         client_id = tool_input.get("client_id")
         rdv_id = tool_input.get("rdv_id")
+
+        print(f"🗑️ [ANNULATION] client_id={client_id} rdv_id={rdv_id} tel={telephone}")
+
         if annuler_rdv(client_id, rdv_id):
-            client = get_or_create_client(telephone)
-            prenom = (client.get("nom") or "").split()[0] or "vous"
-            message = (f"Bonjour {prenom}, votre rendez-vous au {NOM_SALON} a bien été annulé. "
-                       f"Pour reprendre un RDV appelez le {TELEPHONE_SALON}. À bientôt !")
-            send_sms(telephone, message)
-            return "RDV annulé avec succès."
+            ctx = get_client_context(telephone)
+            prenom = ctx.get("prenom") or ctx.get("nom", "").split()[0] or "vous"
+
+            print(f"📱 [ANNULATION SMS] Envoi à {telephone} pour {prenom}")
+
+            message = (
+                f"Bonjour {prenom}, votre rendez-vous "
+                f"au {NOM_SALON} a bien été annulé. "
+                f"Pour reprendre un RDV appelez le "
+                f"{TELEPHONE_SALON}. À bientôt !"
+            )
+            ok, sid = send_sms(telephone, message)
+            print(f"📱 [ANNULATION SMS] Résultat : ok={ok} sid={sid}")
+
+            return "RDV annulé avec succès. SMS de confirmation envoyé."
         return "Erreur lors de l'annulation."
+
+    elif tool_name == "get_rdv_client_actif":
+        tel = tool_input.get("telephone") or telephone
+        client = get_or_create_client(tel)
+        client_id = client.get("id")
+        print(f"📋 [RDV ACTIF] Recherche RDVs pour client_id={client_id} tel={tel}")
+        rdvs = get_rdv_client(client_id)
+        if not rdvs:
+            return "Aucun RDV à venir pour ce client."
+        rdvs_str = []
+        for r in rdvs:
+            rdvs_str.append(
+                f"ID:{r['id']} | {r['jour']} à "
+                f"{r['heure_debut']} | {r['prestation']}"
+            )
+        update_client_context(tel, client_id=client_id)
+        return "RDV trouvés : " + " /// ".join(rdvs_str)
 
     elif tool_name == "get_services":
         services = get_services()
