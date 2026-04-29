@@ -924,7 +924,8 @@ def build_system_prompt(telephone: str = None) -> str:
 🏢 Salon : {NOM_SALON}
 📞 Téléphone : {TELEPHONE_SALON}
 📍 Adresse : {ADRESSE_SALON}
-⏰ Horaires : {HORAIRE_OUVERTURE} à {HORAIRE_FERMETURE}, du mardi au samedi
+⏰ Horaires : {HORAIRE_OUVERTURE} à {HORAIRE_FERMETURE}
+📅 Jours ouverts : {', '.join(JOURS_OUVERTS)}
 🕸️ Site : {SITE_CLIENT}
 
 RÈGLES ABSOLUES :
@@ -1595,19 +1596,39 @@ def handle_appel(
     telephone = telephone_appelant
     response_text = run_agent(SpeechResult, telephone)
 
-    gather = twiml.gather(
-        input="speech",
-        action="/appel",
-        method="POST",
-        language="fr-FR",
-        speech_timeout="auto",
-        speech_model="phone_call",
-        timeout=8,
-    )
-    gather.say(response_text, language="fr-FR", voice="Polly.Lea")
+    phrases_fin = [
+        "bonne journée", "à bientôt", "au revoir",
+        "merci pour votre appel", "à très bientôt",
+        "bonne continuation", "à la prochaine",
+        "rdv est confirmé", "rendez-vous est confirmé",
+    ]
+    est_fin = any(p in (response_text or "").lower() for p in phrases_fin)
 
-    twiml.say("Merci pour votre appel. À bientôt !", language="fr-FR", voice="Polly.Lea")
-    twiml.hangup()
+    if est_fin:
+        gather = twiml.gather(
+            input="speech",
+            action="/appel",
+            method="POST",
+            language="fr-FR",
+            speech_timeout="auto",
+            speech_model="phone_call",
+            timeout=3,
+        )
+        gather.say(response_text, language="fr-FR", voice="Polly.Lea")
+        twiml.hangup()
+    else:
+        gather = twiml.gather(
+            input="speech",
+            action="/appel",
+            method="POST",
+            language="fr-FR",
+            speech_timeout="auto",
+            speech_model="phone_call",
+            timeout=8,
+        )
+        gather.say(response_text, language="fr-FR", voice="Polly.Lea")
+        twiml.say("Merci pour votre appel. À bientôt !", language="fr-FR", voice="Polly.Lea")
+        twiml.hangup()
 
     return str(twiml)
 
