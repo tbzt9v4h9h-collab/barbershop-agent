@@ -1504,6 +1504,22 @@ async def sync_config(request: Request):
         if data.get("render_url"):
             BASE_URL = data["render_url"]
 
+        # Persistance dans Supabase
+        if supabase:
+            try:
+                supabase.table("salon").upsert({
+                    "twilio_number": TWILIO_NUMBER,
+                    "nom": NOM_SALON,
+                    "telephone": TELEPHONE_SALON,
+                    "adresse": ADRESSE_SALON,
+                    "horaire_ouverture": HORAIRE_OUVERTURE,
+                    "horaire_fermeture": HORAIRE_FERMETURE,
+                    "jours_ouverts": json.dumps(JOURS_OUVERTS),
+                }, on_conflict="twilio_number").execute()
+                print(f"✅ [SYNC SUPABASE] Config sauvegardée pour {TWILIO_NUMBER}")
+            except Exception as e_db:
+                print(f"⚠️ [SYNC SUPABASE] Erreur persistance : {e_db}")
+
         print(f"✅ [SYNC COMPLÈTE] {NOM_SALON} | {HORAIRE_OUVERTURE}-{HORAIRE_FERMETURE} | Jours: {JOURS_OUVERTS}")
         return {"status": "ok", "salon": NOM_SALON}
 
@@ -1521,6 +1537,25 @@ def handle_appel(
     SpeechResult: str = Form(default=""),
 ):
     twiml = VoiceResponse()
+
+    # Charger la config salon depuis Supabase (persistance entre redémarrages)
+    if supabase:
+        try:
+            called_number = Called or TWILIO_NUMBER
+            salon_row = supabase.table("salon").select("*")\
+                .eq("twilio_number", called_number).limit(1).execute()
+            if salon_row.data:
+                s = salon_row.data[0]
+                global NOM_SALON, TELEPHONE_SALON, ADRESSE_SALON
+                global HORAIRE_OUVERTURE, HORAIRE_FERMETURE, JOURS_OUVERTS
+                if s.get("nom"):               NOM_SALON = s["nom"]
+                if s.get("telephone"):         TELEPHONE_SALON = s["telephone"]
+                if s.get("adresse"):           ADRESSE_SALON = s["adresse"]
+                if s.get("horaire_ouverture"): HORAIRE_OUVERTURE = s["horaire_ouverture"]
+                if s.get("horaire_fermeture"): HORAIRE_FERMETURE = s["horaire_fermeture"]
+                if s.get("jours_ouverts"):     JOURS_OUVERTS = json.loads(s["jours_ouverts"])
+        except Exception as _e_cfg:
+            print(f"⚠️ [CONFIG] Erreur chargement salon : {_e_cfg}")
 
     # Anti-spam : bloquer si +10 appels en 24h
     def est_spam(tel: str) -> bool:
