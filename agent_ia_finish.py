@@ -456,6 +456,16 @@ def enregistrer_rdv(client_id, jour, heure, type_client,
         # Écriture simultanée dans la table "appointment"
         try:
             salon_id_eff = salon_id or _session_salon_id
+            if not salon_id_eff:
+                try:
+                    result = supabase.table("salon").select("id")\
+                        .eq("twilio_number", TWILIO_NUMBER)\
+                        .limit(1).execute()
+                    if result.data:
+                        salon_id_eff = result.data[0]["id"]
+                        print(f"✅ [APPOINTMENT] salon_id trouvé : {salon_id_eff}")
+                except Exception as e:
+                    print(f"⚠️ [APPOINTMENT] salon_id non trouvé : {e}")
             appt_row = {
                 "salon_id":    salon_id_eff,
                 "client_name": client_nom or telephone or "Inconnu",
