@@ -442,12 +442,12 @@ def load_all_salon_data():
         if staff_result.data:
             COIFFEURS = [
                 {
-                    "nom": e.get("name") or e.get("first_name", ""),
+                    "nom": e.get("full_name") or e.get("name") or e.get("first_name", ""),
                     "id": e.get("id"),
                     "specialites": e.get("specialties") or e.get("role", ""),
                 }
                 for e in staff_result.data
-                if e.get("name") or e.get("first_name")
+                if e.get("full_name") or e.get("name") or e.get("first_name")
             ]
             print(f"✅ [LOAD] Coiffeurs : {[c['nom'] for c in COIFFEURS]}")
         else:
@@ -455,6 +455,16 @@ def load_all_salon_data():
             print(f"⚠️ [LOAD] Aucun coiffeur pour salon_id={salon_id}")
 
         # 3. Charger les prestations depuis table "service"
+        sample_service = supabase.table("service")\
+            .select("*").limit(1).execute()
+        if sample_service.data:
+            print(f"📋 [SERVICE] Colonnes : {list(sample_service.data[0].keys())}")
+        else:
+            print("📋 [SERVICE] Table vide ou salon_id incorrect")
+            all_services = supabase.table("service")\
+                .select("*").limit(3).execute()
+            print(f"📋 [SERVICE] Sans filtre : {all_services.data}")
+
         services_result = supabase.table("service")\
             .select("*")\
             .eq("salon_id", salon_id)\
