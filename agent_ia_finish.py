@@ -1833,15 +1833,27 @@ def root():
 def health():
     return {"status": "ok"}
 
+def salon_id_from_twilio() -> str:
+    """Retourne le salon_id depuis la table salon via TWILIO_NUMBER."""
+    try:
+        res = supabase.table("salon").select("id")\
+            .eq("twilio_number", TWILIO_NUMBER)\
+            .limit(1).execute()
+        return res.data[0]["id"] if res.data else None
+    except Exception:
+        return None
+
 @app.post("/update-config")
 async def sync_config(request: Request):
     try:
         data = await request.json()
+        print(f"📥 [UPDATE-CONFIG] Payload reçu : {json.dumps(data, indent=2)}")
 
         global NOM_SALON, TELEPHONE_SALON, ADRESSE_SALON
         global HORAIRE_OUVERTURE, HORAIRE_FERMETURE, JOURS_OUVERTS
-        global COIFFEURS, BASE_URL, TWILIO_NUMBER
+        global COIFFEURS, PRESTATIONS_SALON, BASE_URL, TWILIO_NUMBER
 
+        # ── Config salon de base ──────────────────────────────────
         if data.get("salon_name"):
             NOM_SALON = data["salon_name"]
         if data.get("twilio_phone"):
@@ -1861,17 +1873,58 @@ async def sync_config(request: Request):
                 "Dimanche": "dimanche",
             }
             JOURS_OUVERTS = [jours_map.get(j, j.lower()) for j in data["open_days"]]
-        if data.get("staff"):
-            COIFFEURS = [{"nom": c.get("name"), "specialites": c.get("specialties", "")}
-                         for c in data["staff"]]
         if data.get("render_url"):
             BASE_URL = data["render_url"]
 
-        print(f"🔄 [UPDATE-CONFIG] Reçu : {data}")
-        print(f"🔄 [UPDATE-CONFIG] JOURS_OUVERTS après update : {JOURS_OUVERTS}")
-        print(f"🔄 [UPDATE-CONFIG] HORAIRE : {HORAIRE_OUVERTURE}-{HORAIRE_FERMETURE}")
+        # ── Coiffeurs ─────────────────────────────────────────────
+        staff_data = data.get("staff") or data.get("employees") or data.get("coiffeurs")
+        if staff_data:
+            COIFFEURS = []
+            sid = _session_salon_id or salon_id_from_twilio()
+            for s in staff_data:
+                nom = (s.get("full_name") or s.get("name") or
+                       s.get("firstName") or s.get("first_name") or "")
+                if nom:
+                    COIFFEURS.append({
+                        "nom": nom,
+                        "id": s.get("id", ""),
+                        "specialites": s.get("specialties") or s.get("role", ""),
+                    })
+                    try:
+                        supabase.table("employee").upsert({
+                            "id": s.get("id"),
+                            "salon_id": sid,
+                            "full_name": nom,
+                            "specialties": s.get("specialties") or s.get("role", ""),
+                        }, on_conflict="id").execute()
+                    except Exception as e:
+                        print(f"⚠️ [SYNC] Erreur upsert employee : {e}")
+            print(f"✅ [SYNC] Coiffeurs : {[c['nom'] for c in COIFFEURS]}")
 
-        # Persistance dans Supabase
+        # ── Prestations ───────────────────────────────────────────
+        services_data = data.get("services") or data.get("prestations")
+        if services_data:
+            PRESTATIONS_SALON = []
+            sid = _session_salon_id or salon_id_from_twilio()
+            for sv in services_data:
+                nom = sv.get("name") or sv.get("nom") or ""
+                if nom:
+                    PRESTATIONS_SALON.append(sv)
+                    try:
+                        supabase.table("service").upsert({
+                            "id": sv.get("id"),
+                            "salon_id": sid,
+                            "name": nom,
+                            "price": sv.get("price") or sv.get("prix") or 0,
+                            "duration_minutes": sv.get("duration") or sv.get("duree") or 30,
+                        }, on_conflict="id").execute()
+                    except Exception as e:
+                        print(f"⚠️ [SYNC] Erreur upsert service : {e}")
+            print(f"✅ [SYNC] Prestations : {[p.get('name') for p in PRESTATIONS_SALON]}")
+
+        print(f"🔄 [UPDATE-CONFIG] JOURS_OUVERTS={JOURS_OUVERTS} | HORAIRE={HORAIRE_OUVERTURE}-{HORAIRE_FERMETURE}")
+
+        # ── Persistance salon dans Supabase ───────────────────────
         if supabase:
             try:
                 salon_row = {
@@ -1883,11 +1936,11 @@ async def sync_config(request: Request):
                     "horaire_fermeture": HORAIRE_FERMETURE,
                     "jours_ouverts": json.dumps(JOURS_OUVERTS),
                 }
-                print(f"💾 [UPSERT] Sauvegarde : {salon_row}")
+                print(f"💾 [UPSERT] Sauvegarde salon : {salon_row}")
                 supabase.table("salon").upsert(salon_row, on_conflict="twilio_number").execute()
                 print(f"💾 [UPSERT] OK")
             except Exception as e_db:
-                print(f"⚠️ [SYNC SUPABASE] Erreur persistance : {e_db}")
+                print(f"⚠️ [SYNC SUPABASE] Erreur persistance salon : {e_db}")
 
         print(f"✅ [SYNC COMPLÈTE] {NOM_SALON} | {HORAIRE_OUVERTURE}-{HORAIRE_FERMETURE} | Jours: {JOURS_OUVERTS}")
         return {"status": "ok", "salon": NOM_SALON}
