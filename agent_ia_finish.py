@@ -36,10 +36,7 @@ HORAIRE_OUVERTURE = "09:00"                      # À PERSONNALISER
 HORAIRE_FERMETURE = "18:00"                      # À PERSONNALISER
 JOURS_OUVERTS = ["mardi", "mercredi", "jeudi", "vendredi", "samedi"] # À PERSONNALISER
 
-COIFFEURS = [                                    # À PERSONNALISER
-    {"nom": "Sophie", "specialites": "coupe femme, couleur"},
-    {"nom": "Marc",   "specialites": "coupe homme, barbe"},
-]
+COIFFEURS = []  # Chargé depuis Supabase table "employee"
 
 PRIX_HOMME_COUPE = {                             # À PERSONNALISER
     "normale":    15,
@@ -390,27 +387,91 @@ def clean_messages(messages: list) -> list:
 # ====================================================
 
 def load_salon_data(twilio_number: str = None):
-    """Charge depuis Supabase l'équipe et les prestations du salon."""
+    """Alias pour compatibilité — délègue à load_all_salon_data()."""
+    load_all_salon_data()
+
+def load_all_salon_data():
+    """Charge config salon, coiffeurs et prestations depuis Supabase."""
     global COIFFEURS, PRESTATIONS_SALON
-    if not supabase or not _session_salon_id:
+    global NOM_SALON, TELEPHONE_SALON, ADRESSE_SALON
+    global HORAIRE_OUVERTURE, HORAIRE_FERMETURE, JOURS_OUVERTS
+    global TWILIO_NUMBER, _session_salon_id
+
+    if not supabase:
+        print("⚠️ [LOAD] Supabase non initialisé")
         return
+
     try:
-        staff = supabase.table("employee").select("*")\
-            .eq("salon_id", _session_salon_id).eq("is_active", True).execute()
-        if staff.data:
-            COIFFEURS = [{"nom": e.get("name"), "id": e.get("id"),
-                          "specialites": e.get("specialties", "")} for e in staff.data]
-            print(f"✅ [DATA] {len(COIFFEURS)} coiffeurs chargés")
+        # 1. Charger config salon depuis table "salon"
+        salon_result = supabase.table("salon")\
+            .select("*")\
+            .eq("twilio_number", TWILIO_NUMBER)\
+            .limit(1).execute()
+
+        if not salon_result.data:
+            print(f"⚠️ [LOAD] Aucun salon pour {TWILIO_NUMBER}")
+            return
+
+        s = salon_result.data[0]
+        salon_id = s.get("id")
+        _session_salon_id = salon_id
+
+        if s.get("nom"):               NOM_SALON = s["nom"]
+        if s.get("telephone"):         TELEPHONE_SALON = s["telephone"]
+        if s.get("adresse"):           ADRESSE_SALON = s["adresse"]
+        if s.get("horaire_ouverture"): HORAIRE_OUVERTURE = s["horaire_ouverture"]
+        if s.get("horaire_fermeture"): HORAIRE_FERMETURE = s["horaire_fermeture"]
+        if s.get("jours_ouverts"):
+            try:
+                jours = json.loads(s["jours_ouverts"])
+                if isinstance(jours, list) and len(jours) > 0:
+                    JOURS_OUVERTS = jours
+            except Exception:
+                pass
+
+        print(f"✅ [LOAD] Salon : {NOM_SALON} | "
+              f"{HORAIRE_OUVERTURE}-{HORAIRE_FERMETURE} | "
+              f"Jours : {JOURS_OUVERTS}")
+
+        # 2. Charger les coiffeurs depuis table "employee"
+        staff_result = supabase.table("employee")\
+            .select("*")\
+            .eq("salon_id", salon_id)\
+            .execute()
+
+        if staff_result.data:
+            COIFFEURS = [
+                {
+                    "nom": e.get("name") or e.get("first_name", ""),
+                    "id": e.get("id"),
+                    "specialites": e.get("specialties") or e.get("role", ""),
+                }
+                for e in staff_result.data
+                if e.get("name") or e.get("first_name")
+            ]
+            print(f"✅ [LOAD] Coiffeurs : {[c['nom'] for c in COIFFEURS]}")
+        else:
+            COIFFEURS = []
+            print(f"⚠️ [LOAD] Aucun coiffeur pour salon_id={salon_id}")
+
+        # 3. Charger les prestations depuis table "service"
+        services_result = supabase.table("service")\
+            .select("*")\
+            .eq("salon_id", salon_id)\
+            .execute()
+
+        if services_result.data:
+            PRESTATIONS_SALON = services_result.data
+            noms = [p.get("name", "") for p in PRESTATIONS_SALON]
+            print(f"✅ [LOAD] Prestations : {noms}")
+        else:
+            PRESTATIONS_SALON = []
+            print(f"⚠️ [LOAD] Aucune prestation pour salon_id={salon_id}")
+
     except Exception as e:
-        print(f"⚠️ [DATA] Erreur chargement équipe : {e}")
-    try:
-        services = supabase.table("service").select("*")\
-            .eq("salon_id", _session_salon_id).execute()
-        if services.data:
-            PRESTATIONS_SALON = services.data
-            print(f"✅ [DATA] {len(PRESTATIONS_SALON)} prestations chargées")
-    except Exception as e:
-        print(f"⚠️ [DATA] Erreur chargement prestations : {e}")
+        print(f"❌ [LOAD] Erreur load_all_salon_data : {e}")
+        import traceback
+        traceback.print_exc()
 
 def get_or_create_client(telephone: str) -> dict:
     """Cherche le client par son numéro. S'il existe → retourne sa fiche + enrichit le contexte."""
@@ -505,36 +566,41 @@ def enregistrer_rdv(client_id, jour, heure, type_client,
         # Écriture simultanée dans la table "appointment"
         try:
             salon_id_eff = salon_id or _session_salon_id
+
+            # Résoudre salon_id si toujours None
             if not salon_id_eff:
-                try:
-                    result = supabase.table("salon").select("id")\
-                        .eq("twilio_number", TWILIO_NUMBER)\
-                        .limit(1).execute()
-                    if result.data:
-                        salon_id_eff = result.data[0]["id"]
-                        print(f"✅ [APPOINTMENT] salon_id trouvé : {salon_id_eff}")
-                except Exception as e:
-                    print(f"⚠️ [APPOINTMENT] salon_id non trouvé : {e}")
+                res = supabase.table("salon").select("id")\
+                    .eq("twilio_number", TWILIO_NUMBER)\
+                    .limit(1).execute()
+                if res.data:
+                    salon_id_eff = res.data[0]["id"]
+
+            print(f"💾 [APPOINTMENT] salon_id={salon_id_eff} "
+                  f"client={client_nom} jour={jour} heure={heure}")
+
             appt_row = {
-                "salon_id":    salon_id_eff,
-                "client_name": client_nom or telephone or "Inconnu",
+                "salon_id":     salon_id_eff,
+                "client_name":  client_nom or telephone or "Inconnu",
                 "client_phone": telephone or "",
-                "status":      "confirme",
-                "date":        jour,
-                "time":        heure + ":00" if len(heure) == 5 else heure,
-                "service":     prestation,
-                "staff_name":  coupe_detail or "",
-                "price":       prix or 0,
-                "created_at":  datetime.now(timezone.utc).isoformat(),
+                "status":       "confirme",
+                "date":         jour,
+                "time":         heure + ":00" if len(heure) == 5 else heure,
+                "service":      prestation,
+                "staff_name":   coupe_detail or "",
+                "price":        prix or 0,
+                "created_at":   datetime.now(timezone.utc).isoformat(),
             }
-            print(f"💾 [APPOINTMENT] Insertion : {appt_row}")
+
             appt_result = supabase.table("appointment")\
                 .insert(appt_row).execute()
             appt_id = appt_result.data[0]["id"] \
                       if appt_result.data else None
-            print(f"✅ [APPOINTMENT] id={appt_id}")
+            print(f"✅ [APPOINTMENT] Inséré id={appt_id}")
+
         except Exception as e_appt:
-            print(f"⚠️ [APPOINTMENT] Erreur : {e_appt}")
+            print(f"❌ [APPOINTMENT] ERREUR : {e_appt}")
+            import traceback
+            traceback.print_exc()
 
         if client_id:
             client_row = supabase.table("clients")\
@@ -828,6 +894,22 @@ try:
 except Exception as _e_sync:
     print(f"⚠️ [BOOT] sync_appointment_columns : {_e_sync}")
 
+# Chargement complet salon au démarrage
+try:
+    load_all_salon_data()
+except Exception as _e_load:
+    print(f"⚠️ [BOOT] load_all_salon_data failed : {_e_load}")
+
+# Vérification colonnes table employee
+try:
+    _sample_emp = supabase.table("employee").select("*").limit(1).execute()
+    if _sample_emp.data:
+        print(f"📋 [EMPLOYEE] Colonnes : {list(_sample_emp.data[0].keys())}")
+    else:
+        print("📋 [EMPLOYEE] Table vide")
+except Exception as _e_emp:
+    print(f"⚠️ [EMPLOYEE] {_e_emp}")
+
 
 def annuler_rdv(client_id: str, rdv_id: str) -> bool:
     """Annule un RDV en le marquant comme 'annule'."""
@@ -1120,19 +1202,23 @@ MÉMOIRE DU CLIENT :
             else:
                 prompt += f"Accueille-le chaleureusement par son prénom.\n"
 
-    # Ajouter les prestations chargées depuis Supabase
-    if PRESTATIONS_SALON:
-        noms_prestations = [p.get("name", "") for p in PRESTATIONS_SALON if p.get("name")]
-        prompt += f"\nPRESTATIONS DISPONIBLES : {', '.join(noms_prestations)}\n"
-        prompt += ("Si client demande une prestation non listée : "
-                   "explique qu'elle n'est pas disponible et propose de lister par genre.\n")
-
-    # Ajouter les coiffeurs disponibles
+    # Coiffeurs dynamiques depuis Supabase
     if COIFFEURS:
-        noms_coiffeurs = [c.get("nom", "") for c in COIFFEURS if c.get("nom")]
-        prompt += f"ÉQUIPE : {', '.join(noms_coiffeurs)}\n"
+        liste_coiffeurs = ', '.join([c['nom'] for c in COIFFEURS if c.get('nom')])
+        prompt += f"\nÉQUIPE DISPONIBLE : {liste_coiffeurs}\n"
+        prompt += ("Propose UNIQUEMENT ces coiffeurs. "
+                   "Ne jamais inventer de noms.\n")
+    else:
+        prompt += "\nAucun coiffeur enregistré pour ce salon.\n"
 
-    print(f"🧠 [PROMPT] Jours dans prompt : {JOURS_OUVERTS}")
+    # Prestations dynamiques depuis Supabase
+    if PRESTATIONS_SALON:
+        noms_prest = [p.get('name', '') for p in PRESTATIONS_SALON if p.get('name')]
+        prompt += f"\nPRESTATIONS DISPONIBLES : {', '.join(noms_prest)}\n"
+        prompt += ("Propose UNIQUEMENT ces prestations. "
+                   "Refuse toute prestation non listée.\n")
+
+    print(f"🧠 [PROMPT] Jours={JOURS_OUVERTS} | Coiffeurs={[c['nom'] for c in COIFFEURS]} | Prestations={len(PRESTATIONS_SALON)}")
     return prompt
 
 # ====================================================
@@ -1814,34 +1900,9 @@ def handle_appel(
 
     twiml = VoiceResponse()
 
-    # Charger la config salon depuis Supabase (persistance entre redémarrages)
-    try:
-        called = Called or TWILIO_NUMBER
-        salon_data = supabase.table("salon").select("*")\
-            .eq("twilio_number", called).limit(1).execute()
-        if salon_data.data:
-            s = salon_data.data[0]
-            if s.get("nom"):               NOM_SALON = s["nom"]
-            if s.get("telephone"):         TELEPHONE_SALON = s["telephone"]
-            if s.get("adresse"):           ADRESSE_SALON = s["adresse"]
-            if s.get("horaire_ouverture"): HORAIRE_OUVERTURE = s["horaire_ouverture"]
-            if s.get("horaire_fermeture"): HORAIRE_FERMETURE = s["horaire_fermeture"]
-            if s.get("jours_ouverts"):
-                try:
-                    jours = json.loads(s["jours_ouverts"])
-                    if isinstance(jours, list) and len(jours) > 0:
-                        JOURS_OUVERTS = jours
-                        print(f"✅ [APPEL] Jours chargés : {JOURS_OUVERTS}")
-                except Exception as e_j:
-                    print(f"⚠️ [APPEL] Erreur parse jours : {e_j}")
-        print(f"📞 [APPEL] NOM_SALON={NOM_SALON}")
-        print(f"📞 [APPEL] JOURS_OUVERTS={JOURS_OUVERTS}")
-        print(f"📞 [APPEL] HORAIRES={HORAIRE_OUVERTURE}-{HORAIRE_FERMETURE}")
-    except Exception as e:
-        print(f"⚠️ [APPEL] Erreur chargement config : {e}")
-
-    # Charger équipe et prestations depuis Supabase
-    load_salon_data()
+    # Charger config, coiffeurs et prestations depuis Supabase
+    load_all_salon_data()
+    print(f"📞 [APPEL] NOM_SALON={NOM_SALON} | JOURS={JOURS_OUVERTS} | HORAIRES={HORAIRE_OUVERTURE}-{HORAIRE_FERMETURE}")
 
     # Anti-spam : bloquer si +10 appels en 24h
     def est_spam(tel: str) -> bool:
