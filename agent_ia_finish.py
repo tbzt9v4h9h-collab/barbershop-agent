@@ -337,19 +337,52 @@ def update_client_context(telephone: str, **kwargs):
 
 def clean_messages(messages: list) -> list:
     """
-    CORRECTION BUG 1 : Nettoie l'historique des messages orphelins
-    Supprime les messages 'tool' qui ne sont pas précédés
-    d'un message 'assistant' avec 'tool_calls'.
+    Nettoie l'historique pour éviter les messages orphelins.
+    Règles OpenAI :
+    1. Un message assistant avec tool_calls DOIT être suivi
+       d'un message tool pour chaque tool_call_id
+    2. Un message tool DOIT être précédé d'un assistant
+       avec tool_calls
     """
     cleaned = []
-    for i, msg in enumerate(messages):
-        if msg.get('role') == 'tool':
-            # Vérifier que le message précédent est un assistant avec tool_calls
-            if cleaned and cleaned[-1].get('role') == 'assistant' and cleaned[-1].get('tool_calls'):
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+
+        if msg.get('role') == 'assistant' and msg.get('tool_calls'):
+            # Collecter tous les tool_call_ids attendus
+            expected_ids = {tc['id'] for tc in msg['tool_calls']}
+
+            # Chercher les tool results qui suivent
+            tool_results = []
+            j = i + 1
+            while j < len(messages) and messages[j].get('role') == 'tool':
+                tool_results.append(messages[j])
+                j += 1
+
+            # Vérifier que tous les IDs sont couverts
+            found_ids = {tr.get('tool_call_id') for tr in tool_results}
+
+            if expected_ids == found_ids and tool_results:
+                # Tout est bon, ajouter le bloc complet
                 cleaned.append(msg)
-            # Sinon, ignorer ce message orphelin
+                cleaned.extend(tool_results)
+                i = j
+            else:
+                # Bloc incomplet — ignorer complètement
+                print(f"⚠️ [CLEAN] Bloc tool_calls incomplet ignoré "
+                      f"(attendu: {expected_ids}, trouvé: {found_ids})")
+                i = j if j > i + 1 else i + 1
+
+        elif msg.get('role') == 'tool':
+            # Message tool orphelin — ignorer
+            print(f"⚠️ [CLEAN] Tool result orphelin ignoré : "
+                  f"{msg.get('tool_call_id')}")
+            i += 1
         else:
             cleaned.append(msg)
+            i += 1
+
     return cleaned
 
 # ====================================================
@@ -1606,7 +1639,13 @@ def run_agent(message_user: str, telephone: str) -> str:
 
     except Exception as e:
         print(f"Erreur GPT-4o: {e}")
-        return "Désolé, une erreur s'est produite. Pouvez-vous répéter?"
+        # Nettoyer l'historique en cas d'erreur
+        history = get_conversation_history(telephone)
+        if history and history[-1].get('role') == 'assistant' \
+           and history[-1].get('tool_calls'):
+            history.pop()
+            print("⚠️ [CLEAN] Dernier tool_call retiré après erreur")
+        return "Désolé, pouvez-vous répéter ?"
 
     # Traiter la réponse
     choice = response.choices[0]
@@ -1654,7 +1693,12 @@ def run_agent(message_user: str, telephone: str) -> str:
 
         except Exception as e:
             print(f"Erreur GPT-4o (retry): {e}")
-            return "Désolé, une erreur s'est produite. Pouvez-vous répéter?"
+            history = get_conversation_history(telephone)
+            if history and history[-1].get('role') == 'assistant' \
+               and history[-1].get('tool_calls'):
+                history.pop()
+                print("⚠️ [CLEAN] Dernier tool_call retiré après erreur (retry)")
+            return "Désolé, pouvez-vous répéter ?"
 
         choice = response.choices[0]
 
