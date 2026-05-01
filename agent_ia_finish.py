@@ -1949,6 +1949,79 @@ async def sync_config(request: Request):
         print(f"❌ [SYNC] Erreur : {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/sync-staff")
+async def sync_staff(request: Request):
+    try:
+        data = await request.json()
+        print(f"📥 [SYNC-STAFF] Reçu : {data}")
+
+        global COIFFEURS
+        staff_list = data.get("staff") or data.get("employees") or []
+
+        COIFFEURS = []
+        sid = salon_id_from_twilio()
+
+        for s in staff_list:
+            nom = (s.get("full_name") or s.get("name") or
+                   s.get("firstName") or "")
+            if not nom:
+                continue
+            COIFFEURS.append({
+                "nom": nom,
+                "id": s.get("id", ""),
+                "specialites": s.get("specialties") or s.get("role", ""),
+            })
+            try:
+                supabase.table("employee").upsert({
+                    "id": s.get("id"),
+                    "salon_id": sid,
+                    "full_name": nom,
+                    "specialties": s.get("specialties", ""),
+                }, on_conflict="id").execute()
+            except Exception as e:
+                print(f"⚠️ [SYNC-STAFF] Erreur : {e}")
+
+        print(f"✅ [SYNC-STAFF] {len(COIFFEURS)} coiffeurs : "
+              f"{[c['nom'] for c in COIFFEURS]}")
+        return {"status": "ok", "coiffeurs": len(COIFFEURS)}
+    except Exception as e:
+        print(f"❌ [SYNC-STAFF] {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/sync-services")
+async def sync_services(request: Request):
+    try:
+        data = await request.json()
+        print(f"📥 [SYNC-SERVICES] Reçu : {data}")
+
+        global PRESTATIONS_SALON
+        services_list = data.get("services") or data.get("prestations") or []
+
+        PRESTATIONS_SALON = []
+        sid = salon_id_from_twilio()
+
+        for sv in services_list:
+            nom = sv.get("name") or sv.get("nom") or ""
+            if not nom:
+                continue
+            PRESTATIONS_SALON.append(sv)
+            try:
+                supabase.table("service").upsert({
+                    "id": sv.get("id"),
+                    "salon_id": sid,
+                    "name": nom,
+                    "price": sv.get("price") or 0,
+                    "duration_minutes": sv.get("duration") or 30,
+                }, on_conflict="id").execute()
+            except Exception as e:
+                print(f"⚠️ [SYNC-SERVICES] Erreur : {e}")
+
+        print(f"✅ [SYNC-SERVICES] {len(PRESTATIONS_SALON)} prestations")
+        return {"status": "ok", "prestations": len(PRESTATIONS_SALON)}
+    except Exception as e:
+        print(f"❌ [SYNC-SERVICES] {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 # ====================================================
 # ENDPOINT PRINCIPAL
 # ====================================================
