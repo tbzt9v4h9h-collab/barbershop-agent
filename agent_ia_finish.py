@@ -435,10 +435,26 @@ def enregistrer_rdv(client_id, jour, heure, type_client,
                     duree_max, prix, avec_shampoing=False, salon_id=None,
                     telephone=None, client_nom=None):
     """Enregistre un RDV dans Supabase, incrémente nb_visites, envoie SMS de confirmation."""
+    # RÉSOLUTION SALON_ID EN PRIORITÉ
+    if not salon_id:
+        try:
+            result = supabase.table("salon")\
+                .select("id")\
+                .eq("twilio_number", TWILIO_NUMBER)\
+                .limit(1).execute()
+            if result.data:
+                salon_id = result.data[0]["id"]
+                print(f"✅ [RDV] salon_id={salon_id}")
+            else:
+                print(f"⚠️ [RDV] Aucun salon pour {TWILIO_NUMBER}")
+        except Exception as e:
+            print(f"⚠️ [RDV] Erreur salon_id : {e}")
+
     try:
         heure_fin = ajouter_minutes_hhmm(heure, duree_max)
         row = {
             "client_id":      client_id,
+            "salon_id":       salon_id,
             "jour":           jour,
             "heure_debut":    heure,
             "heure_fin":      heure_fin,
