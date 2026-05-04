@@ -26,7 +26,7 @@ print("🔵 [BOOT 1/8] load_dotenv OK")
 # ====================================================
 # ⚙️ CONFIGURATION DU SALON — À PERSONNALISER
 # ====================================================
-NOM_SALON = "Chez les fdp du dégradé"          # À PERSONNALISER
+NOM_SALON = "le salon"  # Remplacé au démarrage par Supabase via load_all_salon_data()
 TELEPHONE_SALON = "+33939245880"                  # À PERSONNALISER
 ADRESSE_SALON = "12 rue Exemple, 75001 Paris"    # À PERSONNALISER
 
@@ -1856,6 +1856,7 @@ async def sync_config(request: Request):
         # ── Config salon de base ──────────────────────────────────
         if data.get("salon_name"):
             NOM_SALON = data["salon_name"]
+            print(f"✅ [SYNC] NOM_SALON = {NOM_SALON}")
         if data.get("twilio_phone"):
             TELEPHONE_SALON = data["twilio_phone"]
             TWILIO_NUMBER = data["twilio_phone"]
