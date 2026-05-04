@@ -288,6 +288,7 @@ NOMS_MOIS = [
 # ====================================================
 conversation_history = {}  # {phone: [{"role": "user/assistant/tool", "content": "..."}]}
 client_context = {}        # {phone: {"nom": "...", "client_id": "...", "prenom": "..."}}
+derniere_activite = {}     # {phone: datetime} — pour nettoyage auto des historiques inactifs
 
 def get_conversation_history(telephone: str):
     """Récupère l'historique de conversation pour ce numéro."""
@@ -299,6 +300,24 @@ def add_to_history(telephone: str, role: str, content: str):
     """Ajoute un message à l'historique."""
     history = get_conversation_history(telephone)
     history.append({"role": role, "content": content})
+    derniere_activite[telephone] = datetime.now()
+
+def nettoyer_historiques():
+    """Supprime les historiques de conversations inactifs depuis plus de 2h."""
+    maintenant = datetime.now()
+    a_supprimer = []
+    for tel in list(conversation_history.keys()):
+        if tel in derniere_activite:
+            if (maintenant - derniere_activite[tel]).seconds > 7200:
+                a_supprimer.append(tel)
+    for tel in a_supprimer:
+        del conversation_history[tel]
+        if tel in client_context:
+            del client_context[tel]
+        if tel in derniere_activite:
+            del derniere_activite[tel]
+    if a_supprimer:
+        print(f"🧹 [CLEAN] {len(a_supprimer)} historiques supprimés")
 
 def add_assistant_message_with_tools(telephone: str, content: str = None, tool_calls: list = None):
     """Ajoute un message assistant avec tool_calls."""
@@ -891,6 +910,8 @@ try:
                       id="rappels_1h", replace_existing=True)
     scheduler.add_job(send_rapport_hebdo, "cron", day_of_week="mon", hour=8,
                       id="rapport_hebdo", replace_existing=True)
+    scheduler.add_job(nettoyer_historiques, "cron", minute=30,
+                      id="nettoyage_historiques", replace_existing=True)
     scheduler.start()
     print("🔵 [BOOT 7/8] Scheduler OK — rappels 10h00, rappels 1h, rapport lundi 8h")
 except Exception as _e_sched:
@@ -1139,6 +1160,16 @@ def build_system_prompt(telephone: str = None) -> str:
 📅 Jours ouverts : {', '.join(JOURS_OUVERTS)}
 🕸️ Site : {SITE_CLIENT}
 
+IMPORTANT : Réponds en maximum 1-2 phrases TRÈS courtes. Maximum 20 mots par réponse. Sois direct et efficace comme au téléphone.
+
+TON ET LANGAGE :
+Utilise un langage naturel et chaleureux comme une vraie réceptionniste française.
+Évite les formulations trop formelles ou robotiques. Varie tes expressions.
+- Au lieu de "Quelle prestation souhaitez-vous ?" → "Qu'est-ce que je peux faire pour vous ?"
+- Au lieu de "Quel jour vous convient ?" → "Vous préférez venir quand ?"
+- Au lieu de "Votre prénom ?" → "C'est à quel nom ?"
+- Utilise : "Très bien !", "Parfait !", "Bien sûr !", "Pas de souci !", "Avec plaisir !"
+
 RÈGLES ABSOLUES :
 0. Tu réponds TOUJOURS en français, peu importe la langue du message reçu. Ne jamais répondre en anglais.
 0b. Dès que le client donne son prénom, appelle IMMÉDIATEMENT get_client_info avec son numéro de téléphone pour enregistrer le contexte, avant même de continuer la conversation.
@@ -1152,20 +1183,25 @@ RÈGLES ABSOLUES :
 8. Tu ne raccroches que si le RDV est confirmé OU si le client dit au revoir explicitement
 9. Si un créneau n'est pas disponible, tu proposes AUTOMATIQUEMENT le suivant disponible
 10. Si le salon est fermé ce jour, tu dis pourquoi et tu proposes un autre jour
-11. Réponds en maximum 1-2 phrases courtes. Sois direct et concis. Pas de phrases longues.
+11. Maximum 2 phrases courtes par réponse, toujours.
 12. Dès que le client donne son prénom, appelle immédiatement get_client_info pour vérifier s'il existe déjà, puis utilise rechercher_client_par_nom si aucun nom n'est trouvé par téléphone.
 13. Si le client demande des conseils (coloration, coupe conseillée, soin, entretien, etc.), appelle immédiatement demander_rappel_conseil puis dis au client : "Bien sûr [prénom] ! Un expert vous rappelle au [numéro] dans les plus brefs délais."
-14. Quand le client donne son prénom, répète-le UNE SEULE FOIS pour confirmer ("Parfait [Prénom] !") puis CONTINUE IMMÉDIATEMENT avec la suite. Ne redemande JAMAIS le prénom si tu l'as déjà reçu dans cette conversation. Si tu as déjà le prénom dans l'historique, utilise-le directement sans le redemander.
+14. Quand le client donne son prénom, répète-le UNE SEULE FOIS pour confirmer ("Parfait [Prénom] !") puis CONTINUE IMMÉDIATEMENT. Ne redemande JAMAIS le prénom si tu l'as déjà.
 15. Ne redemande JAMAIS une information déjà donnée dans la conversation.
 16. Si le client répète son prénom, dis simplement "Oui je vous ai bien noté [Prénom]" et continue.
-17. Maximum 2 phrases par réponse, toujours.
 
-FLOW RDV : 1) Extraire prestation+jour+heure → 2) Demander coiffeur (préférence) → 3) Demander prénom (1 fois) → 4) Demander shampoing (1 fois) → 5) Récapituler et confirmer → 6) Enregistrer → "RDV confirmé !"
+FLOW RDV : 1) Extraire prestation+jour+heure → 2) Demander coiffeur (préférence) → 3) Demander prénom (1 fois) → 4) Demander shampoing (1 fois) → 5) Récapituler et confirmer → 6) Enregistrer
 Si créneau indisponible : appelle proposer_creneaux, présente les 3 options en 1 phrase.
 Si demande de prix : calcule total et propose un créneau dans la même phrase. Donne le prix AVANT de confirmer.
 Si "parler à quelqu'un" / "humain" : appelle transfert_humain.
 Si événement urgent (mariage, cérémonie) : priorité créneaux du jour, appelle transfert_humain.
 Après coupe homme : propose barbe (1 fois). Après coupe femme : propose soin (1 fois).
+
+CONFIRMATION RDV :
+Dis exactement : "Donc je récapitule : [prestation] [avec/sans shampoing] le [jour] à [heure] avec [coiffeur]. C'est bien ça ?"
+Attends un "oui", "c'est ça", "parfait", "exact" ou similaire.
+Si le client dit "non" : demande ce qu'il veut changer.
+Une fois confirmé : enregistre et dis "Parfait, c'est réservé ! Vous recevrez un SMS de confirmation. À [jour] !"
 
 GESTION COIFFEURS :
 - Toujours demander préférence coiffeur après prestation/heure
@@ -1181,6 +1217,12 @@ CONSEILS :
 - Quand client demande conseil, utilise son prénom connu ou demande-le
 - Appelle demander_rappel_conseil avec prénom ET numéro appelant
 - Confirme : "Un expert vous rappelle au [numéro] dans les plus brefs délais"
+
+GESTION DES INTERRUPTIONS :
+- Si le client change de sujet en plein milieu, adapte-toi immédiatement sans insister
+- Si le client dit "non finalement" ou "laisse tomber" : "Pas de souci ! Y a-t-il autre chose que je peux faire pour vous ?"
+- Si le client semble hésiter : "Je peux vous proposer nos disponibilités si vous voulez ?"
+- Ne jamais forcer ou insister sur un créneau refusé
 
 ANNULATION RDV :
 1. Appelle get_rdv_client_actif avec le numéro du client
@@ -1711,6 +1753,12 @@ def run_agent(message_user: str, telephone: str) -> str:
     if est_anglais:
         sys_prompt += "\nLe client parle anglais. Réponds en anglais mais garde les données en français dans Supabase."
 
+    # Limiter l'historique à 10 messages pour performance
+    history = get_conversation_history(telephone)
+    if len(history) > 10:
+        history = history[-10:]
+        conversation_history[telephone] = history
+
     # Préparer les messages avec le system prompt en premier
     messages = [{"role": "system", "content": sys_prompt}] + get_conversation_history(telephone)
 
@@ -1725,7 +1773,7 @@ def run_agent(message_user: str, telephone: str) -> str:
             tools=TOOLS,
             tool_choice="auto",
             temperature=0.3,
-            max_tokens=150,
+            max_tokens=100,
         )
         # ÉTAPE 2 : Récupérer et accumuler les tokens
         session_tokens_input += response.usage.prompt_tokens
@@ -1779,7 +1827,7 @@ def run_agent(message_user: str, telephone: str) -> str:
                 model="gpt-4o-mini",
                 messages=messages,
                 temperature=0.3,
-                max_tokens=150,
+                max_tokens=100,
             )
             # ÉTAPE 2 : Récupérer et accumuler les tokens du deuxième appel
             session_tokens_input += response.usage.prompt_tokens
@@ -2054,25 +2102,61 @@ def handle_appel(
             return False
 
     telephone_appelant = From or Called
+
+    # Numéro masqué ou anonyme
+    if not telephone_appelant or telephone_appelant.lower() in ("", "anonymous", "unknown"):
+        twiml.say(
+            "Bonjour ! Pour prendre rendez-vous, merci de rappeler sans masquer votre numéro "
+            "afin qu'on puisse vous envoyer la confirmation. À bientôt !",
+            language="fr-FR", voice="Polly.Lea",
+        )
+        twiml.hangup()
+        return str(twiml)
+
     if est_spam(telephone_appelant):
         twiml.say("Ce numéro a été temporairement suspendu.", language="fr-FR", voice="Polly.Lea")
         twiml.hangup()
         return str(twiml)
 
+    HINTS = (
+        "rendez-vous, coupe, couleur, brushing, shampoing, annuler, demain, "
+        "lundi, mardi, mercredi, jeudi, vendredi, samedi, bonjour, oui, non, "
+        "merci, au revoir, barbe, dégradé, soin, balayage, mèches, prénom, heure"
+    )
+
     if not SpeechResult:
+        # Compteur de silences par session
+        silence_key = f"silence_{telephone_appelant}"
+        nb_silences = client_context.get(silence_key, 0)
+
+        if nb_silences >= 2:
+            twiml.say(
+                "Je ne vous entends pas. N'hésitez pas à nous rappeler. À bientôt !",
+                language="fr-FR", voice="Polly.Lea",
+            )
+            twiml.hangup()
+            client_context.pop(silence_key, None)
+            return str(twiml)
+
+        if nb_silences == 1:
+            client_context[silence_key] = nb_silences + 1
+            gather = twiml.gather(
+                input="speech", action="/appel", method="POST",
+                language="fr-FR", speech_timeout="auto",
+                speech_model="phone_call", timeout=6, hints=HINTS,
+            )
+            gather.say("Vous êtes toujours là ? Je vous écoute.", language="fr-FR", voice="Polly.Lea")
+            return str(twiml)
+
+        client_context[silence_key] = nb_silences + 1
         gather = twiml.gather(
-            input="speech",
-            action="/appel",
-            method="POST",
-            language="fr-FR",
-            speech_timeout="auto",
-            speech_model="phone_call",
-            timeout=5,
+            input="speech", action="/appel", method="POST",
+            language="fr-FR", speech_timeout="auto",
+            speech_model="phone_call", timeout=6, hints=HINTS,
         )
         gather.say(
             f"Bonjour et bienvenue chez {NOM_SALON}, comment puis-je vous aider ?",
-            language="fr-FR",
-            voice="Polly.Lea",
+            language="fr-FR", voice="Polly.Lea",
         )
         return str(twiml)
 
@@ -2107,7 +2191,8 @@ def handle_appel(
             language="fr-FR",
             speech_timeout="auto",
             speech_model="phone_call",
-            timeout=8,
+            timeout=6,
+            hints=HINTS,
         )
         gather.say(response_text, language="fr-FR", voice="Polly.Lea")
         twiml.say("Merci pour votre appel. À bientôt !", language="fr-FR", voice="Polly.Lea")
