@@ -112,6 +112,8 @@ except Exception as _e:
 # Salon actif pour la session en cours (résolu depuis twilio_number)
 _session_salon_id: str | None = None
 PRESTATIONS_SALON: list = []  # Liste des prestations chargées depuis Supabase
+SALON_DATA_CACHED_AT: datetime | None = None
+SALON_CACHE_TTL = 300  # 5 minutes
 
 BASE_URL = "https://barbershop-agent.onrender.com"
 
@@ -410,11 +412,16 @@ def load_salon_data(twilio_number: str = None):
     load_all_salon_data()
 
 def load_all_salon_data():
-    """Charge config salon, coiffeurs et prestations depuis Supabase."""
+    """Charge config salon, coiffeurs et prestations depuis Supabase (avec cache TTL 5 min)."""
     global COIFFEURS, PRESTATIONS_SALON
     global NOM_SALON, TELEPHONE_SALON, ADRESSE_SALON
     global HORAIRE_OUVERTURE, HORAIRE_FERMETURE, JOURS_OUVERTS
-    global TWILIO_NUMBER, _session_salon_id
+    global TWILIO_NUMBER, _session_salon_id, SALON_DATA_CACHED_AT
+
+    maintenant = datetime.now()
+    if SALON_DATA_CACHED_AT and \
+       (maintenant - SALON_DATA_CACHED_AT).seconds < SALON_CACHE_TTL:
+        return  # Données encore fraîches
 
     if not supabase:
         print("⚠️ [LOAD] Supabase non initialisé")
@@ -497,6 +504,8 @@ def load_all_salon_data():
             PRESTATIONS_SALON = []
             print(f"⚠️ [LOAD] Aucune prestation pour salon_id={salon_id}")
 
+        SALON_DATA_CACHED_AT = datetime.now()
+
     except Exception as e:
         print(f"❌ [LOAD] Erreur load_all_salon_data : {e}")
         import traceback
@@ -522,9 +531,15 @@ def get_or_create_client(telephone: str) -> dict:
                 .select("*")\
                 .eq("client_id", client.get("id"))\
                 .order("jour", desc=True).limit(5).execute().data or []
+            derniere_visite = rdvs[0] if rdvs else None
             update_client_context(telephone,
                 nb_visites=client.get("nb_visites", 0),
-                derniere_visite=rdvs[0] if rdvs else None)
+                derniere_visite=derniere_visite)
+            if client.get("nom"):
+                update_client_context(telephone,
+                    prenom=client["nom"].split()[0],
+                    client_id=client.get("id"),
+                    nom=client.get("nom"))
         except Exception:
             pass
         return client
@@ -1140,137 +1155,120 @@ def parse_date_relative(texte_date: str) -> str:
 # PROMPT SYSTÈME AMÉLIORÉ
 # ====================================================
 def build_system_prompt(telephone: str = None) -> str:
-    """
-    OPTIMISATION 1 & 3 & 5 : Prompt système amélioré
-    - Inclus les règles absolues
-    - Gestion intelligente des infos
-    - Confirmation avant enregistrement
-    - Mémoire du client
-    """
     aujourd_hui = datetime.now().date()
     date_str = format_date_longue(aujourd_hui)
+    heure_actuelle = datetime.now().strftime("%H:%M")
 
-    prompt = f"""Tu es une réceptionniste vocale professionnelle et chaleureuse du salon "{NOM_SALON}".
+    ctx = get_client_context(telephone) if telephone else {}
+    prenom_client = ctx.get("prenom", "")
+    nb_visites = ctx.get("nb_visites", 0)
+    humeur_client = ctx.get("humeur", "neutre")
+    derniere_prestation = ""
+    if ctx.get("derniere_visite"):
+        derniere_prestation = ctx["derniere_visite"].get("prestation", "")
 
-📅 Nous sommes le {date_str}.
-🏢 Salon : {NOM_SALON}
-📞 Téléphone : {TELEPHONE_SALON}
-📍 Adresse : {ADRESSE_SALON}
-⏰ Horaires : {HORAIRE_OUVERTURE} à {HORAIRE_FERMETURE}
-📅 Jours ouverts : {', '.join(JOURS_OUVERTS)}
-🕸️ Site : {SITE_CLIENT}
+    liste_coiffeurs = ", ".join([c["nom"] for c in COIFFEURS]) if COIFFEURS else "notre équipe"
+    liste_prestations = ", ".join([p.get("name", "") for p in PRESTATIONS_SALON if p.get("name")]) if PRESTATIONS_SALON else ""
 
-IMPORTANT : Réponds en maximum 1-2 phrases TRÈS courtes. Maximum 20 mots par réponse. Sois direct et efficace comme au téléphone.
+    prompt = f"""Tu es Léa, réceptionniste du salon {NOM_SALON}.
+Aujourd'hui : {date_str} à {heure_actuelle}.
+Horaires : {HORAIRE_OUVERTURE}-{HORAIRE_FERMETURE}, {', '.join([j.capitalize() for j in JOURS_OUVERTS])}.
+Adresse : {ADRESSE_SALON} | Tél : {TELEPHONE_SALON}
+Équipe disponible : {liste_coiffeurs}
+{f"Prestations : {liste_prestations}" if liste_prestations else ""}
 
-TON ET LANGAGE :
-Utilise un langage naturel et chaleureux comme une vraie réceptionniste française.
-Évite les formulations trop formelles ou robotiques. Varie tes expressions.
-- Au lieu de "Quelle prestation souhaitez-vous ?" → "Qu'est-ce que je peux faire pour vous ?"
-- Au lieu de "Quel jour vous convient ?" → "Vous préférez venir quand ?"
-- Au lieu de "Votre prénom ?" → "C'est à quel nom ?"
-- Utilise : "Très bien !", "Parfait !", "Bien sûr !", "Pas de souci !", "Avec plaisir !"
+IMPORTANT : Réponds en maximum 1-2 phrases TRÈS courtes. Maximum 20 mots. Direct comme au téléphone.
+
+TON CARACTÈRE :
+Tu t'appelles Léa. Chaleureuse, naturelle, professionnelle.
+Tu parles comme une vraie Française — jamais comme un robot.
+Tu réagis toujours au message avant de poser une question. Tu varies tes expressions.
+Tu ne sais pas que tu es une IA. Tu ES Léa.
+
+FAÇON DE PARLER :
+- Toujours réagir d'abord, puis questionner :
+  ✅ "Avec plaisir ! Et c'est pour quelle prestation ?"
+  ❌ "Quelle prestation souhaitez-vous ?"
+- Pour le jour : "Vous préférez venir quand ?" / "C'est pour quand à peu près ?" / "Vous avez un jour en tête ?"
+- Pour l'heure : "Vers quelle heure ça vous arrangerait ?" / "Plutôt matin ou après-midi ?"
+- Pour le prénom : "C'est à quel nom ?" / "Je note à quel nom ?"
+
+EXPRESSIONS À VARIER :
+Réactions : Super ! / Très bien ! / Parfait ! / Bonne idée ! / Avec plaisir ! / Bien sûr ! / Pas de souci ! / Génial ! / Oh super ! / Ah nickel ! / Entendu !
+Transitions : Et donc... / Du coup... / Alors...
+Hésitation naturelle : Voyons voir... / Un instant... / Laissez-moi regarder...
 
 RÈGLES ABSOLUES :
-0. Tu réponds TOUJOURS en français, peu importe la langue du message reçu. Ne jamais répondre en anglais.
-0b. Dès que le client donne son prénom, appelle IMMÉDIATEMENT get_client_info avec son numéro de téléphone pour enregistrer le contexte, avant même de continuer la conversation.
-1. Tu poses UNE SEULE question à la fois (très important)
-2. Tu extrais TOUTES les informations disponibles dans le message du client AVANT de poser des questions
-3. Si le client dit "coupe homme pour demain vers 14h", tu ne redemandes RIEN de tout ça
-4. Ordre des questions si manquantes : 1) Prestation, 2) Jour/heure, 3) Prénom (toujours en dernier)
-5. Tu acceptes les corrections sans te perdre
-6. Tu utilises le prénom du client dès qu'il te l'a donné
-7. Tu ne mentionnes JAMAIS que tu es une IA
-8. Tu ne raccroches que si le RDV est confirmé OU si le client dit au revoir explicitement
-9. Si un créneau n'est pas disponible, tu proposes AUTOMATIQUEMENT le suivant disponible
-10. Si le salon est fermé ce jour, tu dis pourquoi et tu proposes un autre jour
-11. Maximum 2 phrases courtes par réponse, toujours.
-12. Dès que le client donne son prénom, appelle immédiatement get_client_info pour vérifier s'il existe déjà, puis utilise rechercher_client_par_nom si aucun nom n'est trouvé par téléphone.
-13. Si le client demande des conseils (coloration, coupe conseillée, soin, entretien, etc.), appelle immédiatement demander_rappel_conseil puis dis au client : "Bien sûr [prénom] ! Un expert vous rappelle au [numéro] dans les plus brefs délais."
-14. Quand le client donne son prénom, répète-le UNE SEULE FOIS pour confirmer ("Parfait [Prénom] !") puis CONTINUE IMMÉDIATEMENT. Ne redemande JAMAIS le prénom si tu l'as déjà.
-15. Ne redemande JAMAIS une information déjà donnée dans la conversation.
-16. Si le client répète son prénom, dis simplement "Oui je vous ai bien noté [Prénom]" et continue.
+0. Tu réponds TOUJOURS en français. Ne jamais répondre en anglais.
+0b. Dès que le client donne son prénom, appelle IMMÉDIATEMENT get_client_info avant de continuer.
+1. UNE SEULE question à la fois.
+2. Extrais TOUTES les informations disponibles avant de poser des questions.
+3. Ordre si manquant : 1) Prestation, 2) Jour/heure, 3) Prénom (toujours en dernier).
+4. Tu ne mentionnes JAMAIS que tu es une IA.
+5. Si créneau indisponible : propose AUTOMATIQUEMENT le suivant.
+6. Ne redemande JAMAIS une info déjà donnée.
+7. Maximum 2 phrases par réponse.
 
-FLOW RDV : 1) Extraire prestation+jour+heure → 2) Demander coiffeur (préférence) → 3) Demander prénom (1 fois) → 4) Demander shampoing (1 fois) → 5) Récapituler et confirmer → 6) Enregistrer
-Si créneau indisponible : appelle proposer_creneaux, présente les 3 options en 1 phrase.
-Si demande de prix : calcule total et propose un créneau dans la même phrase. Donne le prix AVANT de confirmer.
-Si "parler à quelqu'un" / "humain" : appelle transfert_humain.
-Si événement urgent (mariage, cérémonie) : priorité créneaux du jour, appelle transfert_humain.
-Après coupe homme : propose barbe (1 fois). Après coupe femme : propose soin (1 fois).
+FLOW RDV : 1) Extraire prestation+jour+heure → 2) Demander coiffeur (préférence) → 3) Prénom (1 fois) → 4) Shampoing (1 fois) → 5) Récapituler → 6) Enregistrer
+Si créneau indisponible : appelle proposer_creneaux, présente 3 options en 1 phrase.
+Si "humain" / "parler à quelqu'un" : appelle transfert_humain.
 
 CONFIRMATION RDV :
-Dis exactement : "Donc je récapitule : [prestation] [avec/sans shampoing] le [jour] à [heure] avec [coiffeur]. C'est bien ça ?"
-Attends un "oui", "c'est ça", "parfait", "exact" ou similaire.
-Si le client dit "non" : demande ce qu'il veut changer.
-Une fois confirmé : enregistre et dis "Parfait, c'est réservé ! Vous recevrez un SMS de confirmation. À [jour] !"
+Dis : "Donc je récapitule : [prestation] [avec/sans shampoing] le [jour] à [heure] avec [coiffeur], c'est bien ça ?"
+Attends un "oui" / "c'est ça" / "parfait". Si "non" : demande ce qui change.
+Une fois confirmé : "Parfait, c'est réservé ! Vous recevrez un SMS. À [jour] !"
 
 GESTION COIFFEURS :
-- Toujours demander préférence coiffeur après prestation/heure
-- Appelle verifier_coiffeur_disponible pour confirmer la disponibilité
-- Si coiffeur non dispo : propose heure alternative OU autre coiffeur
-- Si pas de préférence : attribue le premier disponible
+Étape 1 — Demander naturellement : "Vous avez l'habitude de voir quelqu'un chez nous ?"
+Étape 2a — Client cite un nom : appelle verifier_coiffeur_disponible.
+  • Dispo : "Super, [Coiffeur] est libre à cette heure-là !"
+  • Pas dispo : "Oh, [Coiffeur] est pris là... Il serait libre à [heure1] ou [heure2]. Ou je mets [autre] à l'heure demandée ?"
+Étape 2b — Pas de préférence : appelle verifier_coiffeur_disponible, prend le premier dispo.
+Si client demande QUI est disponible : cite tous les coiffeurs naturellement.
 
 GESTION PRESTATIONS :
-- Enregistre le nom EXACT de la prestation comme demandé par le client
-- Si prestation inconnue : explique et propose de lister les prestations disponibles
+- Enregistre le nom EXACT de la prestation.
+- Propose UNIQUEMENT les prestations listées ci-dessus.
+
+AVANT D'APPELER UN OUTIL LENT (verifier_coiffeur_disponible, proposer_creneaux, prendre_rdv) :
+Dis TOUJOURS d'abord : "Un instant, je regarde les disponibilités..." OU "Laissez-moi vérifier ça..."
+Puis appelle le tool, puis donne le résultat.
 
 CONSEILS :
-- Quand client demande conseil, utilise son prénom connu ou demande-le
-- Appelle demander_rappel_conseil avec prénom ET numéro appelant
-- Confirme : "Un expert vous rappelle au [numéro] dans les plus brefs délais"
+- Appelle demander_rappel_conseil avec prénom ET numéro.
+- Confirme : "Un expert vous rappelle au [numéro] dans les plus brefs délais."
 
 GESTION DES INTERRUPTIONS :
-- Si le client change de sujet en plein milieu, adapte-toi immédiatement sans insister
-- Si le client dit "non finalement" ou "laisse tomber" : "Pas de souci ! Y a-t-il autre chose que je peux faire pour vous ?"
-- Si le client semble hésiter : "Je peux vous proposer nos disponibilités si vous voulez ?"
-- Ne jamais forcer ou insister sur un créneau refusé
+- Si le client change de sujet, adapte-toi immédiatement.
+- "Non finalement" / "laisse tomber" → "Pas de souci ! Autre chose ?"
+- Ne jamais insister sur un créneau refusé.
 
 ANNULATION RDV :
-1. Appelle get_rdv_client_actif avec le numéro du client
-2. Liste les RDV trouvés au client
-3. Demande confirmation : "Voulez-vous annuler votre RDV du [date] à [heure] pour [prestation] ?"
-4. Si oui : appelle annuler_rdv avec client_id et rdv_id
-5. Le SMS de confirmation est envoyé automatiquement
+1. Appelle get_rdv_client_actif. 2. Liste les RDV. 3. Demande confirmation.
+4. Appelle annuler_rdv. 5. SMS envoyé automatiquement.
 
-MÉMOIRE DU CLIENT :
 """
 
-    # Ajouter les infos du client si connu
-    if telephone:
-        ctx = get_client_context(telephone)
-        if ctx.get("nom") or ctx.get("prenom"):
-            prenom = ctx.get("prenom") or ctx.get("nom", "").split()[0]
-            prompt += f"- Ce client s'appelle {prenom}\n"
-            rdvs = get_rdv_client(ctx.get("client_id")) if ctx.get("client_id") else []
-            if rdvs:
-                dernier_rdv = rdvs[-1]
-                derniere_prestation = dernier_rdv.get("prestation", "")
-                derniere_date = dernier_rdv.get("jour", "")
-                prompt += f"- Dernière visite : {derniere_date} pour {derniere_prestation}\n"
-                prompt += (
-                    f"Accueille-le : 'Bonjour {prenom} ! Comment allez-vous depuis la dernière fois ? "
-                    f"Je vois que vous étiez venu(e) pour {derniere_prestation} le {derniere_date}. "
-                    f"Souhaitez-vous reprendre la même chose ?'\n"
-                )
-            else:
-                prompt += f"Accueille-le chaleureusement par son prénom.\n"
+    # Humeur client
+    if humeur_client == "pressé":
+        prompt += "Client pressé : ultra concis, va droit au but.\n"
+    elif humeur_client == "stressé":
+        prompt += "Client stressé : sois rassurant, doux, prends le temps.\n"
+    elif humeur_client == "joyeux":
+        prompt += "Client joyeux : sois enjoué, chaleureux !\n"
 
-    # Coiffeurs dynamiques depuis Supabase
-    if COIFFEURS:
-        liste_coiffeurs = ', '.join([c['nom'] for c in COIFFEURS if c.get('nom')])
-        prompt += f"\nÉQUIPE DISPONIBLE : {liste_coiffeurs}\n"
-        prompt += ("Propose UNIQUEMENT ces coiffeurs. "
-                   "Ne jamais inventer de noms.\n")
-    else:
-        prompt += "\nAucun coiffeur enregistré pour ce salon.\n"
+    # Client reconnu
+    if prenom_client and nb_visites > 0:
+        prompt += f"\nCLIENT RECONNU : {prenom_client} ({nb_visites} visite(s))\n"
+        if derniere_prestation:
+            prompt += f'Dernière prestation : {derniere_prestation}\n'
+            prompt += f'Si client répond à l\'accueil, demande : "Vous revenez pour une {derniere_prestation} comme la dernière fois ?"\n'
+        else:
+            prompt += 'Si client répond à l\'accueil, demande : "Qu\'est-ce que je peux faire pour vous ?"\n'
+    elif prenom_client:
+        prompt += f"\nCLIENT CONNU : {prenom_client}\n"
 
-    # Prestations dynamiques depuis Supabase
-    if PRESTATIONS_SALON:
-        noms_prest = [p.get('name', '') for p in PRESTATIONS_SALON if p.get('name')]
-        prompt += f"\nPRESTATIONS DISPONIBLES : {', '.join(noms_prest)}\n"
-        prompt += ("Propose UNIQUEMENT ces prestations. "
-                   "Refuse toute prestation non listée.\n")
-
-    print(f"🧠 [PROMPT] Jours={JOURS_OUVERTS} | Coiffeurs={[c['nom'] for c in COIFFEURS]} | Prestations={len(PRESTATIONS_SALON)}")
+    print(f"🧠 [PROMPT] Jours={JOURS_OUVERTS} | Coiffeurs={[c['nom'] for c in COIFFEURS]} | Prestations={len(PRESTATIONS_SALON)} | Humeur={humeur_client}")
     return prompt
 
 # ====================================================
@@ -1707,6 +1705,32 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
     return "Fonction inconnue."
 
 # ====================================================
+# HELPERS AVANT APPEL GPT
+# ====================================================
+def get_reponse_cache(message: str) -> str | None:
+    """Retourne une réponse immédiate pour les questions fréquentes sans appel GPT."""
+    ml = message.lower().strip()
+    if any(m in ml for m in ["horaire", "ouvert", "fermé", "quand", "jusqu'à", "à partir"]) \
+       or ("heure" in ml and "rendez" not in ml):
+        jours = ', '.join([j.capitalize() for j in JOURS_OUVERTS])
+        return f"On est ouvert {jours} de {HORAIRE_OUVERTURE} à {HORAIRE_FERMETURE}."
+    if any(m in ml for m in ["adresse", "situé", "trouver", "localisation", "comment venir"]) \
+       or ("où" in ml and len(ml) < 40):
+        return f"On est situé au {ADRESSE_SALON}."
+    return None
+
+def detecter_humeur(message: str) -> str:
+    """Détecte l'humeur du client pour adapter le ton de l'agent."""
+    ml = message.lower()
+    if any(m in ml for m in ["vite", "rapidement", "urgent", "pressé", "pas le temps"]):
+        return "pressé"
+    if any(m in ml for m in ["problème", "soucis", "compliqué", "difficile", "impossible"]):
+        return "stressé"
+    if any(m in ml for m in ["super", "génial", "parfait", "excellent", "top", "cool"]):
+        return "joyeux"
+    return "neutre"
+
+# ====================================================
 # AGENT PRINCIPAL AVEC GPT-4o OPTIMISÉ
 # ====================================================
 def run_agent(message_user: str, telephone: str) -> str:
@@ -1721,21 +1745,17 @@ def run_agent(message_user: str, telephone: str) -> str:
         return "⚠️ Erreur: API OpenAI non configurée. Vérifiez votre clé API."
 
     # Cache réponses fréquentes (évite un appel GPT)
-    CACHE_REPONSES = {
-        "horaires": f"Nous sommes ouverts de {HORAIRE_OUVERTURE} à {HORAIRE_FERMETURE}.",
-        "adresse":  f"Nous sommes situés au {ADRESSE_SALON}.",
-        "prix":     "Les tarifs commencent à 15€ pour une coupe homme.",
-    }
-    message_lower = message_user.lower()
-    if "horaire" in message_lower or ("heure" in message_lower and "rendez" not in message_lower):
-        return CACHE_REPONSES["horaires"]
-    if "adresse" in message_lower or ("où" in message_lower and "situé" in message_lower):
-        return CACHE_REPONSES["adresse"]
-    if "prix" in message_lower or "tarif" in message_lower or "coût" in message_lower or "combien" in message_lower:
-        return CACHE_REPONSES["prix"]
+    reponse_cache = get_reponse_cache(message_user)
+    if reponse_cache:
+        add_to_history(telephone, "assistant", reponse_cache)
+        return reponse_cache
 
     # Ajouter le message utilisateur à l'historique
     add_to_history(telephone, "user", message_user)
+
+    # Détection humeur
+    humeur = detecter_humeur(message_user)
+    update_client_context(telephone, humeur=humeur)
 
     # Détection langue anglaise
     mots_anglais = ["hello", "hi", "appointment", "booking", "please", "thank", "yes", "no", "hair", "cut"]
@@ -1753,10 +1773,10 @@ def run_agent(message_user: str, telephone: str) -> str:
     if est_anglais:
         sys_prompt += "\nLe client parle anglais. Réponds en anglais mais garde les données en français dans Supabase."
 
-    # Limiter l'historique à 10 messages pour performance
+    # Limiter l'historique à 8 messages pour performance
     history = get_conversation_history(telephone)
-    if len(history) > 10:
-        history = history[-10:]
+    if len(history) > 8:
+        history = history[-8:]
         conversation_history[telephone] = history
 
     # Préparer les messages avec le system prompt en premier
@@ -1772,8 +1792,11 @@ def run_agent(message_user: str, telephone: str) -> str:
             messages=messages,
             tools=TOOLS,
             tool_choice="auto",
-            temperature=0.3,
-            max_tokens=100,
+            temperature=0.85,
+            max_tokens=80,
+            presence_penalty=0.1,
+            frequency_penalty=0.1,
+            stream=False,
         )
         # ÉTAPE 2 : Récupérer et accumuler les tokens
         session_tokens_input += response.usage.prompt_tokens
@@ -1796,6 +1819,23 @@ def run_agent(message_user: str, telephone: str) -> str:
 
     # Si GPT-4o veut appeler une fonction
     if choice.message.tool_calls:
+        # Message d'attente pour les outils lents (évite silence Twilio)
+        import random as _random
+        OUTILS_LENTS = {
+            "verifier_coiffeur_disponible", "proposer_creneaux",
+            "prendre_rdv", "get_rdv_client_actif", "verifier_disponibilite",
+        }
+        outil_utilise = choice.message.tool_calls[0].function.name
+        if outil_utilise in OUTILS_LENTS:
+            MSGS_ATTENTE = [
+                "Un instant, je regarde les disponibilités...",
+                "Laissez-moi vérifier ça pour vous...",
+                "Je jette un œil au planning...",
+                "Une seconde, je consulte l'agenda...",
+                "Voyons voir ce qu'on a de disponible...",
+            ]
+            update_client_context(telephone, message_attente=_random.choice(MSGS_ATTENTE))
+
         # Ajouter le message assistant avec tool_calls
         tool_calls_data = []
         for tc in choice.message.tool_calls:
@@ -1826,8 +1866,11 @@ def run_agent(message_user: str, telephone: str) -> str:
             response = client_openai.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=messages,
-                temperature=0.3,
-                max_tokens=100,
+                temperature=0.85,
+                max_tokens=80,
+                presence_penalty=0.1,
+                frequency_penalty=0.1,
+                stream=False,
             )
             # ÉTAPE 2 : Récupérer et accumuler les tokens du deuxième appel
             session_tokens_input += response.usage.prompt_tokens
@@ -2142,61 +2185,88 @@ def handle_appel(
             client_context[silence_key] = nb_silences + 1
             gather = twiml.gather(
                 input="speech", action="/appel", method="POST",
-                language="fr-FR", speech_timeout="auto",
+                language="fr-FR", speech_timeout="1",
                 speech_model="phone_call", timeout=6, hints=HINTS,
             )
             gather.say("Vous êtes toujours là ? Je vous écoute.", language="fr-FR", voice="Polly.Lea")
             return str(twiml)
 
         client_context[silence_key] = nb_silences + 1
+        ctx_accueil = get_client_context(telephone_appelant)
+        prenom_connu = ctx_accueil.get("prenom", "")
+        nb_visites_connu = ctx_accueil.get("nb_visites", 0)
+        import random as _rand
+        if prenom_connu and nb_visites_connu > 0:
+            accueils = [
+                f"Bonjour {prenom_connu} ! Ça fait plaisir de vous retrouver ! Comment vous allez ?",
+                f"Ah, bonjour {prenom_connu} ! Ravi de vous réentendre ! Vous allez bien ?",
+                f"Bonjour {prenom_connu} ! Toujours un plaisir ! Comment ça va ?",
+                f"Oh, bonjour {prenom_connu} ! Content de vous réentendre ! Tout va bien ?",
+            ]
+            message_accueil = _rand.choice(accueils)
+        else:
+            accueils = [
+                f"Bonjour et bienvenue chez {NOM_SALON}, c'est Léa à l'appareil, comment puis-je vous aider ?",
+                f"{NOM_SALON} bonjour, Léa à l'écoute, qu'est-ce que je peux faire pour vous ?",
+                f"Bonjour ! Vous êtes bien chez {NOM_SALON}, Léa à votre service, que puis-je faire pour vous ?",
+            ]
+            message_accueil = _rand.choice(accueils)
         gather = twiml.gather(
             input="speech", action="/appel", method="POST",
-            language="fr-FR", speech_timeout="auto",
+            language="fr-FR", speech_timeout="1",
             speech_model="phone_call", timeout=6, hints=HINTS,
         )
-        gather.say(
-            f"Bonjour et bienvenue chez {NOM_SALON}, comment puis-je vous aider ?",
-            language="fr-FR", voice="Polly.Lea",
-        )
+        gather.say(message_accueil, language="fr-FR", voice="Polly.Lea")
         return str(twiml)
 
     telephone = telephone_appelant
     response_text = run_agent(SpeechResult, telephone)
 
-    phrases_fin = [
-        "bonne journée", "à bientôt", "au revoir",
-        "merci pour votre appel", "à très bientôt",
-        "bonne continuation", "à la prochaine",
-        "rdv est confirmé", "rendez-vous est confirmé",
+    PHRASES_FIN = [
+        "au revoir", "bonne journée", "à bientôt", "c'est tout",
+        "ça sera tout", "bye", "bonne continuation", "à la prochaine",
+        "ciao", "merci beaucoup", "super merci", "ok merci",
+        "rdv est confirmé", "c'est réservé",
     ]
-    est_fin = any(p in (response_text or "").lower() for p in phrases_fin)
+    import random as _rand2
+    REPONSES_FIN = [
+        "À très bientôt ! Bonne journée à vous !",
+        "Avec plaisir ! À bientôt chez nous !",
+        "Merci à vous ! Passez une excellente journée !",
+        "Au revoir ! On vous attend avec plaisir !",
+        "À bientôt ! Prenez soin de vous !",
+        "Bonne journée ! À très vite !",
+    ]
 
-    if est_fin:
-        gather = twiml.gather(
-            input="speech",
-            action="/appel",
-            method="POST",
-            language="fr-FR",
-            speech_timeout="auto",
-            speech_model="phone_call",
-            timeout=3,
-        )
-        gather.say(response_text, language="fr-FR", voice="Polly.Lea")
+    est_fin_client = any(p in SpeechResult.lower() for p in PHRASES_FIN)
+    est_fin_agent = any(p in (response_text or "").lower() for p in PHRASES_FIN)
+
+    if est_fin_client or est_fin_agent:
+        reponse_fin = _rand2.choice(REPONSES_FIN)
+        twiml.say(reponse_fin, language="fr-FR", voice="Polly.Lea")
         twiml.hangup()
-    else:
-        gather = twiml.gather(
-            input="speech",
-            action="/appel",
-            method="POST",
-            language="fr-FR",
-            speech_timeout="auto",
-            speech_model="phone_call",
-            timeout=6,
-            hints=HINTS,
-        )
-        gather.say(response_text, language="fr-FR", voice="Polly.Lea")
-        twiml.say("Merci pour votre appel. À bientôt !", language="fr-FR", voice="Polly.Lea")
-        twiml.hangup()
+        return str(twiml)
+
+    # Message d'attente pré-outil (évite silence Twilio)
+    ctx_post = get_client_context(telephone)
+    msg_attente = ctx_post.pop("message_attente", None)
+    if msg_attente:
+        update_client_context(telephone)  # flush (pop already done on dict)
+    texte_final = (msg_attente + " " + response_text) if msg_attente else response_text
+
+    gather = twiml.gather(
+        input="speech",
+        action="/appel",
+        method="POST",
+        language="fr-FR",
+        speech_timeout="1",
+        speech_model="phone_call",
+        timeout=6,
+        hints=HINTS,
+    )
+    gather.say(texte_final, language="fr-FR", voice="Polly.Lea")
+    twiml.say("Merci pour votre appel. À bientôt !", language="fr-FR", voice="Polly.Lea")
+    twiml.hangup()
 
     return str(twiml)
 
