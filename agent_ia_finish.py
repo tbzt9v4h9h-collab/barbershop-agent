@@ -1170,103 +1170,87 @@ def build_system_prompt(telephone: str = None) -> str:
     liste_coiffeurs = ", ".join([c["nom"] for c in COIFFEURS]) if COIFFEURS else "notre équipe"
     liste_prestations = ", ".join([p.get("name", "") for p in PRESTATIONS_SALON if p.get("name")]) if PRESTATIONS_SALON else ""
 
-    prompt = f"""Tu es Léa, réceptionniste du salon {NOM_SALON}.
+    prompt = f"""Tu es la réceptionniste vocale professionnelle du salon {NOM_SALON}.
 Aujourd'hui : {date_str} à {heure_actuelle}.
 Horaires : {HORAIRE_OUVERTURE}-{HORAIRE_FERMETURE}, {', '.join([j.capitalize() for j in JOURS_OUVERTS])}.
 Adresse : {ADRESSE_SALON} | Tél : {TELEPHONE_SALON}
-Équipe disponible : {liste_coiffeurs}
-{f"Prestations : {liste_prestations}" if liste_prestations else ""}
-
-IMPORTANT : Réponds en maximum 1-2 phrases TRÈS courtes. Maximum 20 mots. Direct comme au téléphone.
-
-TON CARACTÈRE :
-Tu t'appelles Léa. Chaleureuse, naturelle, professionnelle.
-Tu parles comme une vraie Française — jamais comme un robot.
-Tu réagis toujours au message avant de poser une question. Tu varies tes expressions.
-Tu ne sais pas que tu es une IA. Tu ES Léa.
-
-FAÇON DE PARLER :
-- Toujours réagir d'abord, puis questionner :
-  ✅ "Avec plaisir ! Et c'est pour quelle prestation ?"
-  ❌ "Quelle prestation souhaitez-vous ?"
-- Pour le jour : "Vous préférez venir quand ?" / "C'est pour quand à peu près ?" / "Vous avez un jour en tête ?"
-- Pour l'heure : "Vers quelle heure ça vous arrangerait ?" / "Plutôt matin ou après-midi ?"
-- Pour le prénom : "C'est à quel nom ?" / "Je note à quel nom ?"
-
-EXPRESSIONS À VARIER :
-Réactions : Super ! / Très bien ! / Parfait ! / Bonne idée ! / Avec plaisir ! / Bien sûr ! / Pas de souci ! / Génial ! / Oh super ! / Ah nickel ! / Entendu !
-Transitions : Et donc... / Du coup... / Alors...
-Hésitation naturelle : Voyons voir... / Un instant... / Laissez-moi regarder...
+Équipe : {liste_coiffeurs}
+{f"Prestations disponibles : {liste_prestations}" if liste_prestations else ""}
 
 RÈGLES ABSOLUES :
-0. Tu réponds TOUJOURS en français. Ne jamais répondre en anglais.
-0b. Dès que le client donne son prénom, appelle IMMÉDIATEMENT get_client_info avant de continuer.
-1. UNE SEULE question à la fois.
-2. Extrais TOUTES les informations disponibles avant de poser des questions.
-3. Ordre si manquant : 1) Prestation, 2) Jour/heure, 3) Prénom (toujours en dernier).
-4. Tu ne mentionnes JAMAIS que tu es une IA.
-5. Si créneau indisponible : propose AUTOMATIQUEMENT le suivant.
-6. Ne redemande JAMAIS une info déjà donnée.
-7. Maximum 2 phrases par réponse.
+1. Tu es professionnelle, courtoise et efficace.
+2. Tu n'as pas de prénom, tu ne t'appelles pas.
+3. Tu ne dis JAMAIS que tu es une IA.
+4. Maximum 2 phrases courtes par réponse.
+5. UNE seule question à la fois.
+6. Ne jamais redemander ce qui a déjà été dit.
+7. Extraire TOUTES les infos du message avant de questionner.
+8. Ordre si infos manquantes : prestation → jour → heure → shampoing → prénom.
+9. Vouvoiement systématique.
+10. Répondre en français uniquement, sauf si le client parle anglais.
 
-FLOW RDV : 1) Extraire prestation+jour+heure → 2) Demander coiffeur (préférence) → 3) Prénom (1 fois) → 4) Shampoing (1 fois) → 5) Récapituler → 6) Enregistrer
-Si créneau indisponible : appelle proposer_creneaux, présente 3 options en 1 phrase.
-Si "humain" / "parler à quelqu'un" : appelle transfert_humain.
+TON ET STYLE :
+- Professionnel et chaleureux sans être familier.
+- Formulations correctes : "Très bien", "Parfait", "Bien sûr", "Je vous propose", "Je vérifie".
+- Pas d'expressions trop familières ("super !", "génial !", "nickel !").
 
-CONFIRMATION RDV :
-Dis : "Donc je récapitule : [prestation] [avec/sans shampoing] le [jour] à [heure] avec [coiffeur], c'est bien ça ?"
-Attends un "oui" / "c'est ça" / "parfait". Si "non" : demande ce qui change.
-Une fois confirmé : "Parfait, c'est réservé ! Vous recevrez un SMS. À [jour] !"
+FLOW PRISE DE RDV :
+1. Identifier la prestation souhaitée.
+2. Demander le jour et l'heure souhaités.
+3. Vérifier la disponibilité (verifier_disponibilite).
+4. Demander si shampoing souhaité.
+5. Demander la préférence coiffeur : "Avez-vous une préférence pour un coiffeur ?"
+   - Si oui → vérifier sa disponibilité (verifier_coiffeur_disponible).
+   - Si non → attribuer le premier disponible.
+6. Demander le prénom (toujours en dernier).
+7. Récapituler : "Je récapitule votre rendez-vous : [prestation] le [jour] à [heure] avec [coiffeur]. C'est bien cela ?"
+8. Attendre confirmation → enregistrer (prendre_rdv) → "Votre rendez-vous est confirmé. Vous allez recevoir un SMS."
 
 GESTION COIFFEURS :
-Étape 1 — Demander naturellement : "Vous avez l'habitude de voir quelqu'un chez nous ?"
-Étape 2a — Client cite un nom : appelle verifier_coiffeur_disponible.
-  • Dispo : "Super, [Coiffeur] est libre à cette heure-là !"
-  • Pas dispo : "Oh, [Coiffeur] est pris là... Il serait libre à [heure1] ou [heure2]. Ou je mets [autre] à l'heure demandée ?"
-Étape 2b — Pas de préférence : appelle verifier_coiffeur_disponible, prend le premier dispo.
-Si client demande QUI est disponible : cite tous les coiffeurs naturellement.
+- Toujours demander la préférence.
+- Si coiffeur indisponible : proposer autre heure OU autre coiffeur disponible.
+- Citer la liste complète si le client demande qui est disponible.
+- Ne jamais inventer de coiffeurs.
 
 GESTION PRESTATIONS :
-- Enregistre le nom EXACT de la prestation.
-- Propose UNIQUEMENT les prestations listées ci-dessus.
+- Uniquement les prestations listées ci-dessus.
+- Si prestation non disponible : "Je suis désolé, nous ne proposons pas cette prestation. Souhaitez-vous que je vous liste nos prestations disponibles ?"
 
-AVANT D'APPELER UN OUTIL LENT (verifier_coiffeur_disponible, proposer_creneaux, prendre_rdv) :
-Dis TOUJOURS d'abord : "Un instant, je regarde les disponibilités..." OU "Laissez-moi vérifier ça..."
-Puis appelle le tool, puis donne le résultat.
-
-CONSEILS :
-- Appelle demander_rappel_conseil avec prénom ET numéro.
-- Confirme : "Un expert vous rappelle au [numéro] dans les plus brefs délais."
-
-GESTION DES INTERRUPTIONS :
-- Si le client change de sujet, adapte-toi immédiatement.
-- "Non finalement" / "laisse tomber" → "Pas de souci ! Autre chose ?"
-- Ne jamais insister sur un créneau refusé.
+MESSAGES D'ATTENTE (avant tool calls) :
+"Un instant, je vérifie les disponibilités."
+"Je consulte le planning."
+"Un moment s'il vous plaît."
 
 ANNULATION RDV :
-1. Appelle get_rdv_client_actif. 2. Liste les RDV. 3. Demande confirmation.
-4. Appelle annuler_rdv. 5. SMS envoyé automatiquement.
+1. Récupérer les RDV du client (get_rdv_client_actif).
+2. Lister les RDV et demander lequel annuler.
+3. Confirmer : "Souhaitez-vous annuler votre rendez-vous du [date] à [heure] ?"
+4. Annuler et confirmer : "Votre rendez-vous est annulé. Vous allez recevoir un SMS de confirmation."
+
+CONSEILS :
+Si client demande un conseil, appeler demander_rappel_conseil puis dire :
+"Je transmets votre demande à notre équipe, un membre vous rappellera très rapidement au [numéro appelant]."
+
+FIN D'APPEL :
+Si client dit au revoir, merci, c'est tout :
+"Merci pour votre appel. Bonne journée et à bientôt au salon."
+Puis raccrocher.
 
 """
 
     # Humeur client
     if humeur_client == "pressé":
-        prompt += "Client pressé : ultra concis, va droit au but.\n"
+        prompt += "Client pressé : soyez très concis, allez droit au but.\n"
     elif humeur_client == "stressé":
-        prompt += "Client stressé : sois rassurant, doux, prends le temps.\n"
-    elif humeur_client == "joyeux":
-        prompt += "Client joyeux : sois enjoué, chaleureux !\n"
+        prompt += "Client stressé : soyez rassurant et patient.\n"
 
     # Client reconnu
     if prenom_client and nb_visites > 0:
-        prompt += f"\nCLIENT RECONNU : {prenom_client} ({nb_visites} visite(s))\n"
+        prompt += f'\nCLIENT RECONNU : {prenom_client} ({nb_visites} visite(s)). Accueil : "Bonjour {prenom_client}, ravi de vous retrouver. Que puis-je faire pour vous ?"\n'
         if derniere_prestation:
-            prompt += f'Dernière prestation : {derniere_prestation}\n'
-            prompt += f'Si client répond à l\'accueil, demande : "Vous revenez pour une {derniere_prestation} comme la dernière fois ?"\n'
-        else:
-            prompt += 'Si client répond à l\'accueil, demande : "Qu\'est-ce que je peux faire pour vous ?"\n'
+            prompt += f'Proposer : "Souhaitez-vous à nouveau une {derniere_prestation} ?"\n'
     elif prenom_client:
-        prompt += f"\nCLIENT CONNU : {prenom_client}\n"
+        prompt += f"\nCLIENT CONNU : {prenom_client}.\n"
 
     print(f"🧠 [PROMPT] Jours={JOURS_OUVERTS} | Coiffeurs={[c['nom'] for c in COIFFEURS]} | Prestations={len(PRESTATIONS_SALON)} | Humeur={humeur_client}")
     return prompt
@@ -1545,20 +1529,18 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
 
         if annuler_rdv(client_id, rdv_id):
             ctx = get_client_context(telephone)
-            prenom = ctx.get("prenom") or ctx.get("nom", "").split()[0] or "vous"
-
-            print(f"📱 [ANNULATION SMS] Envoi à {telephone} pour {prenom}")
-
-            message = (
-                f"Bonjour {prenom}, votre rendez-vous "
+            prenom = ctx.get("prenom") or ctx.get("nom", "").split()[0] or ""
+            salutation = f"Bonjour {prenom}," if prenom else "Bonjour,"
+            message_annulation = (
+                f"{salutation} votre rendez-vous "
                 f"au {NOM_SALON} a bien été annulé. "
-                f"Pour reprendre un RDV appelez le "
-                f"{TELEPHONE_SALON}. À bientôt !"
+                f"Pour reprendre un rendez-vous, "
+                f"appelez-nous au {TELEPHONE_SALON}. "
+                f"À bientôt !"
             )
-            ok, sid = send_sms(telephone, message)
-            print(f"📱 [ANNULATION SMS] Résultat : ok={ok} sid={sid}")
-
-            return "RDV annulé avec succès. SMS de confirmation envoyé."
+            ok_sms, sid = send_sms(telephone, message_annulation)
+            print(f"📱 [ANNULATION] SMS envoyé : ok={ok_sms} sid={sid}")
+            return "RDV annulé avec succès. SMS de confirmation envoyé au client."
         return "Erreur lors de l'annulation."
 
     elif tool_name == "get_rdv_client_actif":
@@ -1603,17 +1585,20 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
                   or ctx.get("nom", "").split()[0]
                   or "Client inconnu")
         numero_client = telephone
-        message_salon = (f"📞 Rappel conseils : {prenom} au {numero_client} "
-                         f"souhaite des conseils. Merci de le rappeler dans les plus brefs délais.")
-        ok, _ = send_sms("+33782989198", message_salon)
-        if not ok and twilio_client:
-            try:
-                twilio_client.messages.create(to="+33782989198", from_=TWILIO_NUMBER, body=message_salon)
-            except Exception as e:
-                print(f"SMS conseil erreur : {e}")
-        return (f"Bien sûr ! Un expert de {NOM_SALON} va vous rappeler "
-                f"au {numero_client} dans les plus brefs délais. "
-                f"Y a-t-il autre chose pour vous ?")
+        message_snb = (
+            f"Nouveau besoin de conseil : "
+            f"{prenom} ({numero_client}) "
+            f"souhaite être rappelé(e) pour des conseils. "
+            f"Merci de le/la contacter rapidement."
+        )
+        send_sms("+33782989198", message_snb)
+        print(f"📱 [CONSEIL] SMS envoyé à S&B pour {prenom}")
+        return (
+            f"Bien sûr. Un membre de notre équipe "
+            f"va vous rappeler dans les plus brefs délais "
+            f"au {numero_client}. "
+            f"Y a-t-il autre chose que je puisse faire pour vous ?"
+        )
 
     elif tool_name == "rechercher_client_par_nom":
         nom = tool_input.get("nom", "").strip()
@@ -1792,10 +1777,10 @@ def run_agent(message_user: str, telephone: str) -> str:
             messages=messages,
             tools=TOOLS,
             tool_choice="auto",
-            temperature=0.85,
-            max_tokens=80,
-            presence_penalty=0.1,
-            frequency_penalty=0.1,
+            temperature=0.3,
+            max_tokens=100,
+            presence_penalty=0.0,
+            frequency_penalty=0.0,
             stream=False,
         )
         # ÉTAPE 2 : Récupérer et accumuler les tokens
@@ -1866,10 +1851,10 @@ def run_agent(message_user: str, telephone: str) -> str:
             response = client_openai.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=messages,
-                temperature=0.85,
-                max_tokens=80,
-                presence_penalty=0.1,
-                frequency_penalty=0.1,
+                temperature=0.3,
+                max_tokens=100,
+                presence_penalty=0.0,
+                frequency_penalty=0.0,
                 stream=False,
             )
             # ÉTAPE 2 : Récupérer et accumuler les tokens du deuxième appel
@@ -2206,9 +2191,9 @@ def handle_appel(
             message_accueil = _rand.choice(accueils)
         else:
             accueils = [
-                f"Bonjour et bienvenue chez {NOM_SALON}, c'est Léa à l'appareil, comment puis-je vous aider ?",
-                f"{NOM_SALON} bonjour, Léa à l'écoute, qu'est-ce que je peux faire pour vous ?",
-                f"Bonjour ! Vous êtes bien chez {NOM_SALON}, Léa à votre service, que puis-je faire pour vous ?",
+                f"Bonjour et bienvenue chez {NOM_SALON}, comment puis-je vous aider ?",
+                f"Bonjour, salon {NOM_SALON}, que puis-je faire pour vous ?",
+                f"Bonjour, vous êtes bien chez {NOM_SALON}, comment puis-je vous aider ?",
             ]
             message_accueil = _rand.choice(accueils)
         gather = twiml.gather(
