@@ -1242,10 +1242,11 @@ Si client dit au revoir / merci / c'est tout : "Merci pour votre appel. Bonne jo
 
     # Prestations disponibles
     if PRESTATIONS_SALON:
-        noms_prest = [p.get("name", "") for p in PRESTATIONS_SALON if p.get("name")]
-        prompt += "\nPRESTATIONS DISPONIBLES DANS CE SALON :\n"
+        noms_prest = [p.get("name", "").strip() for p in PRESTATIONS_SALON if p.get("name", "").strip()]
+        noms_prest = list(dict.fromkeys(noms_prest))
+        prompt += f"\nPRESTATIONS DISPONIBLES ({len(noms_prest)}) :\n"
         prompt += "\n".join([f"- {n}" for n in noms_prest])
-        prompt += "\n\nRÈGLE ABSOLUE : Tu ne proposes QUE ces prestations.\nSi on te demande ce que vous proposez, liste EXACTEMENT ces prestations et rien d'autre.\nNe jamais inventer ou suggérer autre chose.\n"
+        prompt += f"\n\nRÈGLES ABSOLUES SUR LES PRESTATIONS :\n- Tu proposes UNIQUEMENT ces {len(noms_prest)} prestations\n- Si on demande la liste complète, cite-les TOUTES\n- Ne jamais en inventer ou en omettre\n- Si une prestation demandée n'est pas dans la liste, dire : \"Nous ne proposons pas cette prestation. Voici ce que nous proposons : [liste complète]\"\n"
     else:
         prompt += '\nPRESTATIONS : Aucune prestation enregistrée.\nSi on demande les prestations, réponds : "Je n\'ai pas encore la liste des prestations disponibles. Je vous invite à nous appeler directement pour plus d\'informations."\n'
 
@@ -1574,8 +1575,13 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
         return "RDV trouvés : " + " /// ".join(rdvs_str)
 
     elif tool_name == "get_services":
-        services = get_services()
-        return f"Services : {', '.join(services)}"
+        if PRESTATIONS_SALON:
+            noms = list(dict.fromkeys([
+                p.get("name", "") for p in PRESTATIONS_SALON
+                if p.get("name", "")
+            ]))
+            return f"Services disponibles ({len(noms)}) : {', '.join(noms)}"
+        return "Aucune prestation enregistrée."
 
     elif tool_name == "get_client_info":
         client = get_or_create_client(telephone)
@@ -2316,8 +2322,8 @@ def handle_appel(
             message_accueil = _rand.choice(accueils)
         gather = twiml.gather(
             input="speech", action="/appel", method="POST",
-            language="fr-FR", speech_timeout="1",
-            speech_model="phone_call", timeout=5, hints=HINTS,
+            language="fr-FR", speech_timeout="auto",
+            speech_model="phone_call", timeout=10, hints=HINTS,
         )
         gather.say(message_accueil, language="fr-FR", voice="Polly.Lea")
         return str(twiml)
@@ -2364,7 +2370,7 @@ def handle_appel(
         language="fr-FR",
         speech_timeout="1",
         speech_model="phone_call",
-        timeout=5,
+        timeout=6,
         hints=HINTS,
     )
     gather.say(texte_final, language="fr-FR", voice="Polly.Lea")
