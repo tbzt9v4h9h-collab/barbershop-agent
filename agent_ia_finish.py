@@ -2143,6 +2143,60 @@ async def sync_services(request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 # ====================================================
+# ANNULATION RDV DEPUIS BASE44
+# ====================================================
+@app.post("/annuler-rdv")
+async def annuler_rdv_base44(request: Request):
+    try:
+        data = await request.json()
+        rdv_id = data.get("rdv_id")
+        telephone = data.get("telephone")
+        client_nom = data.get("client_nom")
+
+        print(f"🗑️ [ANNULATION BASE44] rdv_id={rdv_id} tel={telephone}")
+
+        # Annuler dans rendez_vous
+        try:
+            supabase.table("rendez_vous")\
+                .update({"statut": "annule"})\
+                .eq("id", rdv_id)\
+                .execute()
+        except Exception as e:
+            print(f"⚠️ [ANNULATION] rendez_vous : {e}")
+
+        # Annuler dans appointment
+        try:
+            supabase.table("appointment")\
+                .update({"status": "annule"})\
+                .eq("id", rdv_id)\
+                .execute()
+        except Exception as e:
+            print(f"⚠️ [ANNULATION] appointment : {e}")
+
+        # SMS au client
+        if telephone:
+            prenom = (client_nom or "").split()[0] \
+                     if client_nom else ""
+            salutation = f"Bonjour {prenom}," \
+                        if prenom else "Bonjour,"
+            message = (
+                f"{salutation} votre rendez-vous "
+                f"au {NOM_SALON} a bien été annulé. "
+                f"Pour reprendre un rendez-vous, "
+                f"appelez-nous au {TELEPHONE_SALON}. "
+                f"À bientôt !"
+            )
+            ok, sid = send_sms(telephone, message)
+            print(f"📱 [ANNULATION] SMS envoyé : ok={ok}")
+
+        return {"status": "ok", "message": "RDV annulé"}
+
+    except Exception as e:
+        print(f"❌ [ANNULATION BASE44] Erreur : {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ====================================================
 # ENDPOINT PRINCIPAL
 # ====================================================
 @app.post("/appel", response_class=PlainTextResponse)
