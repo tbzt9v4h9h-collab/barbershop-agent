@@ -481,28 +481,24 @@ def load_all_salon_data():
             print(f"⚠️ [LOAD] Aucun coiffeur pour salon_id={salon_id}")
 
         # 3. Charger les prestations depuis table "service"
-        sample_service = supabase.table("service")\
-            .select("*").limit(1).execute()
-        if sample_service.data:
-            print(f"📋 [SERVICE] Colonnes : {list(sample_service.data[0].keys())}")
-        else:
-            print("📋 [SERVICE] Table vide ou salon_id incorrect")
-            all_services = supabase.table("service")\
-                .select("*").limit(3).execute()
-            print(f"📋 [SERVICE] Sans filtre : {all_services.data}")
+        print(f"🔍 [PRESTATIONS] Recherche salon_id={_session_salon_id}")
 
         services_result = supabase.table("service")\
             .select("*")\
             .eq("salon_id", salon_id)\
             .execute()
 
+        print(f"🔍 [PRESTATIONS] Trouvées : {services_result.data}")
+
         if services_result.data:
             PRESTATIONS_SALON = services_result.data
             noms = [p.get("name", "") for p in PRESTATIONS_SALON]
-            print(f"✅ [LOAD] Prestations : {noms}")
+            print(f"✅ [PRESTATIONS] {len(noms)} prestations : {noms}")
         else:
+            # Debug : voir TOUTES les prestations sans filtre
+            all_s = supabase.table("service").select("*").execute()
+            print(f"🔍 [TOUTES PRESTATIONS] {all_s.data}")
             PRESTATIONS_SALON = []
-            print(f"⚠️ [LOAD] Aucune prestation pour salon_id={salon_id}")
 
         SALON_DATA_CACHED_AT = datetime.now()
 
@@ -1181,7 +1177,6 @@ def build_system_prompt(telephone: str = None) -> str:
 Aujourd'hui : {date_str} à {heure_actuelle}.
 Horaires : {HORAIRE_OUVERTURE}-{HORAIRE_FERMETURE}, {', '.join([j.capitalize() for j in JOURS_OUVERTS])}.
 Adresse : {ADRESSE_SALON} | Tél : {TELEPHONE_SALON}
-{f"Prestations disponibles : {liste_prestations}" if liste_prestations else ""}
 {shampoing_info}
 IMPORTANT : Maximum 2 phrases courtes. Maximum 25 mots par réponse. Direct et efficace.
 
@@ -1224,9 +1219,6 @@ MESSAGES D'ATTENTE (avant tool calls lents) :
 "Je consulte le planning."
 "Un moment s'il vous plaît."
 
-GESTION PRESTATIONS :
-Uniquement les prestations listées. Si non disponible : "Je suis désolé, nous ne proposons pas cette prestation."
-
 ANNULATION RDV :
 1. get_rdv_client_actif → lister → confirmer → annuler_rdv → "Votre rendez-vous est annulé. Vous allez recevoir un SMS."
 
@@ -1247,6 +1239,15 @@ Si client dit au revoir / merci / c'est tout : "Merci pour votre appel. Bonne jo
     else:
         noms_c = ', '.join([c['nom'] for c in COIFFEURS])
         prompt += f"GESTION COIFFEURS : Demander la préférence UNE SEULE fois parmi : {noms_c}.\nSi coiffeur indisponible : proposer autre heure OU autre coiffeur.\n"
+
+    # Prestations disponibles
+    if PRESTATIONS_SALON:
+        noms_prest = [p.get("name", "") for p in PRESTATIONS_SALON if p.get("name")]
+        prompt += "\nPRESTATIONS DISPONIBLES DANS CE SALON :\n"
+        prompt += "\n".join([f"- {n}" for n in noms_prest])
+        prompt += "\n\nRÈGLE ABSOLUE : Tu ne proposes QUE ces prestations.\nSi on te demande ce que vous proposez, liste EXACTEMENT ces prestations et rien d'autre.\nNe jamais inventer ou suggérer autre chose.\n"
+    else:
+        prompt += '\nPRESTATIONS : Aucune prestation enregistrée.\nSi on demande les prestations, réponds : "Je n\'ai pas encore la liste des prestations disponibles. Je vous invite à nous appeler directement pour plus d\'informations."\n'
 
     # Humeur client
     if humeur_client == "pressé":
@@ -2213,6 +2214,7 @@ def handle_appel(
     # Charger config, coiffeurs et prestations depuis Supabase
     load_all_salon_data()
     print(f"📞 [APPEL] NOM_SALON={NOM_SALON} | JOURS={JOURS_OUVERTS} | HORAIRES={HORAIRE_OUVERTURE}-{HORAIRE_FERMETURE}")
+    print(f"📋 [APPEL] {len(PRESTATIONS_SALON)} prestations disponibles pour cet appel")
 
     # Charger le contexte client immédiatement (pour accueil personnalisé)
     try:
