@@ -1242,11 +1242,23 @@ Si client dit au revoir / merci / c'est tout : "Merci pour votre appel. Bonne jo
 
     # Prestations disponibles
     if PRESTATIONS_SALON:
-        noms_prest = [p.get("name", "").strip() for p in PRESTATIONS_SALON if p.get("name", "").strip()]
-        noms_prest = list(dict.fromkeys(noms_prest))
+        noms_prest = list(dict.fromkeys([
+            p.get("name", "").strip()
+            for p in PRESTATIONS_SALON
+            if p.get("name", "").strip()
+        ]))
         prompt += f"\nPRESTATIONS DISPONIBLES ({len(noms_prest)}) :\n"
         prompt += "\n".join([f"- {n}" for n in noms_prest])
-        prompt += f"\n\nRÈGLES ABSOLUES SUR LES PRESTATIONS :\n- Tu proposes UNIQUEMENT ces {len(noms_prest)} prestations\n- Si on demande la liste complète, cite-les TOUTES\n- Ne jamais en inventer ou en omettre\n- Si une prestation demandée n'est pas dans la liste, dire : \"Nous ne proposons pas cette prestation. Voici ce que nous proposons : [liste complète]\"\n"
+        prompt += f"""
+
+RÈGLES ABSOLUES SUR LES PRESTATIONS :
+- Ne JAMAIS lister les prestations spontanément
+- Les citer UNIQUEMENT si le client demande explicitement : "qu'est-ce que vous proposez ?", "quelles sont vos prestations ?", "vous faites quoi ?"
+- Si client demande une prestation non disponible : "Nous ne proposons pas cette prestation. Souhaitez-vous que je vous liste ce que nous faisons ?"
+- Si client demande "c'est tout ?" ou "vous avez autre chose ?" → citer TOUTES les prestations restantes, ne jamais dire au revoir
+- Ne jamais confondre fin de liste avec fin d'appel
+- Quand tu listes les prestations, utilise TOUJOURS le tool get_services pour avoir la liste complète et exacte en temps réel. Ne jamais réciter de mémoire.
+"""
     else:
         prompt += '\nPRESTATIONS : Aucune prestation enregistrée.\nSi on demande les prestations, réponds : "Je n\'ai pas encore la liste des prestations disponibles. Je vous invite à nous appeler directement pour plus d\'informations."\n'
 
@@ -1577,10 +1589,12 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
     elif tool_name == "get_services":
         if PRESTATIONS_SALON:
             noms = list(dict.fromkeys([
-                p.get("name", "") for p in PRESTATIONS_SALON
-                if p.get("name", "")
+                p.get("name", "").strip()
+                for p in PRESTATIONS_SALON
+                if p.get("name", "").strip()
             ]))
-            return f"Services disponibles ({len(noms)}) : {', '.join(noms)}"
+            print(f"📋 [GET_SERVICES] {len(noms)} prestations : {noms}")
+            return f"Voici toutes nos prestations ({len(noms)}) : {', '.join(noms)}."
         return "Aucune prestation enregistrée."
 
     elif tool_name == "get_client_info":
@@ -2331,11 +2345,15 @@ def handle_appel(
     telephone = telephone_appelant
     response_text = run_agent(SpeechResult, telephone)
 
-    PHRASES_FIN = [
-        "au revoir", "bonne journée", "à bientôt", "c'est tout",
-        "ça sera tout", "bye", "bonne continuation", "à la prochaine",
-        "ciao", "merci beaucoup", "super merci", "ok merci",
-        "rdv est confirmé", "c'est réservé",
+    PHRASES_FIN_CLIENT = [
+        "au revoir", "bonne journée", "à bientôt",
+        "c'est tout merci", "merci au revoir",
+        "bye", "salut", "bonne continuation",
+        "à la prochaine", "ciao", "ok merci bye",
+    ]
+    PHRASES_FIN_AGENT = [
+        "au revoir", "bonne journée", "à bientôt",
+        "ça sera tout", "bonne continuation", "à la prochaine",
     ]
     import random as _rand2
     REPONSES_FIN = [
@@ -2347,8 +2365,16 @@ def handle_appel(
         "Bonne journée ! À très vite !",
     ]
 
-    est_fin_client = any(p in SpeechResult.lower() for p in PHRASES_FIN)
-    est_fin_agent = any(p in (response_text or "").lower() for p in PHRASES_FIN)
+    # "c'est tout" seul n'est PAS une fin d'appel (peut être une question)
+    mots_question = ["?", "quoi", "tout", "autre", "avez", "faites",
+                     "proposez", "encore", "aussi", "plus"]
+    est_question = any(m in SpeechResult.lower() for m in mots_question)
+
+    est_fin_client = (
+        any(phrase in SpeechResult.lower().strip() for phrase in PHRASES_FIN_CLIENT)
+        and not est_question
+    )
+    est_fin_agent = any(p in (response_text or "").lower() for p in PHRASES_FIN_AGENT)
 
     if est_fin_client or est_fin_agent:
         reponse_fin = _rand2.choice(REPONSES_FIN)
