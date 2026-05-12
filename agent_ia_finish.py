@@ -249,6 +249,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 print("🔵 [BOOT 6/8] FastAPI OK")
+
+@app.on_event("startup")
+async def startup_event():
+    """Chargement des données salon au démarrage uvicorn — avant le premier appel."""
+    print("🚀 [STARTUP] Chargement données salon...")
+    try:
+        sync_appointment_columns()
+        print("✅ [STARTUP] sync_appointment_columns OK")
+    except Exception as _e:
+        print(f"⚠️ [STARTUP] sync_appointment_columns : {_e}")
+    try:
+        load_all_salon_data()
+        print(f"✅ [STARTUP] Salon={NOM_SALON} | Coiffeurs={len(COIFFEURS)} | Prestations={len(PRESTATIONS_SALON)}")
+    except Exception as _e:
+        print(f"⚠️ [STARTUP] load_all_salon_data : {_e}")
+
 END_CALL_MESSAGE = "Merci pour votre appel. Bonne journée et à bientôt au salon."
 
 MESSAGE_HORAIRES = f"Le salon est ouvert du mardi au samedi de {HORAIRE_OUVERTURE} à {HORAIRE_FERMETURE}."
@@ -929,28 +945,6 @@ except Exception as _e_sched:
     print(f"⚠️  [BOOT 7/8] Scheduler non démarré : {_e_sched}")
 
 print("🟢 [BOOT 8/8] Module chargé — uvicorn prêt à écouter sur $PORT")
-
-# Vérification des colonnes de la table appointment au démarrage
-try:
-    sync_appointment_columns()
-except Exception as _e_sync:
-    print(f"⚠️ [BOOT] sync_appointment_columns : {_e_sync}")
-
-# Chargement complet salon au démarrage
-try:
-    load_all_salon_data()
-except Exception as _e_load:
-    print(f"⚠️ [BOOT] load_all_salon_data failed : {_e_load}")
-
-# Vérification colonnes table employee
-try:
-    _sample_emp = supabase.table("employee").select("*").limit(1).execute()
-    if _sample_emp.data:
-        print(f"📋 [EMPLOYEE] Colonnes : {list(_sample_emp.data[0].keys())}")
-    else:
-        print("📋 [EMPLOYEE] Table vide")
-except Exception as _e_emp:
-    print(f"⚠️ [EMPLOYEE] {_e_emp}")
 
 
 def annuler_rdv(client_id: str, rdv_id: str) -> bool:
@@ -2231,10 +2225,9 @@ def handle_appel(
 
     twiml = VoiceResponse()
 
-    # Charger config, coiffeurs et prestations depuis Supabase
+    # Rafraîchissement TTL (no-op si données fraîches < 5 min — chargées au startup)
     load_all_salon_data()
-    print(f"📞 [APPEL] NOM_SALON={NOM_SALON} | JOURS={JOURS_OUVERTS} | HORAIRES={HORAIRE_OUVERTURE}-{HORAIRE_FERMETURE}")
-    print(f"📋 [APPEL] {len(PRESTATIONS_SALON)} prestations disponibles pour cet appel")
+    print(f"📞 [APPEL] NOM_SALON={NOM_SALON} | Coiffeurs={len(COIFFEURS)} | Prestations={len(PRESTATIONS_SALON)}")
 
     # Charger le contexte client immédiatement (pour accueil personnalisé)
     try:
