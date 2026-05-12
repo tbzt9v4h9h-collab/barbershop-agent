@@ -2115,9 +2115,10 @@ async def sync_staff(request: Request):
                 "id": s.get("id", ""),
                 "specialites": s.get("specialties") or s.get("role", ""),
             })
+            nom = nom.strip().title()
             try:
                 supabase.table("employee").insert({
-                    "id": s.get("id"),
+                    "id": str(uuid.uuid4()),
                     "salon_id": sid,
                     "full_name": nom,
                     "specialties": s.get("specialties", ""),
@@ -2144,19 +2145,27 @@ async def sync_services(request: Request):
         PRESTATIONS_SALON = []
         sid = salon_id_from_twilio()
 
+        # Supprimer les services existants pour ce salon avant insert
+        if sid:
+            try:
+                supabase.table("service").delete().eq("salon_id", sid).execute()
+                print(f"🗑️ [SYNC-SERVICES] Anciens services supprimés pour salon_id={sid}")
+            except Exception as e:
+                print(f"⚠️ [SYNC-SERVICES] Erreur delete : {e}")
+
         for sv in services_list:
             nom = sv.get("name") or sv.get("nom") or ""
             if not nom:
                 continue
             PRESTATIONS_SALON.append(sv)
             try:
-                supabase.table("service").upsert({
-                    "id": sv.get("id"),
+                supabase.table("service").insert({
+                    "id": str(uuid.uuid4()),
                     "salon_id": sid,
                     "name": nom,
                     "price": sv.get("price") or 0,
                     "duration_minutes": sv.get("duration") or 30,
-                }, on_conflict="id").execute()
+                }).execute()
             except Exception as e:
                 print(f"⚠️ [SYNC-SERVICES] Erreur : {e}")
 
