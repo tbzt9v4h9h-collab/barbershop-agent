@@ -2096,6 +2096,15 @@ async def sync_staff(request: Request):
         COIFFEURS = []
         sid = salon_id_from_twilio()
 
+        # 1. Supprimer tous les coiffeurs existants pour ce salon
+        if sid:
+            try:
+                supabase.table("employee").delete().eq("salon_id", sid).execute()
+                print(f"🗑️ [SYNC-STAFF] Anciens coiffeurs supprimés pour salon_id={sid}")
+            except Exception as e:
+                print(f"⚠️ [SYNC-STAFF] Erreur delete : {e}")
+
+        # 2. Insérer les nouveaux coiffeurs
         for s in staff_list:
             nom = (s.get("full_name") or s.get("name") or
                    s.get("firstName") or "")
@@ -2107,14 +2116,14 @@ async def sync_staff(request: Request):
                 "specialites": s.get("specialties") or s.get("role", ""),
             })
             try:
-                supabase.table("employee").upsert({
+                supabase.table("employee").insert({
                     "id": s.get("id"),
                     "salon_id": sid,
                     "full_name": nom,
                     "specialties": s.get("specialties", ""),
-                }, on_conflict="id").execute()
+                }).execute()
             except Exception as e:
-                print(f"⚠️ [SYNC-STAFF] Erreur : {e}")
+                print(f"⚠️ [SYNC-STAFF] Erreur insert : {e}")
 
         print(f"✅ [SYNC-STAFF] {len(COIFFEURS)} coiffeurs : "
               f"{[c['nom'] for c in COIFFEURS]}")
