@@ -2366,15 +2366,29 @@ def handle_appel(
     telephone = telephone_appelant
     response_text = run_agent(SpeechResult, telephone)
 
+    # Phrases de congé explicites — uniquement des formules sans ambiguïté
     PHRASES_FIN_CLIENT = [
-        "au revoir", "bonne journée", "à bientôt",
-        "c'est tout merci", "merci au revoir",
-        "bye", "salut", "bonne continuation",
-        "à la prochaine", "ciao", "ok merci bye",
+        "au revoir",
+        "merci au revoir",
+        "bonne journée",
+        "bonne soirée",
+        "bonne continuation",
+        "à la prochaine",
+        "à bientôt",
+        "c'est bon merci",
+        "c'est tout merci",
+        "ok merci au revoir",
+        "ok merci bye",
+        "merci bye",
+        "ciao",
     ]
+    # Pour l'agent : uniquement si la réponse contient une formule de clôture COMPLÈTE
     PHRASES_FIN_AGENT = [
-        "au revoir", "bonne journée", "à bientôt",
-        "ça sera tout", "bonne continuation", "à la prochaine",
+        "bonne journée et à bientôt",
+        "à bientôt chez nous",
+        "prenez soin de vous",
+        "passez une excellente journée",
+        "on vous attend avec plaisir",
     ]
     import random as _rand2
     REPONSES_FIN = [
@@ -2386,14 +2400,22 @@ def handle_appel(
         "Bonne journée ! À très vite !",
     ]
 
-    # "c'est tout" seul n'est PAS une fin d'appel (peut être une question)
-    mots_question = ["?", "quoi", "tout", "autre", "avez", "faites",
-                     "proposez", "encore", "aussi", "plus"]
-    est_question = any(m in SpeechResult.lower() for m in mots_question)
+    speech_lower = SpeechResult.lower().strip()
+
+    # Un horaire (14h, 10h30, 15 heures…) n'est jamais une fin d'appel
+    import re as _re
+    contient_horaire = bool(_re.search(r'\b\d{1,2}h\d{0,2}\b|\d{1,2}\s*heures?\b', speech_lower))
+
+    # Mots interrogatifs ou contextuels qui indiquent que ce n'est pas un congé
+    mots_question = ["?", "quoi", "autre", "avez", "faites",
+                     "proposez", "encore", "aussi", "plus", "heure",
+                     "rendez", "créneau", "disponible", "semaine"]
+    est_question = any(m in speech_lower for m in mots_question)
 
     est_fin_client = (
-        any(phrase in SpeechResult.lower().strip() for phrase in PHRASES_FIN_CLIENT)
+        any(phrase in speech_lower for phrase in PHRASES_FIN_CLIENT)
         and not est_question
+        and not contient_horaire
     )
     est_fin_agent = any(p in (response_text or "").lower() for p in PHRASES_FIN_AGENT)
 
