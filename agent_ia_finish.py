@@ -2126,6 +2126,10 @@ async def sync_staff(request: Request):
             except Exception as e:
                 print(f"⚠️ [SYNC-STAFF] Erreur insert : {e}")
 
+        # Forcer le rechargement immédiat du cache
+        global SALON_DATA_CACHED_AT
+        SALON_DATA_CACHED_AT = None
+        load_all_salon_data()
         print(f"✅ [SYNC-STAFF] {len(COIFFEURS)} coiffeurs : "
               f"{[c['nom'] for c in COIFFEURS]}")
         return {"status": "ok", "coiffeurs": len(COIFFEURS)}
@@ -2169,6 +2173,10 @@ async def sync_services(request: Request):
             except Exception as e:
                 print(f"⚠️ [SYNC-SERVICES] Erreur : {e}")
 
+        # Forcer le rechargement immédiat du cache
+        global SALON_DATA_CACHED_AT
+        SALON_DATA_CACHED_AT = None
+        load_all_salon_data()
         print(f"✅ [SYNC-SERVICES] {len(PRESTATIONS_SALON)} prestations")
         return {"status": "ok", "prestations": len(PRESTATIONS_SALON)}
     except Exception as e:
