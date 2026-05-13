@@ -1180,6 +1180,7 @@ RÈGLES ABSOLUES :
 3. UNE seule question à la fois. Ne jamais redemander ce qui a déjà été dit.
 4. Extraire TOUTES les infos du message avant de questionner.
 5. Répondre en français uniquement, sauf si le client parle anglais.
+6. Si on change de prestation en cours de flow, NE PAS redemander le jour, l'heure, le shampoing ou le coiffeur déjà confirmés. Reprendre le flow à l'étape de vérification disponibilité directement.
 
 RÈGLE ANTI-RÉPÉTITION :
 - Le shampoing ne doit être demandé QU'UNE SEULE fois. Une fois répondu, ne plus jamais poser cette question.
@@ -1202,6 +1203,7 @@ FLOW PRISE DE RDV :
 1. Identifier la prestation.
 2. Jour et heure souhaités.
 3. Vérifier disponibilité (verifier_disponibilite).
+3b. Si la prestation demandée n'est pas disponible ou n'existe pas : redemander UNIQUEMENT la prestation. Conserver en mémoire le jour, l'heure, le coiffeur et le shampoing déjà donnés. Ne jamais redemander ces informations.
 4. Demander shampoing (UNE SEULE fois, si non encore répondu).
 5. Préférence coiffeur (voir section ci-dessous).
 6. Prénom (toujours en dernier).
@@ -1825,7 +1827,7 @@ def run_agent(message_user: str, telephone: str) -> str:
             tools=TOOLS,
             tool_choice="auto",
             temperature=0.2,
-            max_tokens=80,
+            max_tokens=120,
             presence_penalty=0.0,
             frequency_penalty=0.0,
             stream=False,
@@ -1899,7 +1901,7 @@ def run_agent(message_user: str, telephone: str) -> str:
                 model="gpt-4o-mini",
                 messages=messages,
                 temperature=0.2,
-                max_tokens=80,
+                max_tokens=120,
                 presence_penalty=0.0,
                 frequency_penalty=0.0,
                 stream=False,
