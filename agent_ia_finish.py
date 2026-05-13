@@ -2331,8 +2331,9 @@ def handle_appel(
                 input="speech", action="/appel", method="POST",
                 language="fr-FR", speech_timeout="1",
                 speech_model="phone_call", timeout=5, hints=HINTS,
+                partial_result_callback="",
             )
-            gather.say("Vous êtes toujours là ? Je vous écoute.", language="fr-FR", voice="Polly.Lea")
+            gather.say("Vous êtes toujours là ? Je vous écoute.", language="fr-FR", voice="Polly.Lea", barge_in=False)
             return str(twiml)
 
         client_context[silence_key] = nb_silences + 1
@@ -2359,8 +2360,9 @@ def handle_appel(
             input="speech", action="/appel", method="POST",
             language="fr-FR", speech_timeout="auto",
             speech_model="phone_call", timeout=10, hints=HINTS,
+            partial_result_callback="",
         )
-        gather.say(message_accueil, language="fr-FR", voice="Polly.Lea")
+        gather.say(message_accueil, language="fr-FR", voice="Polly.Lea", barge_in=False)
         return str(twiml)
 
     telephone = telephone_appelant
@@ -2441,8 +2443,9 @@ def handle_appel(
         speech_model="phone_call",
         timeout=6,
         hints=HINTS,
+        partial_result_callback="",
     )
-    gather.say(texte_final, language="fr-FR", voice="Polly.Lea")
+    gather.say(texte_final, language="fr-FR", voice="Polly.Lea", barge_in=False)
     twiml.say("Merci pour votre appel. À bientôt !", language="fr-FR", voice="Polly.Lea")
     twiml.hangup()
 
