@@ -1829,8 +1829,8 @@ def run_agent(message_user: str, telephone: str) -> str:
             messages=messages,
             tools=TOOLS,
             tool_choice="auto",
-            temperature=0,
-            max_tokens=300,
+            temperature=0.3,
+            max_tokens=200,
             presence_penalty=0.0,
             frequency_penalty=0.0,
             stream=False,
@@ -1890,7 +1890,9 @@ def run_agent(message_user: str, telephone: str) -> str:
         for tool_call in choice.message.tool_calls:
             tool_name = tool_call.function.name
             tool_input = json.loads(tool_call.function.arguments)
+            print(f"🔧 [TOOL] {tool_name} | args={tool_input}")
             tool_result = process_tool_call(tool_name, tool_input, telephone)
+            print(f"✅ [TOOL] {tool_name} → {str(tool_result)[:120]}")
 
             # Ajouter le résultat avec le tool_call_id
             add_tool_result(telephone, tool_call.id, tool_result)
@@ -1903,8 +1905,10 @@ def run_agent(message_user: str, telephone: str) -> str:
             response = client_openai.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=messages,
-                temperature=0,
-                max_tokens=300,
+                tools=TOOLS,
+                tool_choice="auto",
+                temperature=0.3,
+                max_tokens=200,
                 presence_penalty=0.0,
                 frequency_penalty=0.0,
                 stream=False,
