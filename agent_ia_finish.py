@@ -1202,6 +1202,11 @@ TON ET STYLE :
 Professionnel et chaleureux. Formulations : "Très bien", "Parfait", "Je vérifie", "Je vous propose".
 Pas d'expressions familières ("super !", "génial !").
 
+RÈGLE ABSOLUE — VÉRIFICATION DISPONIBILITÉ :
+Tu DOIS appeler verifier_disponibilite dès que le client donne un jour ET une heure.
+Ne jamais répondre "très bien" ou confirmer un créneau sans avoir appelé ce tool.
+Même si tu penses connaître la disponibilité, tu DOIS appeler le tool.
+
 FLOW PRISE DE RDV :
 1. Identifier la prestation.
 2. Jour et heure souhaités.
@@ -1847,6 +1852,10 @@ def run_agent(message_user: str, telephone: str) -> str:
     messages = clean_messages(messages)
 
     # Appeler GPT-4o avec function calling
+    if not TOOLS:
+        print("❌ [ERROR] tools vide — TOOLS non chargé, function calling désactivé")
+    else:
+        print(f"🛠️ [GPT] {len(TOOLS)} tools disponibles | tool_choice=auto")
     try:
         response = client_openai.chat.completions.create(
             model="gpt-4o-mini",
@@ -1925,6 +1934,8 @@ def run_agent(message_user: str, telephone: str) -> str:
         messages = [{"role": "system", "content": sys_prompt}] + get_conversation_history(telephone)
         messages = clean_messages(messages)
 
+        if not TOOLS:
+            print("❌ [ERROR] tools vide — TOOLS non chargé sur le second appel GPT")
         try:
             response = client_openai.chat.completions.create(
                 model="gpt-4o-mini",
