@@ -1172,6 +1172,9 @@ Aujourd'hui : {date_str} à {heure_actuelle}.
 Horaires : {HORAIRE_OUVERTURE}-{HORAIRE_FERMETURE}, {', '.join([j.capitalize() for j in JOURS_OUVERTS])}.
 Adresse : {ADRESSE_SALON} | Tél : {TELEPHONE_SALON}
 {shampoing_info}
+RÈGLE ABSOLUE PRIORITAIRE :
+Tu te concentres EXCLUSIVEMENT sur la prise de rendez-vous. Si le client parle d'autre chose, réponds uniquement : "Je suis uniquement disponible pour la prise de rendez-vous. Souhaitez-vous prendre un rendez-vous ?" Ignorer tout bruit de fond, mot isolé, ou phrase non liée à une réservation.
+
 IMPORTANT : Maximum 2 phrases courtes. Maximum 25 mots par réponse. Direct et efficace.
 
 RÈGLES ABSOLUES :
@@ -1822,12 +1825,12 @@ def run_agent(message_user: str, telephone: str) -> str:
     # Appeler GPT-4o avec function calling
     try:
         response = client_openai.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4o",
             messages=messages,
             tools=TOOLS,
             tool_choice="auto",
-            temperature=0.2,
-            max_tokens=120,
+            temperature=0,
+            max_tokens=300,
             presence_penalty=0.0,
             frequency_penalty=0.0,
             stream=False,
@@ -1898,10 +1901,10 @@ def run_agent(message_user: str, telephone: str) -> str:
 
         try:
             response = client_openai.chat.completions.create(
-                model="gpt-4o-mini",
+                model="gpt-4o",
                 messages=messages,
-                temperature=0.2,
-                max_tokens=120,
+                temperature=0,
+                max_tokens=300,
                 presence_penalty=0.0,
                 frequency_penalty=0.0,
                 stream=False,
@@ -2403,6 +2406,7 @@ def handle_appel(
     ]
 
     speech_lower = SpeechResult.lower().strip()
+    nb_mots = len(speech_lower.split())
 
     # Un horaire (14h, 10h30, 15 heures…) n'est jamais une fin d'appel
     import re as _re
@@ -2414,10 +2418,14 @@ def handle_appel(
                      "rendez", "créneau", "disponible", "semaine"]
     est_question = any(m in speech_lower for m in mots_question)
 
+    # Moins de 3 mots → fin d'appel uniquement si c'est exactement "au revoir"
+    trop_court = nb_mots < 3 and speech_lower != "au revoir"
+
     est_fin_client = (
         any(phrase in speech_lower for phrase in PHRASES_FIN_CLIENT)
         and not est_question
         and not contient_horaire
+        and not trop_court
     )
     est_fin_agent = any(p in (response_text or "").lower() for p in PHRASES_FIN_AGENT)
 
@@ -2434,18 +2442,34 @@ def handle_appel(
         update_client_context(telephone)  # flush (pop already done on dict)
     texte_final = (msg_attente + " " + response_text) if msg_attente else response_text
 
-    gather = twiml.gather(
-        input="speech",
-        action="/appel",
-        method="POST",
-        language="fr-FR",
-        speech_timeout="1",
-        speech_model="phone_call",
-        timeout=6,
-        hints=HINTS,
-        partial_result_callback="",
-    )
-    gather.say(texte_final, language="fr-FR", voice="Polly.Lea", barge_in=False)
+    # Pendant un message d'attente (tool call en cours) : gather très court
+    # pour ne pas capter du bruit pendant la vérification
+    if msg_attente:
+        gather = twiml.gather(
+            input="speech",
+            action="/appel",
+            method="POST",
+            language="fr-FR",
+            speech_timeout="1",
+            speech_model="phone_call",
+            timeout=2,
+            hints=HINTS,
+            partial_result_callback="",
+        )
+        gather.say(texte_final, language="fr-FR", voice="Polly.Lea", barge_in=False)
+    else:
+        gather = twiml.gather(
+            input="speech",
+            action="/appel",
+            method="POST",
+            language="fr-FR",
+            speech_timeout="1",
+            speech_model="phone_call",
+            timeout=6,
+            hints=HINTS,
+            partial_result_callback="",
+        )
+        gather.say(texte_final, language="fr-FR", voice="Polly.Lea", barge_in=False)
     twiml.say("Merci pour votre appel. À bientôt !", language="fr-FR", voice="Polly.Lea")
     twiml.hangup()
 
