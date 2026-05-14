@@ -117,6 +117,11 @@ SALON_CACHE_TTL = 300  # 5 minutes
 
 BASE_URL = "https://barbershop-agent.onrender.com"
 
+# Credentials Supabase et webhook spécifiques au salon (mis à jour via /update-config)
+SALON_SUPABASE_URL: str = ""
+SALON_SUPABASE_KEY: str = ""
+SALON_APP_WEBHOOK_URL: str = ""  # URL POST de notification RDV vers l'app S&B
+
 print("🔵 [BOOT 5/8] Création dossier audio…")
 os.makedirs("audio", exist_ok=True)
 print("🔵 [BOOT 5/8] Dossier audio OK")
@@ -1649,6 +1654,33 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
             fidelite = " 10ème visite ! Une prestation offerte vous attend !"
         update_client_context(telephone, rdv_en_cours=False, rdv_pris=True,
                               rdv_prestation="", rdv_jour="", rdv_heure="", rdv_coiffeur="")
+
+        # Notification webhook vers l'app S&B
+        if SALON_APP_WEBHOOK_URL:
+            try:
+                import urllib.request as _urlreq
+                webhook_payload = json.dumps({
+                    "event": "rdv_created",
+                    "salon_id": _session_salon_id,
+                    "client_telephone": telephone,
+                    "client_nom": tool_input.get("client_nom", ""),
+                    "prestation": prestation,
+                    "jour": jour,
+                    "heure": heure,
+                    "coiffeur": coiffeur_choisi or "",
+                    "avec_shampoing": avec_shampoing,
+                }).encode("utf-8")
+                req = _urlreq.Request(
+                    SALON_APP_WEBHOOK_URL,
+                    data=webhook_payload,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with _urlreq.urlopen(req, timeout=5) as resp:
+                    print(f"📡 [WEBHOOK] Notification envoyée → {resp.status}")
+            except Exception as _we:
+                print(f"⚠️ [WEBHOOK] Erreur notification : {_we}")
+
         return f"RDV enregistré pour {jour} à {heure}.{fidelite}"
 
     elif tool_name == "verifier_disponibilite":
@@ -2216,6 +2248,7 @@ async def sync_config(request: Request):
         global NOM_SALON, TELEPHONE_SALON, ADRESSE_SALON
         global HORAIRE_OUVERTURE, HORAIRE_FERMETURE, JOURS_OUVERTS
         global COIFFEURS, PRESTATIONS_SALON, BASE_URL, TWILIO_NUMBER
+        global SALON_SUPABASE_URL, SALON_SUPABASE_KEY, SALON_APP_WEBHOOK_URL
 
         # ── Config salon de base ──────────────────────────────────
         if data.get("salon_name"):
@@ -2240,6 +2273,15 @@ async def sync_config(request: Request):
             JOURS_OUVERTS = [jours_map.get(j, j.lower()) for j in data["open_days"]]
         if data.get("render_url"):
             BASE_URL = data["render_url"]
+        if data.get("supabase_url"):
+            SALON_SUPABASE_URL = data["supabase_url"]
+            print(f"✅ [SYNC] SALON_SUPABASE_URL mis à jour")
+        if data.get("supabase_key"):
+            SALON_SUPABASE_KEY = data["supabase_key"]
+            print(f"✅ [SYNC] SALON_SUPABASE_KEY mis à jour")
+        if data.get("webhook_url") or data.get("app_webhook_url"):
+            SALON_APP_WEBHOOK_URL = data.get("webhook_url") or data.get("app_webhook_url")
+            print(f"✅ [SYNC] SALON_APP_WEBHOOK_URL = {SALON_APP_WEBHOOK_URL}")
 
         # ── Coiffeurs ─────────────────────────────────────────────
         staff_data = data.get("staff") or data.get("employees") or data.get("coiffeurs")
