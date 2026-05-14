@@ -1825,7 +1825,7 @@ def run_agent(message_user: str, telephone: str) -> str:
     # Appeler GPT-4o avec function calling
     try:
         response = client_openai.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-4o-mini",
             messages=messages,
             tools=TOOLS,
             tool_choice="auto",
@@ -1901,7 +1901,7 @@ def run_agent(message_user: str, telephone: str) -> str:
 
         try:
             response = client_openai.chat.completions.create(
-                model="gpt-4o",
+                model="gpt-4o-mini",
                 messages=messages,
                 temperature=0,
                 max_tokens=300,
