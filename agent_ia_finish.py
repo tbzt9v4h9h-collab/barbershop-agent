@@ -1172,6 +1172,8 @@ Aujourd'hui : {date_str} à {heure_actuelle}.
 Horaires : {HORAIRE_OUVERTURE}-{HORAIRE_FERMETURE}, {', '.join([j.capitalize() for j in JOURS_OUVERTS])}.
 Adresse : {ADRESSE_SALON} | Tél : {TELEPHONE_SALON}
 {shampoing_info}
+RÈGLE N°1 ABSOLUE ET NON NÉGOCIABLE : À CHAQUE FOIS QUE LE CLIENT MENTIONNE UN JOUR OU UNE HEURE, TU DOIS OBLIGATOIREMENT APPELER verifier_disponibilite AVANT DE RÉPONDRE QUOI QUE CE SOIT. JAMAIS DE CONFIRMATION SANS CE TOOL.
+
 RÈGLE ABSOLUE PRIORITAIRE :
 Tu te concentres EXCLUSIVEMENT sur la prise de rendez-vous. Si le client parle d'autre chose, réponds uniquement : "Je suis uniquement disponible pour la prise de rendez-vous. Souhaitez-vous prendre un rendez-vous ?" Ignorer tout bruit de fond, mot isolé, ou phrase non liée à une réservation.
 
@@ -1229,8 +1231,11 @@ ANNULATION RDV :
 CONSEILS :
 Appeler demander_rappel_conseil puis : "Je transmets votre demande, un membre vous rappellera rapidement au [numéro]."
 
+FIN DE JOURNÉE :
+Si le client demande un RDV aujourd'hui en fin de journée, calcule le temps restant et propose uniquement les créneaux réalisables. Exemple : s'il est 16h30 et que le salon ferme à 18h, dis "Il nous reste peu de temps aujourd'hui, je peux vous proposer 17h00 ou 17h30 selon la prestation."
+
 FIN D'APPEL :
-Si client dit au revoir / merci / c'est tout : "Merci pour votre appel. Bonne journée et à bientôt."
+Si client dit au revoir / merci au revoir / bonne journée / c'est tout merci : "Merci pour votre appel. Bonne journée et à bientôt."
 
 """
 
@@ -1565,15 +1570,57 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
                 heure_min = parse_hhmm_en_minutes(heure)
                 ouv_min = parse_hhmm_en_minutes(HORAIRE_OUVERTURE)
                 ferm_min = parse_hhmm_en_minutes(HORAIRE_FERMETURE)
+
+                # Hors horaires
                 if not (ouv_min <= heure_min <= ferm_min):
-                    return (f"Indisponible - le salon est fermé à cette heure. "
-                            f"Horaires : {HORAIRE_OUVERTURE}-{HORAIRE_FERMETURE}.")
+                    return (f"Indisponible - le salon est ouvert de "
+                            f"{HORAIRE_OUVERTURE} à {HORAIRE_FERMETURE}.")
+
+                # Durée de la prestation (défaut 30 min)
+                duree_prestation = tool_input.get("duree", 30) or 30
+                if (heure_min + duree_prestation) > ferm_min:
+                    return (f"Indisponible - pas assez de temps avant la fermeture "
+                            f"à {HORAIRE_FERMETURE} pour une prestation de {duree_prestation} min.")
+
+                # Créneau aujourd'hui dans moins de 2h : compter les créneaux restants
+                aujourd_hui = datetime.now().date().isoformat()
+                if jour == aujourd_hui:
+                    maintenant_min = datetime.now().hour * 60 + datetime.now().minute
+                    if heure_min - maintenant_min < 120:
+                        try:
+                            reste = supabase.table("rendez_vous")\
+                                .select("id")\
+                                .eq("jour", aujourd_hui)\
+                                .eq("statut", "confirme")\
+                                .gte("heure_debut", heure)\
+                                .execute()
+                            nb_pris = len(reste.data) if reste.data else 0
+                            slots_total = (ferm_min - heure_min) // 30
+                            slots_libres = max(0, slots_total - nb_pris)
+                            if slots_libres <= 2:
+                                print(f"⏰ [DISPOS] Peu de créneaux restants aujourd'hui : {slots_libres}")
+                        except Exception:
+                            slots_libres = None
             except Exception:
                 pass
 
         update_client_context(telephone, rdv_en_cours=True)
         disponible = est_creneau_disponible(jour, heure)
-        return f"Disponibilité : {'libre' if disponible else 'occupé'}"
+        statut = "libre" if disponible else "occupé"
+
+        # Enrichir la réponse si peu de créneaux aujourd'hui
+        try:
+            if jour == datetime.now().date().isoformat():
+                maintenant_min = datetime.now().hour * 60 + datetime.now().minute
+                heure_min_v = parse_hhmm_en_minutes(heure)
+                if heure_min_v - maintenant_min < 120 and disponible:
+                    slots_total = (parse_hhmm_en_minutes(HORAIRE_FERMETURE) - heure_min_v) // 30
+                    if slots_total <= 2:
+                        return f"Disponibilité : {statut}. Il ne reste que {slots_total} créneau(x) aujourd'hui."
+        except Exception:
+            pass
+
+        return f"Disponibilité : {statut}"
 
     elif tool_name == "annuler_rdv":
         client_id = tool_input.get("client_id")
@@ -1851,17 +1898,30 @@ def run_agent(message_user: str, telephone: str) -> str:
     # CORRECTION BUG 1 : Nettoyer l'historique des messages orphelins
     messages = clean_messages(messages)
 
+    # Détecter si l'historique contient un jour ET une heure non encore vérifiés
+    # → forcer tool_choice="required" pour que GPT appelle obligatoirement un tool
+    _hist_text = " ".join(
+        str(m.get("content", "")) for m in get_conversation_history(telephone)
+    ).lower()
+    _jour_detecte = any(j in _hist_text for j in
+                        ["lundi", "mardi", "mercredi", "jeudi", "vendredi",
+                         "samedi", "dimanche", "demain", "aujourd", "prochain"])
+    _heure_detectee = bool(re.search(r'\b\d{1,2}h\d{0,2}\b|\d{1,2}:\d{2}', _hist_text))
+    _dispos_deja_verif = "disponibilit" in _hist_text or "libre" in _hist_text or "occupé" in _hist_text
+    _force_tool = _jour_detecte and _heure_detectee and not _dispos_deja_verif
+    _tool_choice = "required" if _force_tool else "auto"
+
     # Appeler GPT-4o avec function calling
     if not TOOLS:
         print("❌ [ERROR] tools vide — TOOLS non chargé, function calling désactivé")
     else:
-        print(f"🛠️ [GPT] {len(TOOLS)} tools disponibles | tool_choice=auto")
+        print(f"🛠️ [GPT] {len(TOOLS)} tools | tool_choice={_tool_choice}")
     try:
         response = client_openai.chat.completions.create(
             model="gpt-4o-mini",
             messages=messages,
             tools=TOOLS,
-            tool_choice="auto",
+            tool_choice=_tool_choice,
             temperature=0.3,
             max_tokens=200,
             presence_penalty=0.0,
@@ -2371,8 +2431,8 @@ def handle_appel(
             client_context[silence_key] = nb_silences + 1
             gather = twiml.gather(
                 input="speech", action="/appel", method="POST",
-                language="fr-FR", speech_timeout="1",
-                speech_model="phone_call", timeout=5, hints=HINTS,
+                language="fr-FR", speech_timeout="auto",
+                speech_model="phone_call", timeout=12, hints=HINTS,
                 partial_result_callback="",
             )
             gather.say("Vous êtes toujours là ? Je vous écoute.", language="fr-FR", voice="Polly.Lea", barge_in=False)
@@ -2410,7 +2470,7 @@ def handle_appel(
     telephone = telephone_appelant
     response_text = run_agent(SpeechResult, telephone)
 
-    # Phrases de congé explicites — uniquement des formules sans ambiguïté
+    # Seules phrases EXPLICITES de congé — combinaisons uniquement, jamais un mot seul
     PHRASES_FIN_CLIENT = [
         "au revoir",
         "merci au revoir",
@@ -2418,21 +2478,9 @@ def handle_appel(
         "bonne soirée",
         "bonne continuation",
         "à la prochaine",
-        "à bientôt",
-        "c'est bon merci",
         "c'est tout merci",
         "ok merci au revoir",
-        "ok merci bye",
         "merci bye",
-        "ciao",
-    ]
-    # Pour l'agent : uniquement si la réponse contient une formule de clôture COMPLÈTE
-    PHRASES_FIN_AGENT = [
-        "bonne journée et à bientôt",
-        "à bientôt chez nous",
-        "prenez soin de vous",
-        "passez une excellente journée",
-        "on vous attend avec plaisir",
     ]
     import random as _rand2
     REPONSES_FIN = [
@@ -2447,39 +2495,35 @@ def handle_appel(
     speech_lower = SpeechResult.lower().strip()
     nb_mots = len(speech_lower.split())
 
+    # Silence ou message vide → jamais de fin d'appel
+    if not speech_lower:
+        pass  # continuer vers le gather normal
+
+    # Mots seuls qui ne déclenchent JAMAIS une fin d'appel
+    MOTS_AMBIGUS = {"merci", "ok", "oui", "non", "voilà", "voila", "d'accord",
+                    "bien", "super", "parfait", "ciao", "bye", "salut", "à bientôt"}
+    est_mot_seul_ambigu = nb_mots <= 2 and speech_lower.strip(".,!?") in MOTS_AMBIGUS
+
     # Un horaire (14h, 10h30, 15 heures…) n'est jamais une fin d'appel
     import re as _re
     contient_horaire = bool(_re.search(r'\b\d{1,2}h\d{0,2}\b|\d{1,2}\s*heures?\b', speech_lower))
 
-    # Mots interrogatifs ou contextuels qui indiquent que ce n'est pas un congé
+    # Mots interrogatifs ou contextuels → pas un congé
     mots_question = ["?", "quoi", "autre", "avez", "faites",
                      "proposez", "encore", "aussi", "plus", "heure",
                      "rendez", "créneau", "disponible", "semaine"]
     est_question = any(m in speech_lower for m in mots_question)
 
-    # Moins de 3 mots → fin d'appel uniquement si c'est exactement "au revoir"
-    trop_court = nb_mots < 3 and speech_lower != "au revoir"
-
-    # Si la réponse contient une question shampoing, ne pas déclencher fin d'appel
-    ctx_fin = get_client_context(telephone)
-    agent_pose_shampoing = (
-        "shampoing" in (response_text or "").lower()
-        and not ctx_fin.get("shampoing_repondu")
-    )
-
+    # Fin d'appel uniquement si phrase explicite + aucune ambiguïté
+    # Seul le CLIENT peut terminer l'appel (est_fin_agent supprimé)
     est_fin_client = (
         any(phrase in speech_lower for phrase in PHRASES_FIN_CLIENT)
         and not est_question
         and not contient_horaire
-        and not trop_court
-        and not agent_pose_shampoing
-    )
-    est_fin_agent = (
-        any(p in (response_text or "").lower() for p in PHRASES_FIN_AGENT)
-        and not agent_pose_shampoing
+        and not est_mot_seul_ambigu
     )
 
-    if est_fin_client or est_fin_agent:
+    if est_fin_client:
         reponse_fin = _rand2.choice(REPONSES_FIN)
         twiml.say(reponse_fin, language="fr-FR", voice="Polly.Lea")
         twiml.hangup()
@@ -2499,48 +2543,22 @@ def handle_appel(
         and not ctx_gather.get("shampoing_repondu")
     )
 
-    # Pendant un message d'attente (tool call en cours) : gather très court
-    # pour ne pas capter du bruit pendant la vérification
-    if msg_attente:
-        gather = twiml.gather(
-            input="speech",
-            action="/appel",
-            method="POST",
-            language="fr-FR",
-            speech_timeout="1",
-            speech_model="phone_call",
-            timeout=2,
-            hints=HINTS,
-            partial_result_callback="",
-        )
-        gather.say(texte_final, language="fr-FR", voice="Polly.Lea", barge_in=False)
-    elif question_shampoing:
-        # Après question shampoing : laisser 10s, fin d'appel désactivée
-        gather = twiml.gather(
-            input="speech",
-            action="/appel",
-            method="POST",
-            language="fr-FR",
-            speech_timeout="auto",
-            speech_model="phone_call",
-            timeout=10,
-            hints=HINTS + ", oui, non, avec, sans, volontiers, pas de shampoing",
-            partial_result_callback="",
-        )
-        gather.say(texte_final, language="fr-FR", voice="Polly.Lea", barge_in=False)
-    else:
-        gather = twiml.gather(
-            input="speech",
-            action="/appel",
-            method="POST",
-            language="fr-FR",
-            speech_timeout="1",
-            speech_model="phone_call",
-            timeout=6,
-            hints=HINTS,
-            partial_result_callback="",
-        )
-        gather.say(texte_final, language="fr-FR", voice="Polly.Lea", barge_in=False)
+    # Hints enrichis si question shampoing en cours
+    hints_gather = HINTS + ", oui, non, avec, sans, volontiers, pas de shampoing" \
+        if question_shampoing else HINTS
+
+    gather = twiml.gather(
+        input="speech",
+        action="/appel",
+        method="POST",
+        language="fr-FR",
+        speech_timeout="auto",
+        speech_model="phone_call",
+        timeout=12,
+        hints=hints_gather,
+        partial_result_callback="",
+    )
+    gather.say(texte_final, language="fr-FR", voice="Polly.Lea", barge_in=False)
     twiml.say("Merci pour votre appel. À bientôt !", language="fr-FR", voice="Polly.Lea")
     twiml.hangup()
 
