@@ -1063,7 +1063,37 @@ def date_du_jour():
     return datetime.now().date()
 
 def format_date_longue(date_obj):
-    return f"{NOMS_JOURS[date_obj.weekday()]} {date_obj.day} {NOMS_MOIS[date_obj.month - 1]}"
+    return f"{NOMS_JOURS[date_obj.weekday()]} {date_obj.day} {NOMS_MOIS[date_obj.month - 1]} {date_obj.year}"
+
+def corriger_annee_date(date_iso: str) -> str:
+    """Corrige l'année d'une date ISO si elle ne correspond pas à l'année courante (ou suivante max)."""
+    if not date_iso:
+        return date_iso
+    try:
+        annee_courante = datetime.now().year
+        parts = date_iso.split("-")
+        if len(parts) == 3:
+            annee = int(parts[0])
+            if annee < annee_courante or annee > annee_courante + 1:
+                print(f"⚠️ [DATE] Année corrigée : {annee} → {annee_courante}")
+                return f"{annee_courante}-{parts[1]}-{parts[2]}"
+    except Exception:
+        pass
+    return date_iso
+
+def get_next_weekday(jour_nom: str) -> str:
+    """Retourne la date ISO (YYYY-MM-DD) du prochain jour de la semaine demandé."""
+    jours = {"lundi": 0, "mardi": 1, "mercredi": 2, "jeudi": 3,
+             "vendredi": 4, "samedi": 5, "dimanche": 6}
+    jour_nom_clean = normaliser_texte(jour_nom).split()[0]  # "lundi prochain" → "lundi"
+    cible = jours.get(jour_nom_clean)
+    if cible is None:
+        return (datetime.now().date() + timedelta(days=1)).isoformat()
+    aujourd_hui = datetime.now().date()
+    jours_a_ajouter = (cible - aujourd_hui.weekday()) % 7
+    if jours_a_ajouter == 0:
+        jours_a_ajouter = 7
+    return (aujourd_hui + timedelta(days=jours_a_ajouter)).isoformat()
 
 def parse_hhmm_en_minutes(hhmm):
     heures, minutes = hhmm.split(":")
@@ -1247,8 +1277,18 @@ def build_system_prompt(telephone: str = None) -> str:
     else:
         rdv_context_block = ""
 
+    # Calculer les dates réelles des 7 prochains jours pour ancrer GPT
+    _dates_prochains = []
+    for _i in range(1, 8):
+        _d = aujourd_hui + timedelta(days=_i)
+        _dates_prochains.append(
+            f"{NOMS_JOURS[_d.weekday()]} {_d.day} {NOMS_MOIS[_d.month-1]} = {_d.isoformat()}"
+        )
+    _dates_ref = " | ".join(_dates_prochains)
+
     prompt = f"""Tu es la réceptionniste vocale professionnelle du salon {NOM_SALON}.
-Aujourd'hui : {date_str} à {heure_actuelle}.
+Aujourd'hui : {date_str} à {heure_actuelle}. Date ISO : {aujourd_hui.isoformat()}.
+Prochains jours (utilise ces dates exactes dans les tools) : {_dates_ref}.
 Horaires : {HORAIRE_OUVERTURE}-{HORAIRE_FERMETURE}, {', '.join([j.capitalize() for j in JOURS_OUVERTS])}.
 Adresse : {ADRESSE_SALON} | Tél : {TELEPHONE_SALON}
 {shampoing_info}{rdv_context_block}
@@ -1579,7 +1619,7 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
     """Exécute une fonction appelée par GPT-4o et retourne le résultat."""
 
     if tool_name == "prendre_rdv":
-        jour = tool_input.get("jour")
+        jour = corriger_annee_date(tool_input.get("jour"))
         heure = tool_input.get("heure")
         prestation = tool_input.get("prestation", "coupe")
         type_client = tool_input.get("type_client", "homme")
@@ -1684,22 +1724,11 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
         return f"RDV enregistré pour {jour} à {heure}.{fidelite}"
 
     elif tool_name == "verifier_disponibilite":
-        jour = tool_input.get("jour")
+        jour = corriger_annee_date(tool_input.get("jour"))
         heure = tool_input.get("heure")
         # Mémoriser jour/heure vérifiés dans le contexte RDV
         if jour: update_client_context(telephone, rdv_jour=jour)
         if heure: update_client_context(telephone, rdv_heure=heure)
-
-        # Corriger l'année si GPT envoie une année erronée
-        if jour:
-            try:
-                annee_courante = datetime.now().year
-                parts = jour.split("-")
-                if len(parts) == 3 and int(parts[0]) != annee_courante:
-                    print(f"⚠️ [DISPOS] Année corrigée : {parts[0]} → {annee_courante}")
-                    jour = f"{annee_courante}-{parts[1]}-{parts[2]}"
-            except Exception:
-                pass
 
         # Vérifier que l'heure est dans les horaires d'ouverture
         if heure:
@@ -1885,7 +1914,7 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
             return f"Erreur recherche client : {e}"
 
     elif tool_name == "verifier_coiffeur_disponible":
-        jour = tool_input.get("jour")
+        jour = corriger_annee_date(tool_input.get("jour"))
         heure = tool_input.get("heure")
         coiffeur_souhaite = tool_input.get("coiffeur_souhaite")
         if coiffeur_souhaite:
