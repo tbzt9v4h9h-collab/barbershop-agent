@@ -1317,7 +1317,7 @@ Si client dit au revoir / merci au revoir / bonne journée / c'est tout merci : 
 
 """
 
-    # Coiffeurs : un seul = pas de question
+    # Coiffeurs
     if len(COIFFEURS) == 0:
         prompt += "COIFFEUR : Aucun coiffeur enregistré. Ne pas mentionner de coiffeur.\n"
     elif len(COIFFEURS) == 1:
@@ -1325,13 +1325,24 @@ Si client dit au revoir / merci au revoir / bonne journée / c'est tout merci : 
         prompt += f"COIFFEUR : Un seul coiffeur — {nom_unique}. Ne jamais demander de préférence. Assigner automatiquement {nom_unique}.\n"
     else:
         noms_c = ', '.join([c['nom'] for c in COIFFEURS])
+        # Lignes spécialités pour chaque coiffeur (si renseignées)
+        lignes_spec = []
+        for c in COIFFEURS:
+            specs = c.get("specialites") or []
+            if specs:
+                lignes_spec.append(f"  {c['nom']} : {', '.join(specs)}")
+        spec_block = "\nSpécialités :\n" + "\n".join(lignes_spec) + "\n" if lignes_spec else ""
         prompt += (
-            f"GESTION COIFFEURS ({len(COIFFEURS)} disponibles : {noms_c}) :\n"
-            f"- Poser EXACTEMENT cette question : \"Avez-vous une préférence pour un coiffeur ?\"\n"
-            f"  Ne pas citer les noms dans cette question.\n"
-            f"- Si le client dit non → assigner automatiquement le premier disponible.\n"
-            f"- Si le client dit oui → demander \"Lequel ? Nous avons : {noms_c}.\"\n"
-            f"- Si coiffeur demandé indisponible : proposer autre heure OU autre coiffeur.\n"
+            f"GESTION COIFFEURS ({len(COIFFEURS)} disponibles : {noms_c}) :{spec_block}"
+            f"RÈGLES COIFFEUR (dans l'ordre) :\n"
+            f"1. Après verifier_disponibilite, utilise le résultat 'Coiffeur assigné automatiquement' si présent → ne jamais poser la question de préférence dans ce cas.\n"
+            f"2. Si le résultat de verifier_disponibilite liste plusieurs coiffeurs compétents → poser EXACTEMENT : \"Avez-vous une préférence pour un coiffeur ?\"\n"
+            f"   Ne pas citer les noms dans cette question.\n"
+            f"   - Client dit non → assigner automatiquement le premier de la liste.\n"
+            f"   - Client dit oui → demander \"Lequel ? Nous avons : {noms_c}.\"\n"
+            f"3. Si le client demande un coiffeur non compétent pour la prestation → répondre :\n"
+            f"   \"[Nom] ne propose pas cette prestation, seul [coiffeur compétent] peut vous la réaliser. Je vous confirme avec [coiffeur compétent] ?\"\n"
+            f"4. Si coiffeur demandé indisponible à ce créneau : proposer autre heure OU autre coiffeur compétent.\n"
         )
 
     # Prestations disponibles
@@ -1704,16 +1715,22 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
 
         # Filtrage coiffeurs compétents pour la prestation
         prestation_ctx = tool_input.get("prestation") or get_client_context(telephone).get("rdv_prestation", "")
-        if prestation_ctx and len(COIFFEURS) > 1:
+        if prestation_ctx and len(COIFFEURS) >= 1:
             competents = coiffeurs_competents(prestation_ctx)
             if not competents:
-                return f"Disponibilité : {statut}. Aucun coiffeur ne propose '{prestation_ctx}' actuellement."
+                return (f"Disponibilité : {statut}. "
+                        f"Aucun coiffeur ne propose '{prestation_ctx}' actuellement.")
             elif len(competents) == 1:
                 update_client_context(telephone, rdv_coiffeur=competents[0]["nom"])
-                return f"Disponibilité : {statut}. Coiffeur assigné automatiquement : {competents[0]['nom']} (seul compétent pour {prestation_ctx})."
+                print(f"✅ [COIFFEUR] Assignation auto : {competents[0]['nom']} pour {prestation_ctx}")
+                return (f"Disponibilité : {statut}. "
+                        f"Coiffeur assigné automatiquement : {competents[0]['nom']}. "
+                        f"Ne pas poser la question de préférence coiffeur.")
             else:
                 noms = ', '.join(c['nom'] for c in competents)
-                return f"Disponibilité : {statut}. Coiffeurs compétents pour {prestation_ctx} : {noms}."
+                return (f"Disponibilité : {statut}. "
+                        f"Plusieurs coiffeurs compétents pour {prestation_ctx} : {noms}. "
+                        f"Poser la question de préférence.")
 
         # Enrichir la réponse si peu de créneaux aujourd'hui
         try:
