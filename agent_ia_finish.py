@@ -1542,6 +1542,30 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
     elif tool_name == "verifier_disponibilite":
         jour = tool_input.get("jour")
         heure = tool_input.get("heure")
+
+        # Corriger l'année si GPT envoie une année erronée
+        if jour:
+            try:
+                annee_courante = datetime.now().year
+                parts = jour.split("-")
+                if len(parts) == 3 and int(parts[0]) != annee_courante:
+                    print(f"⚠️ [DISPOS] Année corrigée : {parts[0]} → {annee_courante}")
+                    jour = f"{annee_courante}-{parts[1]}-{parts[2]}"
+            except Exception:
+                pass
+
+        # Vérifier que l'heure est dans les horaires d'ouverture
+        if heure:
+            try:
+                heure_min = parse_hhmm_en_minutes(heure)
+                ouv_min = parse_hhmm_en_minutes(HORAIRE_OUVERTURE)
+                ferm_min = parse_hhmm_en_minutes(HORAIRE_FERMETURE)
+                if not (ouv_min <= heure_min <= ferm_min):
+                    return (f"Indisponible - le salon est fermé à cette heure. "
+                            f"Horaires : {HORAIRE_OUVERTURE}-{HORAIRE_FERMETURE}.")
+            except Exception:
+                pass
+
         update_client_context(telephone, rdv_en_cours=True)
         disponible = est_creneau_disponible(jour, heure)
         return f"Disponibilité : {'libre' if disponible else 'occupé'}"
@@ -2425,13 +2449,24 @@ def handle_appel(
     # Moins de 3 mots → fin d'appel uniquement si c'est exactement "au revoir"
     trop_court = nb_mots < 3 and speech_lower != "au revoir"
 
+    # Si la réponse contient une question shampoing, ne pas déclencher fin d'appel
+    ctx_fin = get_client_context(telephone)
+    agent_pose_shampoing = (
+        "shampoing" in (response_text or "").lower()
+        and not ctx_fin.get("shampoing_repondu")
+    )
+
     est_fin_client = (
         any(phrase in speech_lower for phrase in PHRASES_FIN_CLIENT)
         and not est_question
         and not contient_horaire
         and not trop_court
+        and not agent_pose_shampoing
     )
-    est_fin_agent = any(p in (response_text or "").lower() for p in PHRASES_FIN_AGENT)
+    est_fin_agent = (
+        any(p in (response_text or "").lower() for p in PHRASES_FIN_AGENT)
+        and not agent_pose_shampoing
+    )
 
     if est_fin_client or est_fin_agent:
         reponse_fin = _rand2.choice(REPONSES_FIN)
@@ -2446,6 +2481,13 @@ def handle_appel(
         update_client_context(telephone)  # flush (pop already done on dict)
     texte_final = (msg_attente + " " + response_text) if msg_attente else response_text
 
+    # Déterminer les paramètres du gather selon le contexte
+    ctx_gather = get_client_context(telephone)
+    question_shampoing = (
+        "shampoing" in (response_text or "").lower()
+        and not ctx_gather.get("shampoing_repondu")
+    )
+
     # Pendant un message d'attente (tool call en cours) : gather très court
     # pour ne pas capter du bruit pendant la vérification
     if msg_attente:
@@ -2458,6 +2500,20 @@ def handle_appel(
             speech_model="phone_call",
             timeout=2,
             hints=HINTS,
+            partial_result_callback="",
+        )
+        gather.say(texte_final, language="fr-FR", voice="Polly.Lea", barge_in=False)
+    elif question_shampoing:
+        # Après question shampoing : laisser 10s, fin d'appel désactivée
+        gather = twiml.gather(
+            input="speech",
+            action="/appel",
+            method="POST",
+            language="fr-FR",
+            speech_timeout="auto",
+            speech_model="phone_call",
+            timeout=10,
+            hints=HINTS + ", oui, non, avec, sans, volontiers, pas de shampoing",
             partial_result_callback="",
         )
         gather.say(texte_final, language="fr-FR", voice="Polly.Lea", barge_in=False)
