@@ -486,12 +486,12 @@ def load_all_salon_data():
                 {
                     "nom": e.get("full_name") or e.get("name") or e.get("first_name", ""),
                     "id": e.get("id"),
-                    "specialites": e.get("specialties") or e.get("role", ""),
+                    "specialites": _normaliser_specialites(e.get("specialties") or e.get("role")),
                 }
                 for e in staff_result.data
                 if e.get("full_name") or e.get("name") or e.get("first_name")
             ]
-            print(f"✅ [LOAD] Coiffeurs : {[c['nom'] for c in COIFFEURS]}")
+            print(f"✅ [LOAD] Coiffeurs : {[{'nom': c['nom'], 'specialites': c['specialites']} for c in COIFFEURS]}")
         else:
             COIFFEURS = []
             print(f"⚠️ [LOAD] Aucun coiffeur pour salon_id={salon_id}")
@@ -960,6 +960,39 @@ def annuler_rdv(client_id: str, rdv_id: str) -> bool:
         print(f"Erreur Supabase annuler_rdv: {e}")
         return False
 
+def _normaliser_specialites(raw) -> list:
+    """Convertit specialites en liste de strings, quel que soit le format reçu."""
+    if not raw:
+        return []
+    if isinstance(raw, list):
+        return [str(s).strip() for s in raw if s]
+    if isinstance(raw, str):
+        # "Coupe, Barbe" ou "['Coupe', 'Barbe']" ou "Coupe"
+        raw = raw.strip()
+        if raw.startswith("["):
+            try:
+                import ast
+                parsed = ast.literal_eval(raw)
+                if isinstance(parsed, list):
+                    return [str(s).strip() for s in parsed if s]
+            except Exception:
+                pass
+        return [s.strip() for s in raw.split(",") if s.strip()]
+    return []
+
+def coiffeurs_competents(prestation: str) -> list:
+    """Filtre COIFFEURS selon la prestation. Retourne tous si aucune spécialité n'est renseignée."""
+    if not prestation:
+        return COIFFEURS
+    prest_lower = prestation.lower()
+    competents = [
+        c for c in COIFFEURS
+        if any(prest_lower in s.lower() or s.lower() in prest_lower
+               for s in _normaliser_specialites(c.get("specialites")))
+    ]
+    # Si aucune spécialité ne matche (ou spécialités vides), considérer tous compétents
+    return competents if competents else COIFFEURS
+
 def get_coiffeurs_disponibles(jour: str, heure: str, duree: int = 45) -> list:
     """Retourne la liste des coiffeurs disponibles à l'heure demandée."""
     try:
@@ -1292,7 +1325,14 @@ Si client dit au revoir / merci au revoir / bonne journée / c'est tout merci : 
         prompt += f"COIFFEUR : Un seul coiffeur — {nom_unique}. Ne jamais demander de préférence. Assigner automatiquement {nom_unique}.\n"
     else:
         noms_c = ', '.join([c['nom'] for c in COIFFEURS])
-        prompt += f"GESTION COIFFEURS : Demander la préférence UNE SEULE fois parmi : {noms_c}.\nSi coiffeur indisponible : proposer autre heure OU autre coiffeur.\n"
+        prompt += (
+            f"GESTION COIFFEURS ({len(COIFFEURS)} disponibles : {noms_c}) :\n"
+            f"- Poser EXACTEMENT cette question : \"Avez-vous une préférence pour un coiffeur ?\"\n"
+            f"  Ne pas citer les noms dans cette question.\n"
+            f"- Si le client dit non → assigner automatiquement le premier disponible.\n"
+            f"- Si le client dit oui → demander \"Lequel ? Nous avons : {noms_c}.\"\n"
+            f"- Si coiffeur demandé indisponible : proposer autre heure OU autre coiffeur.\n"
+        )
 
     # Prestations disponibles
     if PRESTATIONS_SALON:
@@ -1661,6 +1701,19 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
         update_client_context(telephone, rdv_en_cours=True)
         disponible = est_creneau_disponible(jour, heure)
         statut = "libre" if disponible else "occupé"
+
+        # Filtrage coiffeurs compétents pour la prestation
+        prestation_ctx = tool_input.get("prestation") or get_client_context(telephone).get("rdv_prestation", "")
+        if prestation_ctx and len(COIFFEURS) > 1:
+            competents = coiffeurs_competents(prestation_ctx)
+            if not competents:
+                return f"Disponibilité : {statut}. Aucun coiffeur ne propose '{prestation_ctx}' actuellement."
+            elif len(competents) == 1:
+                update_client_context(telephone, rdv_coiffeur=competents[0]["nom"])
+                return f"Disponibilité : {statut}. Coiffeur assigné automatiquement : {competents[0]['nom']} (seul compétent pour {prestation_ctx})."
+            else:
+                noms = ', '.join(c['nom'] for c in competents)
+                return f"Disponibilité : {statut}. Coiffeurs compétents pour {prestation_ctx} : {noms}."
 
         # Enrichir la réponse si peu de créneaux aujourd'hui
         try:
@@ -2271,9 +2324,9 @@ async def sync_staff(request: Request):
             if not nom:
                 continue
             COIFFEURS.append({
-                "nom": nom,
+                "nom": nom.strip().title(),
                 "id": s.get("id", ""),
-                "specialites": s.get("specialties") or s.get("role", ""),
+                "specialites": _normaliser_specialites(s.get("specialties") or s.get("role")),
             })
             nom = nom.strip().title()
             try:
@@ -2291,7 +2344,7 @@ async def sync_staff(request: Request):
         SALON_DATA_CACHED_AT = None
         load_all_salon_data()
         print(f"✅ [SYNC-STAFF] {len(COIFFEURS)} coiffeurs : "
-              f"{[c['nom'] for c in COIFFEURS]}")
+              f"{[{'nom': c['nom'], 'specialites': c['specialites']} for c in COIFFEURS]}")
         return {"status": "ok", "coiffeurs": len(COIFFEURS)}
     except Exception as e:
         print(f"❌ [SYNC-STAFF] {e}")
