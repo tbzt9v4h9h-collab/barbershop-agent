@@ -1167,11 +1167,53 @@ def build_system_prompt(telephone: str = None) -> str:
             reponse_sh = "oui" if ctx_sh.get("avec_shampoing") else "non"
             shampoing_info = f"\nSHAMPOING : déjà demandé et répondu ({reponse_sh}). NE PAS redemander.\n"
 
+    # --- Construire CONTEXTE RDV EN COURS depuis client_context + scan historique ---
+    rdv_ctx = {}
+    if telephone:
+        rdv_ctx = {
+            "prestation": ctx.get("rdv_prestation", ""),
+            "jour":       ctx.get("rdv_jour", ""),
+            "heure":      ctx.get("rdv_heure", ""),
+            "shampoing":  ("oui" if ctx.get("avec_shampoing") else "non") if ctx.get("shampoing_repondu") else "",
+            "coiffeur":   ctx.get("rdv_coiffeur", ""),
+            "prenom":     prenom_client,
+        }
+        # Scan historique pour enrichir ce qui n'est pas encore dans le contexte
+        if not rdv_ctx["prenom"]:
+            hist = get_conversation_history(telephone)
+            for msg in hist:
+                if msg.get("role") == "user":
+                    words = msg["content"].strip().split()
+                    if 1 <= len(words) <= 3 and all(w.isalpha() for w in words):
+                        rdv_ctx["prenom"] = words[0].capitalize()
+                        update_client_context(telephone, prenom=rdv_ctx["prenom"])
+                        break
+        if not rdv_ctx["prestation"] and PRESTATIONS_SALON:
+            hist = get_conversation_history(telephone)
+            noms_prest_lower = [p.get("name", "").lower() for p in PRESTATIONS_SALON]
+            for msg in hist:
+                content_lower = str(msg.get("content", "")).lower()
+                for nom in noms_prest_lower:
+                    if nom and nom in content_lower:
+                        rdv_ctx["prestation"] = nom
+                        update_client_context(telephone, rdv_prestation=nom)
+                        break
+                if rdv_ctx["prestation"]:
+                    break
+
+    # Bloc CONTEXTE RDV EN COURS (uniquement si au moins un champ renseigné)
+    rdv_ctx_non_vides = {k: v for k, v in rdv_ctx.items() if v}
+    if rdv_ctx_non_vides:
+        rdv_ctx_str = "\n".join(f"  {k}={v}" for k, v in rdv_ctx_non_vides.items())
+        rdv_context_block = f"\nCONTEXTE RDV EN COURS :\n{rdv_ctx_str}\nTous ces éléments sont ACQUIS. Ne pas les redemander.\n"
+    else:
+        rdv_context_block = ""
+
     prompt = f"""Tu es la réceptionniste vocale professionnelle du salon {NOM_SALON}.
 Aujourd'hui : {date_str} à {heure_actuelle}.
 Horaires : {HORAIRE_OUVERTURE}-{HORAIRE_FERMETURE}, {', '.join([j.capitalize() for j in JOURS_OUVERTS])}.
 Adresse : {ADRESSE_SALON} | Tél : {TELEPHONE_SALON}
-{shampoing_info}
+{shampoing_info}{rdv_context_block}
 RÈGLE N°1 ABSOLUE ET NON NÉGOCIABLE : À CHAQUE FOIS QUE LE CLIENT MENTIONNE UN JOUR OU UNE HEURE, TU DOIS OBLIGATOIREMENT APPELER verifier_disponibilite AVANT DE RÉPONDRE QUOI QUE CE SOIT. JAMAIS DE CONFIRMATION SANS CE TOOL.
 
 RÈGLE ABSOLUE PRIORITAIRE :
@@ -1186,6 +1228,9 @@ RÈGLES ABSOLUES :
 4. Extraire TOUTES les infos du message avant de questionner.
 5. Répondre en français uniquement, sauf si le client parle anglais.
 6. Si on change de prestation en cours de flow, NE PAS redemander le jour, l'heure, le shampoing ou le coiffeur déjà confirmés. Reprendre le flow à l'étape de vérification disponibilité directement.
+7. Si CLIENT RECONNU est présent dans le contexte, le prénom est déjà connu — ne jamais poser la question du prénom.
+8. Si un élément du RDV pose problème (prestation indispo, créneau pris, coiffeur absent), ne redemander QUE l'élément problématique. Tous les autres éléments déjà confirmés dans CONTEXTE RDV EN COURS sont acquis et ne doivent jamais être redemandés.
+9. Si le prénom apparaît déjà dans CONTEXTE RDV EN COURS ou dans l'historique, ne jamais le redemander.
 
 RÈGLE ANTI-RÉPÉTITION :
 - Le shampoing ne doit être demandé QU'UNE SEULE fois. Une fois répondu, ne plus jamais poser cette question.
@@ -1484,6 +1529,11 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
         type_client = tool_input.get("type_client", "homme")
         avec_shampoing = bool(tool_input.get("avec_shampoing", False))
         coiffeur_choisi = tool_input.get("coiffeur")
+        # Mémoriser tout le contexte RDV
+        update_client_context(telephone,
+            rdv_prestation=prestation, rdv_jour=jour, rdv_heure=heure,
+            rdv_coiffeur=coiffeur_choisi or "",
+            avec_shampoing=avec_shampoing, shampoing_repondu=True)
 
         # Vérifier que la prestation existe (si liste chargée)
         if PRESTATIONS_SALON:
@@ -1546,12 +1596,16 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
             fidelite = " C'est votre 5ème visite, vous bénéficiez d'une remise de 10% !"
         elif nb_v == 10:
             fidelite = " 10ème visite ! Une prestation offerte vous attend !"
-        update_client_context(telephone, rdv_en_cours=False, rdv_pris=True)
+        update_client_context(telephone, rdv_en_cours=False, rdv_pris=True,
+                              rdv_prestation="", rdv_jour="", rdv_heure="", rdv_coiffeur="")
         return f"RDV enregistré pour {jour} à {heure}.{fidelite}"
 
     elif tool_name == "verifier_disponibilite":
         jour = tool_input.get("jour")
         heure = tool_input.get("heure")
+        # Mémoriser jour/heure vérifiés dans le contexte RDV
+        if jour: update_client_context(telephone, rdv_jour=jour)
+        if heure: update_client_context(telephone, rdv_heure=heure)
 
         # Corriger l'année si GPT envoie une année erronée
         if jour:
@@ -1732,6 +1786,8 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
         jour = tool_input.get("jour")
         heure = tool_input.get("heure")
         coiffeur_souhaite = tool_input.get("coiffeur_souhaite")
+        if coiffeur_souhaite:
+            update_client_context(telephone, rdv_coiffeur=coiffeur_souhaite)
         disponibles = get_coiffeurs_disponibles(jour, heure)
         if coiffeur_souhaite:
             coiffeur_libre = any(c["nom"].lower() == coiffeur_souhaite.lower() for c in disponibles)
