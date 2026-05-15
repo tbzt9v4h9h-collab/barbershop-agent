@@ -16,9 +16,16 @@ from apscheduler.schedulers.background import BackgroundScheduler
 import openai
 import uuid
 import re
+import pytz
 from datetime import datetime, timedelta, date, timezone
 from dotenv import load_dotenv
 from supabase import create_client, Client
+
+PARIS_TZ = pytz.timezone("Europe/Paris")
+
+def now_paris() -> datetime:
+    """Retourne l'heure actuelle dans le fuseau Europe/Paris."""
+    return datetime.now(PARIS_TZ)
 
 load_dotenv()
 print("🔵 [BOOT 1/8] load_dotenv OK")
@@ -158,7 +165,7 @@ def enregistrer_usage(salon_id: str = None, salon_nom: str = None,
         return
 
     cout_usd, cout_eur = calculer_cout(tokens_input, tokens_output)
-    mois = datetime.now().strftime("%Y-%m")
+    mois = now_paris().strftime("%Y-%m")
 
     try:
         supabase.table("usage_logs").insert({
@@ -182,7 +189,7 @@ def enregistrer_usage(salon_id: str = None, salon_nom: str = None,
 def rapport_mensuel(mois: str = None):
     """Génère un rapport des coûts par salon pour le mois."""
     if not mois:
-        mois = datetime.now().strftime("%Y-%m")
+        mois = now_paris().strftime("%Y-%m")
 
     try:
         result = supabase.table("usage_logs")\
@@ -323,11 +330,11 @@ def add_to_history(telephone: str, role: str, content: str):
     """Ajoute un message à l'historique."""
     history = get_conversation_history(telephone)
     history.append({"role": role, "content": content})
-    derniere_activite[telephone] = datetime.now()
+    derniere_activite[telephone] = now_paris()
 
 def nettoyer_historiques():
     """Supprime les historiques de conversations inactifs depuis plus de 2h."""
-    maintenant = datetime.now()
+    maintenant = now_paris()
     a_supprimer = []
     for tel in list(conversation_history.keys()):
         if tel in derniere_activite:
@@ -439,9 +446,9 @@ def load_all_salon_data():
     global HORAIRE_OUVERTURE, HORAIRE_FERMETURE, JOURS_OUVERTS
     global TWILIO_NUMBER, _session_salon_id, SALON_DATA_CACHED_AT
 
-    maintenant = datetime.now()
+    maintenant = now_paris()
     if SALON_DATA_CACHED_AT and \
-       (maintenant - SALON_DATA_CACHED_AT).seconds < SALON_CACHE_TTL:
+       (maintenant - SALON_DATA_CACHED_AT).total_seconds() < SALON_CACHE_TTL:
         return  # Données encore fraîches
 
     if not supabase:
@@ -521,7 +528,7 @@ def load_all_salon_data():
             print(f"🔍 [TOUTES PRESTATIONS] {all_s.data}")
             PRESTATIONS_SALON = []
 
-        SALON_DATA_CACHED_AT = datetime.now()
+        SALON_DATA_CACHED_AT = now_paris()
 
     except Exception as e:
         print(f"❌ [LOAD] Erreur load_all_salon_data : {e}")
@@ -720,7 +727,7 @@ def est_creneau_disponible(jour: str, heure: str) -> bool:
 def get_rdv_client(client_id: str) -> list:
     """Récupère les RDV à venir d'un client."""
     try:
-        today = datetime.now().date().isoformat()
+        today = now_paris().date().isoformat()
         result = supabase.table("rendez_vous")\
             .select("*")\
             .eq("client_id", client_id)\
@@ -887,7 +894,7 @@ def check_rappels_1h():
     if not supabase:
         return
     try:
-        maintenant = datetime.now()
+        maintenant = now_paris()
         dans_1h = (maintenant + timedelta(hours=1)).strftime("%H:%M")
         aujourdhui = maintenant.date().isoformat()
         rdvs = supabase.table("rendez_vous").select("*")\
@@ -1060,7 +1067,7 @@ def normaliser_texte(texte):
     return re.sub(r"\s+", " ", texte).strip()
 
 def date_du_jour():
-    return datetime.now().date()
+    return now_paris().date()
 
 def format_date_longue(date_obj):
     return f"{NOMS_JOURS[date_obj.weekday()]} {date_obj.day} {NOMS_MOIS[date_obj.month - 1]} {date_obj.year}"
@@ -1070,7 +1077,7 @@ def corriger_annee_date(date_iso: str) -> str:
     if not date_iso:
         return date_iso
     try:
-        annee_courante = datetime.now().year
+        annee_courante = now_paris().year
         parts = date_iso.split("-")
         if len(parts) == 3:
             annee = int(parts[0])
@@ -1088,8 +1095,8 @@ def get_next_weekday(jour_nom: str) -> str:
     jour_nom_clean = normaliser_texte(jour_nom).split()[0]  # "lundi prochain" → "lundi"
     cible = jours.get(jour_nom_clean)
     if cible is None:
-        return (datetime.now().date() + timedelta(days=1)).isoformat()
-    aujourd_hui = datetime.now().date()
+        return (now_paris().date() + timedelta(days=1)).isoformat()
+    aujourd_hui = now_paris().date()
     jours_a_ajouter = (cible - aujourd_hui.weekday()) % 7
     if jours_a_ajouter == 0:
         jours_a_ajouter = 7
@@ -1153,7 +1160,7 @@ def parse_date_relative(texte_date: str) -> str:
     - "en debut de semaine" -> mardi
     - "le plus tot possible" -> premier jour ouvrable
     """
-    aujourd_hui = datetime.now().date()
+    aujourd_hui = now_paris().date()
     texte = normaliser_texte(texte_date)
 
     # Demain
@@ -1213,9 +1220,10 @@ def parse_date_relative(texte_date: str) -> str:
 # PROMPT SYSTÈME AMÉLIORÉ
 # ====================================================
 def build_system_prompt(telephone: str = None) -> str:
-    aujourd_hui = datetime.now().date()
+    _maintenant_paris = now_paris()
+    aujourd_hui = _maintenant_paris.date()
     date_str = format_date_longue(aujourd_hui)
-    heure_actuelle = datetime.now().strftime("%H:%M")
+    heure_actuelle = _maintenant_paris.strftime("%H:%M")
 
     ctx = get_client_context(telephone) if telephone else {}
     prenom_client = ctx.get("prenom", "")
@@ -1351,10 +1359,15 @@ FLOW PRISE DE RDV — ORDRE STRICT ET OBLIGATOIRE :
 Étape 8 — CONFIRMATION : appeler prendre_rdv → "Votre rendez-vous est confirmé. Vous allez recevoir un SMS."
 NE JAMAIS SAUTER UNE ÉTAPE. NE JAMAIS REVENIR EN ARRIÈRE POUR REDEMANDER UN ÉLÉMENT DÉJÀ ACQUIS.
 
-MESSAGES D'ATTENTE (avant tool calls lents) :
-"Un instant, je vérifie les disponibilités."
-"Je consulte le planning."
-"Un moment s'il vous plaît."
+MESSAGES D'ATTENTE — RÈGLE CRITIQUE :
+Lorsque tu appelles un outil (verifier_disponibilite, prendre_rdv, etc.), NE PAS écrire de texte d'attente dans ta réponse. Le système injecte automatiquement un message d'attente avant ton résultat. Si tu écris aussi un message d'attente, il sera dit EN DOUBLE.
+→ Répondre DIRECTEMENT avec le résultat de l'outil, sans préambule d'attente.
+
+RÈGLE MODIFICATION EN COURS DE FLOW :
+Si le client modifie une information déjà fournie (jour, heure, prestation, coiffeur) :
+→ Accuser réception : "Très bien, je modifie pour [nouvelle valeur]." puis appeler verifier_disponibilite avec les nouvelles valeurs.
+→ Ne jamais ignorer silencieusement le changement.
+→ Ne jamais continuer sur l'ancienne valeur sans confirmation.
 
 ANNULATION RDV :
 1. get_rdv_client_actif → lister → confirmer → annuler_rdv → "Votre rendez-vous est annulé. Vous allez recevoir un SMS."
@@ -1780,9 +1793,10 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
                             f"à {HORAIRE_FERMETURE} pour une prestation de {duree_prestation} min.")
 
                 # Créneau aujourd'hui dans moins de 2h : compter les créneaux restants
-                aujourd_hui = datetime.now().date().isoformat()
+                _np = now_paris()
+                aujourd_hui = _np.date().isoformat()
                 if jour == aujourd_hui:
-                    maintenant_min = datetime.now().hour * 60 + datetime.now().minute
+                    maintenant_min = _np.hour * 60 + _np.minute
                     if heure_min - maintenant_min < 120:
                         try:
                             reste = supabase.table("rendez_vous")\
@@ -1826,8 +1840,9 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
 
         # Enrichir la réponse si peu de créneaux aujourd'hui
         try:
-            if jour == datetime.now().date().isoformat():
-                maintenant_min = datetime.now().hour * 60 + datetime.now().minute
+            _np2 = now_paris()
+            if jour == _np2.date().isoformat():
+                maintenant_min = _np2.hour * 60 + _np2.minute
                 heure_min_v = parse_hhmm_en_minutes(heure)
                 if heure_min_v - maintenant_min < 120 and disponible:
                     slots_total = (parse_hhmm_en_minutes(HORAIRE_FERMETURE) - heure_min_v) // 30
@@ -2611,7 +2626,7 @@ def handle_appel(
         if not supabase or not tel:
             return False
         try:
-            hier = (datetime.now() - timedelta(days=1)).isoformat()
+            hier = (now_paris() - timedelta(days=1)).isoformat()
             result = supabase.table("usage_logs").select("id")\
                 .eq("twilio_number", tel).gte("created_at", hier).execute()
             return len(result.data or []) > 10
