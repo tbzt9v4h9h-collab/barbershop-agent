@@ -128,6 +128,7 @@ BASE_URL = "https://barbershop-agent.onrender.com"
 SALON_SUPABASE_URL: str = ""
 SALON_SUPABASE_KEY: str = ""
 SALON_APP_WEBHOOK_URL: str = ""  # URL POST de notification RDV vers l'app S&B
+APP_SALON_ID: str = ""            # ID du salon côté app Base44 (distinct du salon_id Supabase)
 
 print("🔵 [BOOT 5/8] Création dossier audio…")
 os.makedirs("audio", exist_ok=True)
@@ -1731,6 +1732,7 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
                 webhook_payload = json.dumps({
                     "event": "rdv_created",
                     "salon_id": _session_salon_id,
+                    "app_salon_id": APP_SALON_ID,
                     "client_telephone": telephone,
                     "client_nom": tool_input.get("client_nom", ""),
                     "prestation": prestation,
@@ -2357,7 +2359,7 @@ async def sync_config(request: Request):
         global NOM_SALON, TELEPHONE_SALON, ADRESSE_SALON
         global HORAIRE_OUVERTURE, HORAIRE_FERMETURE, JOURS_OUVERTS
         global COIFFEURS, PRESTATIONS_SALON, BASE_URL, TWILIO_NUMBER
-        global SALON_SUPABASE_URL, SALON_SUPABASE_KEY, SALON_APP_WEBHOOK_URL
+        global SALON_SUPABASE_URL, SALON_SUPABASE_KEY, SALON_APP_WEBHOOK_URL, APP_SALON_ID
 
         # ── Config salon de base ──────────────────────────────────
         if data.get("salon_name"):
@@ -2391,6 +2393,9 @@ async def sync_config(request: Request):
         if data.get("webhook_url") or data.get("app_webhook_url"):
             SALON_APP_WEBHOOK_URL = data.get("webhook_url") or data.get("app_webhook_url")
             print(f"✅ [SYNC] SALON_APP_WEBHOOK_URL = {SALON_APP_WEBHOOK_URL}")
+        if data.get("app_salon_id"):
+            APP_SALON_ID = data["app_salon_id"]
+            print(f"✅ [SYNC] APP_SALON_ID = {APP_SALON_ID}")
 
         # ── Coiffeurs ─────────────────────────────────────────────
         staff_data = data.get("staff") or data.get("employees") or data.get("coiffeurs")
