@@ -1307,6 +1307,12 @@ Tu te concentres EXCLUSIVEMENT sur la prise de rendez-vous. Si le client parle d
 
 IMPORTANT : Maximum 2 phrases courtes. Maximum 25 mots par réponse. Direct et efficace.
 
+RAPPEL CONTEXTE — RÈGLE ABSOLUE :
+Le CONTEXTE RDV EN COURS contient les éléments déjà validés : prestation, jour, heure, coiffeur, shampoing.
+Si le client modifie UN élément (ex : change la date), CONSERVER TOUS LES AUTRES éléments tels quels.
+Ne jamais vider ni ignorer le CONTEXTE RDV EN COURS. Ne jamais redemander un élément déjà acquis.
+Exemple : client change "lundi" pour "mardi" → garder prestation, heure, coiffeur, shampoing. Juste re-vérifier la dispo pour mardi à la même heure.
+
 RÈGLES ABSOLUES :
 1. Professionnelle, courtoise, efficace. Vouvoiement systématique.
 2. Tu n'as pas de prénom. Tu ne dis JAMAIS que tu es une IA.
@@ -1749,25 +1755,50 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
     elif tool_name == "verifier_disponibilite":
         jour = corriger_annee_date(tool_input.get("jour"))
         heure = tool_input.get("heure")
-        # Mémoriser jour/heure vérifiés dans le contexte RDV
+        # Mémoriser jour/heure/prestation dans le contexte RDV (merge — ne jamais écraser les autres champs)
         if jour: update_client_context(telephone, rdv_jour=jour)
         if heure: update_client_context(telephone, rdv_heure=heure)
+        _prest_arg = tool_input.get("prestation")
+        if _prest_arg: update_client_context(telephone, rdv_prestation=_prest_arg)
 
-        # Vérifier que le jour correspond à un jour ouvert du salon
+        # Vérifier que le jour correspond à un jour ouvert du salon + cohérence nom/date
         if jour:
             try:
                 _date_obj = datetime.strptime(jour, "%Y-%m-%d").date()
                 _nom_jour_reel = NOMS_JOURS[_date_obj.weekday()].lower()
                 _jours_ouverts_lower = [j.lower() for j in JOURS_OUVERTS]
-                # Détection incohérence jour/date (ex: "jeudi 19 mai" mais c'est un mardi)
+
+                # Détecter le nom du jour mentionné par le client :
+                # 1. Via le champ jour_semaine passé par GPT (si présent)
+                # 2. Sinon : scan du dernier message client dans l'historique
                 _jour_client = (tool_input.get("jour_semaine") or "").lower().strip()
+                if not _jour_client:
+                    _hist_tel = get_conversation_history(telephone)
+                    if _hist_tel:
+                        _last_user = next(
+                            (m.get("content", "") for m in reversed(_hist_tel) if m.get("role") == "user"), ""
+                        )
+                        for _jn in NOMS_JOURS:
+                            if _jn.lower() in _last_user.lower():
+                                _jour_client = _jn.lower()
+                                break
+
                 if _jour_client and _jour_client != _nom_jour_reel:
                     print(f"⚠️ [DATE] Incohérence jour : client dit '{_jour_client}', date {jour} est un {_nom_jour_reel}")
+                    _date_fmt = f"{_date_obj.day} {NOMS_MOIS[_date_obj.month-1]}"
                     if _nom_jour_reel not in _jours_ouverts_lower:
-                        return (f"Le {_date_obj.day} {NOMS_MOIS[_date_obj.month-1]} est un {_nom_jour_reel} "
-                                f"et le salon est fermé ce jour-là. Jours d'ouverture : {', '.join(JOURS_OUVERTS)}.")
-                    return (f"Attention : le {_date_obj.day} {NOMS_MOIS[_date_obj.month-1]} est un {_nom_jour_reel}, "
-                            f"pas un {_jour_client}. Je vérifie le créneau pour {_nom_jour_reel} {_date_obj.day} {NOMS_MOIS[_date_obj.month-1]}.")
+                        return (
+                            f"Le {_date_fmt} est un {_nom_jour_reel} et non un {_jour_client}. "
+                            f"De plus le salon est fermé le {_nom_jour_reel}. "
+                            f"Jours d'ouverture : {', '.join([j.capitalize() for j in JOURS_OUVERTS])}. "
+                            f"Quelle autre date vous conviendrait ?"
+                        )
+                    return (
+                        f"CORRECTION DATE : Le {_date_fmt} est un {_nom_jour_reel} et non un {_jour_client}. "
+                        f"Dire au client : 'Le {_date_fmt} est un {_nom_jour_reel} et non un {_jour_client}. "
+                        f"Souhaitez-vous bien le {_nom_jour_reel} {_date_fmt} ?'"
+                    )
+
                 if _nom_jour_reel not in _jours_ouverts_lower:
                     return (f"Le salon est fermé le {_nom_jour_reel}. "
                             f"Jours d'ouverture : {', '.join([j.capitalize() for j in JOURS_OUVERTS])}.")
@@ -2180,24 +2211,28 @@ def run_agent(message_user: str, telephone: str) -> str:
     # Traiter la réponse
     choice = response.choices[0]
 
-    # Si GPT-4o veut appeler une fonction
-    if choice.message.tool_calls:
-        # Message d'attente pour les outils lents (évite silence Twilio)
-        import random as _random
-        OUTILS_LENTS = {
-            "verifier_coiffeur_disponible", "proposer_creneaux",
-            "prendre_rdv", "get_rdv_client_actif", "verifier_disponibilite",
-        }
-        outil_utilise = choice.message.tool_calls[0].function.name
-        if outil_utilise in OUTILS_LENTS:
-            MSGS_ATTENTE = [
-                "Un instant, je regarde les disponibilités...",
-                "Laissez-moi vérifier ça pour vous...",
-                "Je jette un œil au planning...",
-                "Une seconde, je consulte l'agenda...",
-                "Voyons voir ce qu'on a de disponible...",
-            ]
-            update_client_context(telephone, message_attente=_random.choice(MSGS_ATTENTE))
+    # Boucle tool calls — max 3 itérations (gère les chaînes de tools)
+    import random as _random
+    OUTILS_LENTS = {
+        "verifier_coiffeur_disponible", "proposer_creneaux",
+        "prendre_rdv", "get_rdv_client_actif", "verifier_disponibilite",
+    }
+    MSGS_ATTENTE = [
+        "Un instant, je regarde les disponibilités.",
+        "Laissez-moi vérifier ça pour vous.",
+        "Je jette un œil au planning.",
+        "Une seconde, je consulte l'agenda.",
+        "Voyons voir ce qu'on a de disponible.",
+    ]
+    for _tool_iteration in range(3):
+        if not choice.message.tool_calls:
+            break
+
+        # Message d'attente uniquement sur la première itération
+        if _tool_iteration == 0:
+            outil_utilise = choice.message.tool_calls[0].function.name
+            if outil_utilise in OUTILS_LENTS:
+                update_client_context(telephone, message_attente=_random.choice(MSGS_ATTENTE))
 
         # Ajouter le message assistant avec tool_calls
         tool_calls_data = []
@@ -2216,19 +2251,18 @@ def run_agent(message_user: str, telephone: str) -> str:
         for tool_call in choice.message.tool_calls:
             tool_name = tool_call.function.name
             tool_input = json.loads(tool_call.function.arguments)
-            print(f"🔧 [TOOL] {tool_name} | args={tool_input}")
+            print(f"🔧 [TOOL] itération={_tool_iteration+1} {tool_name} | args={tool_input}")
             tool_result = process_tool_call(tool_name, tool_input, telephone)
             print(f"✅ [TOOL] {tool_name} → {str(tool_result)[:120]}")
-
-            # Ajouter le résultat avec le tool_call_id
+            print(f"🔍 [APRES-TOOL] {tool_name} exécuté — relance GPT pour générer la réponse vocale")
             add_tool_result(telephone, tool_call.id, tool_result)
 
-        # Relancer GPT-4o avec le résultat des fonctions
+        # Relancer GPT avec le résultat des tools
         messages = [{"role": "system", "content": sys_prompt}] + get_conversation_history(telephone)
         messages = clean_messages(messages)
 
         if not TOOLS:
-            print("❌ [ERROR] tools vide — TOOLS non chargé sur le second appel GPT")
+            print("❌ [ERROR] tools vide — TOOLS non chargé sur l'appel GPT post-tool")
         try:
             response = client_openai.chat.completions.create(
                 model="gpt-4o-mini",
@@ -2241,22 +2275,22 @@ def run_agent(message_user: str, telephone: str) -> str:
                 frequency_penalty=0.0,
                 stream=False,
             )
-            # ÉTAPE 2 : Récupérer et accumuler les tokens du deuxième appel
             session_tokens_input += response.usage.prompt_tokens
             session_tokens_output += response.usage.completion_tokens
             session_tokens_total += response.usage.total_tokens
             session_nb_echanges += 1
 
         except Exception as e:
-            print(f"Erreur GPT-4o (retry): {e}")
+            print(f"Erreur GPT-4o (post-tool itération {_tool_iteration+1}): {e}")
             history = get_conversation_history(telephone)
             if history and history[-1].get('role') == 'assistant' \
                and history[-1].get('tool_calls'):
                 history.pop()
-                print("⚠️ [CLEAN] Dernier tool_call retiré après erreur (retry)")
+                print("⚠️ [CLEAN] Dernier tool_call retiré après erreur post-tool")
             return "Désolé, pouvez-vous répéter ?"
 
         choice = response.choices[0]
+        print(f"🔍 [APRES-TOOL] Itération {_tool_iteration+1} — réponse GPT: {str(choice.message.content or '[tool_call]')[:100]}")
 
     # Extraire la réponse texte
     response_text = choice.message.content
@@ -2670,8 +2704,30 @@ def handle_appel(
             client_context.pop(silence_key, None)
             return str(twiml)
 
-        if nb_silences == 1:
-            client_context[silence_key] = nb_silences + 1
+        client_context[silence_key] = nb_silences + 1
+
+        # Si conversation en cours → message contextuel (pas de bienvenue)
+        hist_en_cours = get_conversation_history(telephone_appelant)
+        en_conversation = len(hist_en_cours) > 0
+
+        if en_conversation:
+            import random as _rand
+            msgs_relance = [
+                "Désolé, je ne vous entends pas bien. Pouvez-vous répéter ?",
+                "Je n'ai pas bien entendu. Pouvez-vous répéter s'il vous plaît ?",
+                "Excusez-moi, pouvez-vous répéter votre demande ?",
+            ]
+            gather = twiml.gather(
+                input="speech", action="/appel", method="POST",
+                language="fr-FR", speech_timeout="auto",
+                speech_model="phone_call", timeout=12, hints=HINTS,
+                partial_result_callback="",
+            )
+            gather.say(_rand.choice(msgs_relance), language="fr-FR", voice="Polly.Lea", barge_in=False)
+            return str(twiml)
+
+        # Premier contact : accueil
+        if nb_silences >= 2:
             gather = twiml.gather(
                 input="speech", action="/appel", method="POST",
                 language="fr-FR", speech_timeout="auto",
@@ -2681,7 +2737,6 @@ def handle_appel(
             gather.say("Vous êtes toujours là ? Je vous écoute.", language="fr-FR", voice="Polly.Lea", barge_in=False)
             return str(twiml)
 
-        client_context[silence_key] = nb_silences + 1
         ctx_accueil = get_client_context(telephone_appelant)
         prenom_connu = ctx_accueil.get("prenom", "")
         nb_visites_connu = ctx_accueil.get("nb_visites", 0)
