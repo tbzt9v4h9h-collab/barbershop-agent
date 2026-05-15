@@ -1327,21 +1327,29 @@ TON ET STYLE :
 Professionnel et chaleureux. Formulations : "Très bien", "Parfait", "Je vérifie", "Je vous propose".
 Pas d'expressions familières ("super !", "génial !").
 
+RÈGLE ABSOLUE — PRESTATION EN PREMIER :
+Si le client dit "je veux un rendez-vous", "prendre un RDV", "j'aimerais venir" ou toute formulation générale SANS mentionner de prestation :
+→ Répondre UNIQUEMENT : "Quelle prestation souhaitez-vous ?"
+→ JAMAIS demander le jour ou l'heure avant d'avoir la prestation.
+→ JAMAIS dire "oui, pour quand ?" ou "très bien, quel jour ?" sans avoir la prestation.
+
 RÈGLE ABSOLUE — VÉRIFICATION DISPONIBILITÉ :
 Tu DOIS appeler verifier_disponibilite dès que le client donne un jour ET une heure.
 Ne jamais répondre "très bien" ou confirmer un créneau sans avoir appelé ce tool.
 Même si tu penses connaître la disponibilité, tu DOIS appeler le tool.
+Quand tu appelles verifier_disponibilite, transmets aussi le champ "jour_semaine" si le client a mentionné un nom de jour (ex: "jeudi"), pour permettre la détection d'incohérence entre le nom du jour et la date ISO.
 
-FLOW PRISE DE RDV :
-1. Identifier la prestation.
-2. Jour et heure souhaités.
-3. Vérifier disponibilité (verifier_disponibilite).
-3b. Si la prestation demandée n'est pas disponible ou n'existe pas : redemander UNIQUEMENT la prestation. Conserver en mémoire le jour, l'heure, le coiffeur et le shampoing déjà donnés. Ne jamais redemander ces informations.
-4. Demander shampoing (UNE SEULE fois, si non encore répondu).
-5. Préférence coiffeur (voir section ci-dessous).
-6. Prénom (toujours en dernier).
-7. Récapituler : "Je récapitule : [prestation] le [jour] à [heure] avec [coiffeur]. C'est bien cela ?"
-8. Confirmer → enregistrer (prendre_rdv) → "Votre rendez-vous est confirmé. Vous allez recevoir un SMS."
+FLOW PRISE DE RDV — ORDRE STRICT ET OBLIGATOIRE :
+Étape 1 — PRESTATION : "Quelle prestation souhaitez-vous ?" (TOUJOURS en premier)
+Étape 2 — JOUR ET HEURE : une fois la prestation connue uniquement
+Étape 3 — VÉRIFICATION : appeler verifier_disponibilite (obligatoire)
+  3b. Prestation indispo → redemander UNIQUEMENT la prestation. Conserver jour, heure, coiffeur, shampoing déjà donnés.
+Étape 4 — SHAMPOING : demander une seule fois si non encore répondu
+Étape 5 — COIFFEUR : préférence si plusieurs coiffeurs compétents (voir section COIFFEUR)
+Étape 6 — PRÉNOM : demander en dernier si non connu
+Étape 7 — RÉCAPITULATIF : "Je récapitule : [prestation] le [jour] à [heure] avec [coiffeur]. C'est bien cela ?"
+Étape 8 — CONFIRMATION : appeler prendre_rdv → "Votre rendez-vous est confirmé. Vous allez recevoir un SMS."
+NE JAMAIS SAUTER UNE ÉTAPE. NE JAMAIS REVENIR EN ARRIÈRE POUR REDEMANDER UN ÉLÉMENT DÉJÀ ACQUIS.
 
 MESSAGES D'ATTENTE (avant tool calls lents) :
 "Un instant, je vérifie les disponibilités."
@@ -1463,6 +1471,8 @@ TOOLS = [
                 "properties": {
                     "jour": {"type": "string", "description": "Date au format YYYY-MM-DD"},
                     "heure": {"type": "string", "description": "Heure au format HH:MM"},
+                    "prestation": {"type": "string", "description": "Prestation souhaitée (optionnel)"},
+                    "jour_semaine": {"type": "string", "description": "Jour de la semaine énoncé par le client (ex: 'jeudi'), pour vérifier la cohérence avec la date ISO"},
                 },
                 "required": ["jour", "heure"]
             }
@@ -1729,6 +1739,27 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
         # Mémoriser jour/heure vérifiés dans le contexte RDV
         if jour: update_client_context(telephone, rdv_jour=jour)
         if heure: update_client_context(telephone, rdv_heure=heure)
+
+        # Vérifier que le jour correspond à un jour ouvert du salon
+        if jour:
+            try:
+                _date_obj = datetime.strptime(jour, "%Y-%m-%d").date()
+                _nom_jour_reel = NOMS_JOURS[_date_obj.weekday()].lower()
+                _jours_ouverts_lower = [j.lower() for j in JOURS_OUVERTS]
+                # Détection incohérence jour/date (ex: "jeudi 19 mai" mais c'est un mardi)
+                _jour_client = (tool_input.get("jour_semaine") or "").lower().strip()
+                if _jour_client and _jour_client != _nom_jour_reel:
+                    print(f"⚠️ [DATE] Incohérence jour : client dit '{_jour_client}', date {jour} est un {_nom_jour_reel}")
+                    if _nom_jour_reel not in _jours_ouverts_lower:
+                        return (f"Le {_date_obj.day} {NOMS_MOIS[_date_obj.month-1]} est un {_nom_jour_reel} "
+                                f"et le salon est fermé ce jour-là. Jours d'ouverture : {', '.join(JOURS_OUVERTS)}.")
+                    return (f"Attention : le {_date_obj.day} {NOMS_MOIS[_date_obj.month-1]} est un {_nom_jour_reel}, "
+                            f"pas un {_jour_client}. Je vérifie le créneau pour {_nom_jour_reel} {_date_obj.day} {NOMS_MOIS[_date_obj.month-1]}.")
+                if _nom_jour_reel not in _jours_ouverts_lower:
+                    return (f"Le salon est fermé le {_nom_jour_reel}. "
+                            f"Jours d'ouverture : {', '.join([j.capitalize() for j in JOURS_OUVERTS])}.")
+            except Exception as _e:
+                print(f"⚠️ [DATE] Vérif jour ouvert : {_e}")
 
         # Vérifier que l'heure est dans les horaires d'ouverture
         if heure:
@@ -2615,7 +2646,7 @@ def handle_appel(
         silence_key = f"silence_{telephone_appelant}"
         nb_silences = client_context.get(silence_key, 0)
 
-        if nb_silences >= 2:
+        if nb_silences >= 3:
             twiml.say(
                 "Je ne vous entends pas. N'hésitez pas à nous rappeler. À bientôt !",
                 language="fr-FR", voice="Polly.Lea",
@@ -2699,7 +2730,14 @@ def handle_appel(
     # Mots seuls qui ne déclenchent JAMAIS une fin d'appel
     MOTS_AMBIGUS = {"merci", "ok", "oui", "non", "voilà", "voila", "d'accord",
                     "bien", "super", "parfait", "ciao", "bye", "salut", "à bientôt"}
-    est_mot_seul_ambigu = nb_mots <= 2 and speech_lower.strip(".,!?") in MOTS_AMBIGUS
+    # Un message court (≤ 3 mots) OU contenant un mot ambigu isolé → jamais fin d'appel
+    _speech_clean = speech_lower.strip(".,!? ")
+    est_mot_seul_ambigu = (
+        nb_mots <= 3
+        or _speech_clean in MOTS_AMBIGUS
+        or any(_speech_clean == m or _speech_clean.startswith(m + " ") or _speech_clean.endswith(" " + m)
+               for m in MOTS_AMBIGUS)
+    )
 
     # Un horaire (14h, 10h30, 15 heures…) n'est jamais une fin d'appel
     import re as _re
