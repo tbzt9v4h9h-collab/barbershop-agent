@@ -2670,6 +2670,7 @@ def handle_appel(
     From: str = Form(default=""),
     Called: str = Form(default=""),
     SpeechResult: str = Form(default=""),
+    CallSid: str = Form(default=""),
 ):
     global NOM_SALON, TELEPHONE_SALON, ADRESSE_SALON
     global HORAIRE_OUVERTURE, HORAIRE_FERMETURE, JOURS_OUVERTS, TWILIO_NUMBER
@@ -2727,6 +2728,22 @@ def handle_appel(
         twiml.say("Ce numéro a été temporairement suspendu.", language="fr-FR", voice="Polly.Lea")
         twiml.hangup()
         return str(twiml)
+
+    # ── Détection nouvel appel via CallSid ───────────────────────────────────
+    _ctx_early = get_client_context(telephone_appelant)
+    _last_callsid = _ctx_early.get("call_sid", "")
+    if CallSid and _last_callsid and CallSid != _last_callsid:
+        # CallSid différent = nouvel appel → réinitialiser état conversationnel
+        print(f"📞 [NOUVEL APPEL] CallSid={CallSid} (précédent={_last_callsid}) | réinitialisation contexte tel={telephone_appelant}")
+        _preserved = {
+            k: _ctx_early.get(k)
+            for k in ("prenom", "client_id", "nb_visites", "derniere_visite", "nom")
+            if _ctx_early.get(k)
+        }
+        client_context[telephone_appelant] = _preserved
+        conversation_history[telephone_appelant] = []
+    # Toujours mettre à jour le CallSid courant
+    update_client_context(telephone_appelant, call_sid=CallSid)
 
     HINTS = (
         "rendez-vous, coupe, couleur, brushing, shampoing, annuler, demain, "
