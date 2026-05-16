@@ -2707,34 +2707,36 @@ def handle_appel(
     )
 
     if not SpeechResult:
-        # Compteur de silences par session
-        silence_key = f"silence_{telephone_appelant}"
-        nb_silences = client_context.get(silence_key, 0)
+        # ── Compteur de silences consécutifs (dans le contexte par téléphone) ──
+        _ctx_sil = get_client_context(telephone_appelant)
+        nb_silences = _ctx_sil.get("silences", 0) + 1
+        update_client_context(telephone_appelant, silences=nb_silences)
 
-        if nb_silences >= 3:
-            twiml.say(
-                "Je ne vous entends pas. N'hésitez pas à nous rappeler. À bientôt !",
-                language="fr-FR", voice="Polly.Lea",
-            )
-            twiml.hangup()
-            client_context.pop(silence_key, None)
-            return str(twiml)
-
-        client_context[silence_key] = nb_silences + 1
-
-        # Si conversation en cours → message contextuel (pas de bienvenue)
         hist_en_cours = get_conversation_history(telephone_appelant)
         en_conversation = len(hist_en_cours) > 0
 
+        print(f"🔇 [SILENCE] {nb_silences}/3 | en_conversation={en_conversation} | tel={telephone_appelant}")
+
+        # ── 3 silences consécutifs → raccrocher ────────────────────────────────
+        if nb_silences >= 3:
+            twiml.say(
+                "Je ne vous entends pas bien, n'hésitez pas à rappeler. À bientôt !",
+                language="fr-FR", voice="Polly.Lea",
+            )
+            twiml.hangup()
+            update_client_context(telephone_appelant, silences=0)
+            return str(twiml)
+
+        # ── Conversation déjà commencée → JAMAIS l'accueil, juste "répétez" ───
         if en_conversation:
             import random as _rand
             msgs_relance = [
-                "Désolé, je ne vous entends pas bien. Pouvez-vous répéter ?",
-                "Je n'ai pas bien entendu. Pouvez-vous répéter s'il vous plaît ?",
-                "Excusez-moi, pouvez-vous répéter votre demande ?",
+                "Je ne vous ai pas bien entendu, pouvez-vous répéter ?",
+                "Désolé, je n'entends pas bien. Pouvez-vous répéter s'il vous plaît ?",
+                "Excusez-moi, pouvez-vous répéter votre réponse ?",
             ]
             _msg_relance = _rand.choice(msgs_relance)
-            print(f"📡 [GATHER] relance mid-conv | action=/appel POST | speech_timeout=auto timeout=12 | hints={len(HINTS)}c")
+            print(f"📡 [GATHER] silence {nb_silences}/3 mid-conv | action=/appel POST | speech_timeout=auto timeout=12")
             gather = twiml.gather(
                 input="speech", action="/appel", method="POST",
                 language="fr-FR", speech_timeout="auto",
@@ -2743,9 +2745,9 @@ def handle_appel(
             gather.say(_msg_relance, language="fr-FR", voice="Polly.Lea", barge_in=False)
             return str(twiml)
 
-        # Premier contact : accueil
+        # ── Premier contact, silence #2 → "toujours là ?" ─────────────────────
         if nb_silences >= 2:
-            print(f"📡 [GATHER] silence#2 | action=/appel POST | speech_timeout=auto timeout=12")
+            print(f"📡 [GATHER] silence {nb_silences}/3 accueil | action=/appel POST | speech_timeout=auto timeout=12")
             gather = twiml.gather(
                 input="speech", action="/appel", method="POST",
                 language="fr-FR", speech_timeout="auto",
@@ -2754,10 +2756,11 @@ def handle_appel(
             gather.say("Vous êtes toujours là ? Je vous écoute.", language="fr-FR", voice="Polly.Lea", barge_in=False)
             return str(twiml)
 
+        # ── Premier contact, silence #1 → message d'accueil ───────────────────
+        import random as _rand
         ctx_accueil = get_client_context(telephone_appelant)
         prenom_connu = ctx_accueil.get("prenom", "")
         nb_visites_connu = ctx_accueil.get("nb_visites", 0)
-        import random as _rand
         if prenom_connu and nb_visites_connu > 0:
             accueils = [
                 f"Bonjour {prenom_connu}, ravi de vous retrouver. Comment puis-je vous aider ?",
@@ -2765,15 +2768,14 @@ def handle_appel(
                 f"Bonjour {prenom_connu}, nous sommes ravis de vous retrouver. Que puis-je faire pour vous ?",
                 f"Bonjour {prenom_connu}, toujours un plaisir. Comment puis-je vous aider ?",
             ]
-            message_accueil = _rand.choice(accueils)
         else:
             accueils = [
                 f"Bonjour et bienvenue chez {NOM_SALON}, comment puis-je vous aider ?",
                 f"Bonjour, salon {NOM_SALON}, que puis-je faire pour vous ?",
                 f"Bonjour, vous êtes bien chez {NOM_SALON}, comment puis-je vous aider ?",
             ]
-            message_accueil = _rand.choice(accueils)
-        print(f"📡 [GATHER] accueil | action=/appel POST | speech_timeout=auto timeout=10")
+        message_accueil = _rand.choice(accueils)
+        print(f"📡 [GATHER] silence {nb_silences}/3 accueil initial | action=/appel POST | speech_timeout=auto timeout=10")
         gather = twiml.gather(
             input="speech", action="/appel", method="POST",
             language="fr-FR", speech_timeout="auto",
@@ -2782,7 +2784,9 @@ def handle_appel(
         gather.say(message_accueil, language="fr-FR", voice="Polly.Lea", barge_in=False)
         return str(twiml)
 
+    # ── SpeechResult non vide → remettre le compteur de silences à 0 ──────────
     telephone = telephone_appelant
+    update_client_context(telephone, silences=0)
     response_text = run_agent(SpeechResult, telephone)
 
     # Seules phrases EXPLICITES de congé — combinaisons uniquement, jamais un mot seul
