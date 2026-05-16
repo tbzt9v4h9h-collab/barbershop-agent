@@ -732,7 +732,11 @@ def est_creneau_disponible_v2(jour: str, heure: str, coiffeur: str = None) -> di
     Retourne : {"disponible": bool, "coiffeurs_libres": list[str], "rdvs_trouves": int}
     """
     rdvs_trouves = 0
-    coiffeurs_pris: set[str] = set()
+    # Normalisation : toutes les comparaisons de noms se font en minuscule sans espaces extrêmes
+    def _norm(s: str) -> str:
+        return (s or "").strip().lower()
+
+    coiffeurs_pris: set[str] = set()   # noms normalisés
     try:
         heure_min = parse_hhmm_en_minutes(heure)
 
@@ -744,11 +748,10 @@ def est_creneau_disponible_v2(jour: str, heure: str, coiffeur: str = None) -> di
             try:
                 h_deb = parse_hhmm_en_minutes(rdv.get("heure_debut") or "00:00")
                 h_fin = parse_hhmm_en_minutes(rdv.get("heure_fin") or "00:00")
-                # Chevauchement : créneau demandé tombe pendant ce RDV
                 if h_deb <= heure_min < h_fin:
                     rdvs_trouves += 1
                     if rdv.get("coupe_detail"):
-                        coiffeurs_pris.add(rdv["coupe_detail"])
+                        coiffeurs_pris.add(_norm(rdv["coupe_detail"]))
             except Exception:
                 pass
 
@@ -758,15 +761,14 @@ def est_creneau_disponible_v2(jour: str, heure: str, coiffeur: str = None) -> di
             .eq("date", jour).neq("status", "cancelled").execute()
         for appt in (res_ap.data or []):
             try:
-                t_raw = (appt.get("time") or "")[:5]   # "HH:MM:SS" → "HH:MM"
+                t_raw = (appt.get("time") or "")[:5]
                 if not t_raw:
                     continue
                 t_min = parse_hhmm_en_minutes(t_raw)
-                # Chevauchement : durée minimale 30 min
                 if t_min <= heure_min < t_min + 30:
                     rdvs_trouves += 1
                     if appt.get("staff_name"):
-                        coiffeurs_pris.add(appt["staff_name"])
+                        coiffeurs_pris.add(_norm(appt["staff_name"]))
             except Exception:
                 pass
 
@@ -774,15 +776,14 @@ def est_creneau_disponible_v2(jour: str, heure: str, coiffeur: str = None) -> di
         print(f"⚠️ [DISPO] Erreur vérification étendue : {e}")
         return {"disponible": True, "coiffeurs_libres": [c["nom"] for c in COIFFEURS], "rdvs_trouves": 0}
 
-    coiffeurs_libres = [c["nom"] for c in COIFFEURS if c["nom"] not in coiffeurs_pris]
+    # Coiffeurs libres : ceux dont le nom normalisé n'est pas dans coiffeurs_pris
+    coiffeurs_libres = [c["nom"] for c in COIFFEURS if _norm(c["nom"]) not in coiffeurs_pris]
 
     if coiffeur:
-        # Vérification per-coiffeur
-        coiffeur_pris = coiffeur in coiffeurs_pris
+        coiffeur_pris = _norm(coiffeur) in coiffeurs_pris
         disponible = not coiffeur_pris
         print(f"🔍 [DISPO] jour={jour} heure={heure} coiffeur={coiffeur!r} | rdvs_trouves={rdvs_trouves} | statut={'occupé' if coiffeur_pris else 'libre'}")
     else:
-        # Sans coiffeur : libre si au moins un coiffeur est disponible (ou aucun RDV)
         disponible = rdvs_trouves == 0 or bool(coiffeurs_libres)
         print(f"🔍 [DISPO] jour={jour} heure={heure} | rdvs_trouves={rdvs_trouves} | coiffeurs_pris={coiffeurs_pris} | statut={'occupé' if not disponible else 'libre'}")
 
@@ -1072,10 +1073,10 @@ def coiffeurs_competents(prestation: str) -> list:
 def get_coiffeurs_disponibles(jour: str, heure: str, duree: int = 45) -> list:
     """Retourne la liste des coiffeurs disponibles à l'heure demandée."""
     try:
-        rdvs = supabase.table("rendez_vous").select("coiffeur")\
+        rdvs = supabase.table("rendez_vous").select("coupe_detail")\
             .eq("jour", jour).eq("heure_debut", heure).eq("statut", "confirme").execute()
-        coiffeurs_pris = [r.get("coiffeur") for r in (rdvs.data or [])]
-        disponibles = [c for c in COIFFEURS if c["nom"] not in coiffeurs_pris]
+        coiffeurs_pris = {(r.get("coupe_detail") or "").strip().lower() for r in (rdvs.data or [])}
+        disponibles = [c for c in COIFFEURS if c["nom"].strip().lower() not in coiffeurs_pris]
         return disponibles if disponibles else COIFFEURS
     except Exception as e:
         print(f"⚠️ Erreur disponibilité coiffeur : {e}")
@@ -1997,9 +1998,10 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
         update_client_context(telephone, rdv_en_cours=True)
 
         # CORRECTION 2 : vérification étendue (rendez_vous + appointment, fenêtre 30min, per-coiffeur)
+        # Normaliser le nom du coiffeur demandé (strip + lower géré dans est_creneau_disponible_v2)
         _coiffeur_demande = (
             tool_input.get("coiffeur") or get_client_context(telephone).get("rdv_coiffeur", "")
-        ).strip()
+        ).strip()  # pas de .lower() ici — on garde la casse pour l'affichage, la comparaison est dans v2
         _dispo = est_creneau_disponible_v2(jour, heure, coiffeur=_coiffeur_demande or None)
         disponible = _dispo["disponible"]
         _coiffeurs_libres = _dispo["coiffeurs_libres"]
@@ -2173,7 +2175,8 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
             update_client_context(telephone, rdv_coiffeur=coiffeur_souhaite)
         disponibles = get_coiffeurs_disponibles(jour, heure)
         if coiffeur_souhaite:
-            coiffeur_libre = any(c["nom"].lower() == coiffeur_souhaite.lower() for c in disponibles)
+            _cs_norm = coiffeur_souhaite.strip().lower()
+            coiffeur_libre = any(c["nom"].strip().lower() == _cs_norm for c in disponibles)
             if coiffeur_libre:
                 return f"{coiffeur_souhaite} est disponible à {heure}."
             # Trouver prochains créneaux pour ce coiffeur
@@ -2182,7 +2185,7 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
             for _ in range(8):
                 heure_test = ajouter_minutes_hhmm(heure_test, 30)
                 dispo = get_coiffeurs_disponibles(jour, heure_test)
-                if any(c["nom"].lower() == coiffeur_souhaite.lower() for c in dispo):
+                if any(c["nom"].strip().lower() == _cs_norm for c in dispo):
                     creneaux_coiffeur.append(heure_test)
                 if len(creneaux_coiffeur) >= 2:
                     break
