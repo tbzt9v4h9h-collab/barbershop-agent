@@ -1286,18 +1286,23 @@ def build_system_prompt(telephone: str = None) -> str:
     else:
         rdv_context_block = ""
 
-    # Calculer les dates réelles des 7 prochains jours pour ancrer GPT
+    # Calculer les 14 prochains jours OUVERTS avec leur date ISO exacte (Europe/Paris)
+    _jours_ouverts_lower = [j.lower() for j in JOURS_OUVERTS]
     _dates_prochains = []
-    for _i in range(1, 8):
-        _d = aujourd_hui + timedelta(days=_i)
-        _dates_prochains.append(
-            f"{NOMS_JOURS[_d.weekday()]} {_d.day} {NOMS_MOIS[_d.month-1]} = {_d.isoformat()}"
-        )
+    _d_iter = aujourd_hui + timedelta(days=1)
+    while len(_dates_prochains) < 14:
+        if NOMS_JOURS[_d_iter.weekday()].lower() in _jours_ouverts_lower:
+            _dates_prochains.append(
+                f"{NOMS_JOURS[_d_iter.weekday()]} {_d_iter.day} {NOMS_MOIS[_d_iter.month-1]} {_d_iter.year} = {_d_iter.isoformat()}"
+            )
+        _d_iter += timedelta(days=1)
     _dates_ref = " | ".join(_dates_prochains)
 
     prompt = f"""Tu es la réceptionniste vocale professionnelle du salon {NOM_SALON}.
 Aujourd'hui : {date_str} à {heure_actuelle}. Date ISO : {aujourd_hui.isoformat()}.
-Prochains jours (utilise ces dates exactes dans les tools) : {_dates_ref}.
+JOURS OUVERTS ET DATES EXACTES — utilise UNIQUEMENT ces dates dans les tools, ne calcule jamais toi-même :
+{_dates_ref}.
+RÈGLE : si le client dit "mardi prochain" ou "le 20", retrouve la date correspondante dans ce tableau.
 Horaires : {HORAIRE_OUVERTURE}-{HORAIRE_FERMETURE}, {', '.join([j.capitalize() for j in JOURS_OUVERTS])}.
 Adresse : {ADRESSE_SALON} | Tél : {TELEPHONE_SALON}
 {shampoing_info}{rdv_context_block}
@@ -1862,6 +1867,15 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
         update_client_context(telephone, rdv_en_cours=True)
         disponible = est_creneau_disponible(jour, heure)
         statut = "libre" if disponible else "occupé"
+        if not disponible:
+            # Retourner instruction explicite — ne jamais chercher un autre créneau automatiquement
+            _heure_fmt = heure or "?"
+            _jour_fmt = jour or "?"
+            return (
+                f"Disponibilité : occupé — le créneau du {_jour_fmt} à {_heure_fmt} est déjà pris. "
+                f"Ne pas chercher automatiquement d'autres créneaux. "
+                f"Demander au client : 'Ce créneau est déjà pris. Souhaitez-vous un autre horaire ou un autre jour ?'"
+            )
 
         # Filtrage coiffeurs compétents pour la prestation
         prestation_ctx = tool_input.get("prestation") or get_client_context(telephone).get("rdv_prestation", "")
@@ -2237,7 +2251,7 @@ def run_agent(message_user: str, telephone: str) -> str:
         "Une seconde, je consulte l'agenda.",
         "Voyons voir ce qu'on a de disponible.",
     ]
-    for _tool_iteration in range(3):
+    for _tool_iteration in range(1):  # max 1 tool call par tour — GPT doit répondre au client après
         if not choice.message.tool_calls:
             break
 
@@ -2281,7 +2295,7 @@ def run_agent(message_user: str, telephone: str) -> str:
                 model="gpt-4o-mini",
                 messages=messages,
                 tools=TOOLS,
-                tool_choice="auto",
+                tool_choice="none",  # forcer réponse vocale — pas de chaîne de tools
                 temperature=0.3,
                 max_tokens=200,
                 presence_penalty=0.0,
@@ -2308,9 +2322,10 @@ def run_agent(message_user: str, telephone: str) -> str:
     # Extraire la réponse texte
     response_text = choice.message.content
 
-    # Garde-fou : réponse vide
+    # Garde-fou : réponse vide après boucle tool — ne jamais raccrocher, toujours parler au client
     if not response_text or len(response_text.strip()) < 5:
-        response_text = "Un instant s'il vous plaît, je vérifie les disponibilités."
+        print("⚠️ [GPT] Réponse vide/courte après tool call — fallback vocale")
+        response_text = "Je vérifie, un instant s'il vous plaît."
 
     # Garde-fou : phrase de fin en plein flow RDV
     PHRASES_FIN_FLOW = ["bonne journée", "au revoir", "à bientôt", "merci pour votre appel"]
@@ -2318,6 +2333,19 @@ def run_agent(message_user: str, telephone: str) -> str:
     if ctx_flow.get("rdv_en_cours") and any(p in (response_text or "").lower() for p in PHRASES_FIN_FLOW):
         print(f"⚠️ [FLOW] Réponse de fin détectée en plein flow RDV — ignorée")
         response_text = "Je suis désolé, pouvez-vous répéter s'il vous plaît ?"
+
+    # Garde-fou mémoire : si GPT redemande une info déjà dans le contexte RDV, la réinjecter
+    _ctx_rdv = get_client_context(telephone)
+    _resp_l = (response_text or "").lower()
+    if _ctx_rdv.get("rdv_prestation") and any(k in _resp_l for k in ["quelle prestation", "quel type de prestation", "que souhaitez-vous comme"]):
+        _prest = _ctx_rdv["rdv_prestation"]
+        print(f"⚠️ [CONTEXTE] GPT redemande la prestation déjà connue ({_prest}) — corrigé")
+        response_text = f"Très bien. Donc pour une {_prest}. Pour quel jour souhaitez-vous ?"
+    elif _ctx_rdv.get("rdv_jour") and _ctx_rdv.get("rdv_heure") and any(k in _resp_l for k in ["quel jour", "pour quel jour", "quelle date", "quand souhaitez"]):
+        _jour_c = _ctx_rdv["rdv_jour"]
+        _heure_c = _ctx_rdv["rdv_heure"]
+        print(f"⚠️ [CONTEXTE] GPT redemande le jour déjà connu ({_jour_c} {_heure_c}) — corrigé")
+        response_text = f"Très bien. Je vérifie le créneau du {_jour_c} à {_heure_c}."
 
     # Ajouter la réponse à l'historique
     add_to_history(telephone, "assistant", response_text)
@@ -2707,29 +2735,59 @@ def handle_appel(
     )
 
     if not SpeechResult:
-        # ── Compteur de silences consécutifs (dans le contexte par téléphone) ──
+        import random as _rand
         _ctx_sil = get_client_context(telephone_appelant)
-        nb_silences = _ctx_sil.get("silences", 0) + 1
-        update_client_context(telephone_appelant, silences=nb_silences)
-
         hist_en_cours = get_conversation_history(telephone_appelant)
         en_conversation = len(hist_en_cours) > 0
+        accueil_joue = _ctx_sil.get("accueil_joue", False)
 
+        # ── Premier POST de l'appel : TOUJOURS jouer l'accueil ────────────────
+        # Le compteur de silences ne démarre qu'APRÈS que l'accueil a été joué
+        if not accueil_joue and not en_conversation:
+            update_client_context(telephone_appelant, accueil_joue=True, silences=0)
+            ctx_accueil = _ctx_sil
+            prenom_connu = ctx_accueil.get("prenom", "")
+            nb_visites_connu = ctx_accueil.get("nb_visites", 0)
+            if prenom_connu and nb_visites_connu > 0:
+                accueils = [
+                    f"Bonjour {prenom_connu}, ravi de vous retrouver. Comment puis-je vous aider ?",
+                    f"Bonjour {prenom_connu}, bienvenue chez {NOM_SALON}. Que puis-je faire pour vous aujourd'hui ?",
+                    f"Bonjour {prenom_connu}, nous sommes ravis de vous retrouver. Que puis-je faire pour vous ?",
+                    f"Bonjour {prenom_connu}, toujours un plaisir. Comment puis-je vous aider ?",
+                ]
+            else:
+                accueils = [
+                    f"Bonjour et bienvenue chez {NOM_SALON}, comment puis-je vous aider ?",
+                    f"Bonjour, salon {NOM_SALON}, que puis-je faire pour vous ?",
+                    f"Bonjour, vous êtes bien chez {NOM_SALON}, comment puis-je vous aider ?",
+                ]
+            message_accueil = _rand.choice(accueils)
+            print(f"📡 [GATHER] accueil initial | action=/appel POST | speech_timeout=auto timeout=10")
+            gather = twiml.gather(
+                input="speech", action="/appel", method="POST",
+                language="fr-FR", speech_timeout="auto",
+                speech_model="phone_call", timeout=10, hints=HINTS,
+            )
+            gather.say(message_accueil, language="fr-FR", voice="Polly.Lea", barge_in=False)
+            return str(twiml)
+
+        # ── Accueil déjà joué → compter les silences consécutifs ──────────────
+        nb_silences = _ctx_sil.get("silences", 0) + 1
+        update_client_context(telephone_appelant, silences=nb_silences)
         print(f"🔇 [SILENCE] {nb_silences}/3 | en_conversation={en_conversation} | tel={telephone_appelant}")
 
-        # ── 3 silences consécutifs → raccrocher ────────────────────────────────
+        # ── 3 silences → raccrocher ────────────────────────────────────────────
         if nb_silences >= 3:
             twiml.say(
                 "Je ne vous entends pas bien, n'hésitez pas à rappeler. À bientôt !",
                 language="fr-FR", voice="Polly.Lea",
             )
             twiml.hangup()
-            update_client_context(telephone_appelant, silences=0)
+            update_client_context(telephone_appelant, silences=0, accueil_joue=False)
             return str(twiml)
 
-        # ── Conversation déjà commencée → JAMAIS l'accueil, juste "répétez" ───
+        # ── Conversation en cours → JAMAIS l'accueil, message contextuel ──────
         if en_conversation:
-            import random as _rand
             msgs_relance = [
                 "Je ne vous ai pas bien entendu, pouvez-vous répéter ?",
                 "Désolé, je n'entends pas bien. Pouvez-vous répéter s'il vous plaît ?",
@@ -2745,43 +2803,14 @@ def handle_appel(
             gather.say(_msg_relance, language="fr-FR", voice="Polly.Lea", barge_in=False)
             return str(twiml)
 
-        # ── Premier contact, silence #2 → "toujours là ?" ─────────────────────
-        if nb_silences >= 2:
-            print(f"📡 [GATHER] silence {nb_silences}/3 accueil | action=/appel POST | speech_timeout=auto timeout=12")
-            gather = twiml.gather(
-                input="speech", action="/appel", method="POST",
-                language="fr-FR", speech_timeout="auto",
-                speech_model="phone_call", timeout=12, hints=HINTS,
-            )
-            gather.say("Vous êtes toujours là ? Je vous écoute.", language="fr-FR", voice="Polly.Lea", barge_in=False)
-            return str(twiml)
-
-        # ── Premier contact, silence #1 → message d'accueil ───────────────────
-        import random as _rand
-        ctx_accueil = get_client_context(telephone_appelant)
-        prenom_connu = ctx_accueil.get("prenom", "")
-        nb_visites_connu = ctx_accueil.get("nb_visites", 0)
-        if prenom_connu and nb_visites_connu > 0:
-            accueils = [
-                f"Bonjour {prenom_connu}, ravi de vous retrouver. Comment puis-je vous aider ?",
-                f"Bonjour {prenom_connu}, bienvenue chez {NOM_SALON}. Que puis-je faire pour vous aujourd'hui ?",
-                f"Bonjour {prenom_connu}, nous sommes ravis de vous retrouver. Que puis-je faire pour vous ?",
-                f"Bonjour {prenom_connu}, toujours un plaisir. Comment puis-je vous aider ?",
-            ]
-        else:
-            accueils = [
-                f"Bonjour et bienvenue chez {NOM_SALON}, comment puis-je vous aider ?",
-                f"Bonjour, salon {NOM_SALON}, que puis-je faire pour vous ?",
-                f"Bonjour, vous êtes bien chez {NOM_SALON}, comment puis-je vous aider ?",
-            ]
-        message_accueil = _rand.choice(accueils)
-        print(f"📡 [GATHER] silence {nb_silences}/3 accueil initial | action=/appel POST | speech_timeout=auto timeout=10")
+        # ── Pas encore de conversation, silence après accueil ─────────────────
+        print(f"📡 [GATHER] silence {nb_silences}/3 post-accueil | action=/appel POST | speech_timeout=auto timeout=12")
         gather = twiml.gather(
             input="speech", action="/appel", method="POST",
             language="fr-FR", speech_timeout="auto",
-            speech_model="phone_call", timeout=10, hints=HINTS,
+            speech_model="phone_call", timeout=12, hints=HINTS,
         )
-        gather.say(message_accueil, language="fr-FR", voice="Polly.Lea", barge_in=False)
+        gather.say("Vous êtes toujours là ? Je vous écoute.", language="fr-FR", voice="Polly.Lea", barge_in=False)
         return str(twiml)
 
     # ── SpeechResult non vide → remettre le compteur de silences à 0 ──────────
@@ -2840,10 +2869,13 @@ def handle_appel(
                      "rendez", "créneau", "disponible", "semaine"]
     est_question = any(m in speech_lower for m in mots_question)
 
-    # Fin d'appel uniquement si phrase explicite + aucune ambiguïté
-    # Seul le CLIENT peut terminer l'appel (est_fin_agent supprimé)
+    # Fin d'appel UNIQUEMENT si : "au revoir" ET "merci" présents ensemble (combinaison explicite)
+    # Seul le CLIENT peut terminer l'appel — jamais sur un mot seul
+    _contient_au_revoir = "au revoir" in speech_lower
+    _contient_merci = "merci" in speech_lower
+    _fin_explicite = _contient_au_revoir and _contient_merci
     est_fin_client = (
-        any(phrase in speech_lower for phrase in PHRASES_FIN_CLIENT)
+        _fin_explicite
         and not est_question
         and not contient_horaire
         and not est_mot_seul_ambigu
@@ -2872,10 +2904,19 @@ def handle_appel(
         "9h, 10h, 11h, 12h, 13h, 14h, 15h, 16h, 17h, 18h, "
         "9h30, 10h30, 11h30, 14h30, 15h30, 16h30, 17h30"
     )
+    # Construire HINTS_JOURS dynamiquement depuis les 14 prochains jours ouverts
+    _auj_hints = now_paris().date()
+    _jours_ouverts_lower_h = [j.lower() for j in JOURS_OUVERTS]
+    _dates_hints = []
+    _dh = _auj_hints + timedelta(days=1)
+    while len(_dates_hints) < 14:
+        if NOMS_JOURS[_dh.weekday()].lower() in _jours_ouverts_lower_h:
+            _dates_hints.append(f"{NOMS_JOURS[_dh.weekday()]} {_dh.day}")
+        _dh += timedelta(days=1)
     HINTS_JOURS = (
         "lundi, mardi, mercredi, jeudi, vendredi, samedi, "
         "demain, après-demain, cette semaine, semaine prochaine, "
-        "le quinze, le seize, le dix-sept, le dix-huit, le dix-neuf, le vingt"
+        + ", ".join(_dates_hints)
     )
     HINTS_SHAMPOING = "oui, non, avec, sans, volontiers, pas de shampoing"
 
