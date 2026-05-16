@@ -1742,32 +1742,98 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
         update_client_context(telephone, rdv_en_cours=False, rdv_pris=True,
                               rdv_prestation="", rdv_jour="", rdv_heure="", rdv_coiffeur="")
 
-        # Notification webhook vers l'app S&B
-        if SALON_APP_WEBHOOK_URL:
+        # ── Notification webhook vers l'app Base44 ──────────────────────────
+        import urllib.request as _urlreq
+        import time as _time
+        print(f"📡 [WEBHOOK] DÉBUT | url={SALON_APP_WEBHOOK_URL!r} | app_salon_id={APP_SALON_ID!r}")
+        if not SALON_APP_WEBHOOK_URL:
+            print("❌ [WEBHOOK] URL vide — sync impossible (configurer webhook_url via /update-config)")
+        elif not APP_SALON_ID:
+            print("❌ [WEBHOOK] APP_SALON_ID vide — sync impossible (configurer app_salon_id via /update-config)")
+        else:
+            # CORRECTION 5 : Normaliser formats jour=YYYY-MM-DD et heure=HH:MM
+            _jour_wh = jour or ""
+            _heure_wh = heure or ""
             try:
-                import urllib.request as _urlreq
-                webhook_payload = json.dumps({
-                    "event": "rdv_created",
-                    "salon_id": _session_salon_id,
-                    "app_salon_id": APP_SALON_ID,
-                    "client_telephone": telephone,
-                    "client_nom": tool_input.get("client_nom", ""),
-                    "prestation": prestation,
-                    "jour": jour,
-                    "heure": heure,
-                    "coiffeur": coiffeur_choisi or "",
-                    "avec_shampoing": avec_shampoing,
-                }).encode("utf-8")
-                req = _urlreq.Request(
+                if _jour_wh and not (_jour_wh.count("-") == 2 and len(_jour_wh) == 10):
+                    _jour_wh = datetime.strptime(_jour_wh, "%d/%m/%Y").strftime("%Y-%m-%d")
+            except Exception:
+                pass
+            try:
+                if _heure_wh and "h" in _heure_wh.lower():
+                    _hp = re.split(r"h", _heure_wh.lower())
+                    _hh = int(_hp[0])
+                    _mm = int(_hp[1]) if len(_hp) > 1 and _hp[1].strip() else 0
+                    _heure_wh = f"{_hh:02d}:{_mm:02d}"
+            except Exception:
+                pass
+
+            # CORRECTION 5 : payload validé conforme à newAppointment Base44
+            _payload_dict = {
+                "event": "rdv_created",
+                "app_salon_id": APP_SALON_ID,
+                "client_telephone": telephone,
+                "client_nom": client_nom,
+                "prestation": prestation,
+                "jour": _jour_wh,
+                "heure": _heure_wh,
+                "coiffeur": coiffeur_choisi or "",
+                "avec_shampoing": avec_shampoing,
+            }
+            _payload_bytes = json.dumps(_payload_dict).encode("utf-8")
+            print(f"📡 [WEBHOOK] PAYLOAD | {json.dumps(_payload_dict)}")
+
+            # CORRECTION 6 : headers corrects pour que Base44 parse le body
+            _wh_headers = {
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            }
+
+            def _do_webhook_post():
+                _req = _urlreq.Request(
                     SALON_APP_WEBHOOK_URL,
-                    data=webhook_payload,
-                    headers={"Content-Type": "application/json"},
+                    data=_payload_bytes,
+                    headers=_wh_headers,
                     method="POST",
                 )
-                with _urlreq.urlopen(req, timeout=5) as resp:
-                    print(f"📡 [WEBHOOK] Notification envoyée → {resp.status}")
-            except Exception as _we:
-                print(f"⚠️ [WEBHOOK] Erreur notification : {_we}")
+                with _urlreq.urlopen(_req, timeout=10) as _r:
+                    _rb = _r.read().decode("utf-8", errors="replace")[:200]
+                    print(f"📡 [WEBHOOK] RÉPONSE | status={_r.status} | body={_rb!r}")
+                    return _r.status
+
+            # CORRECTION 4 : essai 1, puis retry après 2s, puis SMS patron
+            _wh_ok = False
+            try:
+                _s1 = _do_webhook_post()
+                _wh_ok = (_s1 == 200)
+                if not _wh_ok:
+                    print(f"⚠️ [WEBHOOK] Tentative 1 — status inattendu : {_s1}")
+            except Exception as _e1:
+                print(f"⚠️ [WEBHOOK] Tentative 1 — ERREUR | type={type(_e1).__name__} | message={_e1}")
+
+            if not _wh_ok:
+                print("🔄 [WEBHOOK] Retry dans 2s…")
+                _time.sleep(2)
+                try:
+                    _s2 = _do_webhook_post()
+                    _wh_ok = (_s2 == 200)
+                    if not _wh_ok:
+                        print(f"⚠️ [WEBHOOK] Tentative 2 — status inattendu : {_s2}")
+                except Exception as _e2:
+                    print(f"⚠️ [WEBHOOK] Tentative 2 — ERREUR | type={type(_e2).__name__} | message={_e2}")
+
+            if not _wh_ok:
+                print(f"❌ [WEBHOOK] ÉCHEC DÉFINITIF — RDV {_jour_wh} {_heure_wh} non synchronisé avec Base44")
+                try:
+                    send_sms(TELEPHONE_SALON,
+                        f"⚠️ RDV non synchronisé avec l'app.\n"
+                        f"Client : {client_nom} ({telephone})\n"
+                        f"{prestation} | {_jour_wh} à {_heure_wh}\n"
+                        f"URL : {SALON_APP_WEBHOOK_URL}"
+                    )
+                    print(f"📱 [WEBHOOK] SMS d'alerte envoyé au patron ({TELEPHONE_SALON})")
+                except Exception as _sms_e:
+                    print(f"⚠️ [WEBHOOK] Erreur SMS patron : {_sms_e}")
 
         return f"RDV enregistré pour {jour} à {heure}.{fidelite}"
 
@@ -2503,12 +2569,68 @@ async def sync_config(request: Request):
             except Exception as e_db:
                 print(f"⚠️ [SYNC SUPABASE] Erreur persistance salon : {e_db}")
 
-        print(f"✅ [SYNC COMPLÈTE] {NOM_SALON} | {HORAIRE_OUVERTURE}-{HORAIRE_FERMETURE} | Jours: {JOURS_OUVERTS}")
+        # CORRECTION 2 : log récapitulatif de toutes les variables critiques
+        print(
+            f"✅ [CONFIG] NOM_SALON={NOM_SALON!r} | TWILIO={TWILIO_NUMBER!r} "
+            f"| WEBHOOK_URL={SALON_APP_WEBHOOK_URL!r} | APP_SALON_ID={APP_SALON_ID!r} "
+            f"| SUPABASE_URL={SALON_SUPABASE_URL!r} "
+            f"| HORAIRE={HORAIRE_OUVERTURE}-{HORAIRE_FERMETURE} | JOURS={JOURS_OUVERTS}"
+        )
         return {"status": "ok", "salon": NOM_SALON}
 
     except Exception as e:
         print(f"❌ [SYNC] Erreur : {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/test-webhook")
+async def test_webhook():
+    """CORRECTION 3 : endpoint de test webhook — appelle SALON_APP_WEBHOOK_URL avec un payload de test."""
+    import urllib.request as _urlreq2
+    result = {
+        "webhook_url": SALON_APP_WEBHOOK_URL,
+        "app_salon_id": APP_SALON_ID,
+        "status": None,
+        "body": None,
+        "error": None,
+    }
+    if not SALON_APP_WEBHOOK_URL:
+        result["error"] = "SALON_APP_WEBHOOK_URL est vide — configurer via /update-config"
+        return result
+    if not APP_SALON_ID:
+        result["error"] = "APP_SALON_ID est vide — configurer via /update-config"
+        return result
+
+    _test_payload = json.dumps({
+        "event": "rdv_created",
+        "app_salon_id": APP_SALON_ID,
+        "client_telephone": "+33600000000",
+        "client_nom": "Test Client",
+        "prestation": "Coupe homme",
+        "jour": now_paris().date().isoformat(),
+        "heure": "10:00",
+        "coiffeur": "",
+        "avec_shampoing": False,
+        "_test": True,
+    }).encode("utf-8")
+
+    _req = _urlreq2.Request(
+        SALON_APP_WEBHOOK_URL,
+        data=_test_payload,
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        method="POST",
+    )
+    try:
+        with _urlreq2.urlopen(_req, timeout=10) as _r:
+            _body = _r.read().decode("utf-8", errors="replace")
+            result["status"] = _r.status
+            result["body"] = _body[:500]
+            print(f"📡 [TEST-WEBHOOK] status={_r.status} | body={_body[:200]!r}")
+    except Exception as _te:
+        result["error"] = f"{type(_te).__name__}: {_te}"
+        print(f"❌ [TEST-WEBHOOK] Erreur : {_te}")
+
+    return result
+
 
 @app.post("/sync-staff")
 async def sync_staff(request: Request):
