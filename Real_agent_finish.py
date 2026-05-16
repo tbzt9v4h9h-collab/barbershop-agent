@@ -1283,6 +1283,7 @@ def build_system_prompt(telephone: str = None) -> str:
     if rdv_ctx_non_vides:
         rdv_ctx_str = "\n".join(f"  {k}={v}" for k, v in rdv_ctx_non_vides.items())
         rdv_context_block = f"\nCONTEXTE RDV EN COURS :\n{rdv_ctx_str}\nTous ces éléments sont ACQUIS. Ne pas les redemander.\n"
+        print(f"📋 [CONTEXTE RDV] prestation={rdv_ctx.get('prestation') or '—'} | jour={rdv_ctx.get('jour') or '—'} | heure={rdv_ctx.get('heure') or '—'} | coiffeur={rdv_ctx.get('coiffeur') or '—'}")
     else:
         rdv_context_block = ""
 
@@ -1300,7 +1301,7 @@ def build_system_prompt(telephone: str = None) -> str:
 
     prompt = f"""Tu es la réceptionniste vocale professionnelle du salon {NOM_SALON}.
 Aujourd'hui : {date_str} à {heure_actuelle}. Date ISO : {aujourd_hui.isoformat()}.
-JOURS OUVERTS ET DATES EXACTES — utilise UNIQUEMENT ces dates dans les tools, ne calcule jamais toi-même :
+PROCHAINS JOURS OUVERTS — utilise UNIQUEMENT ces dates dans les tools, ne calcule jamais toi-même :
 {_dates_ref}.
 RÈGLE : si le client dit "mardi prochain" ou "le 20", retrouve la date correspondante dans ce tableau.
 Horaires : {HORAIRE_OUVERTURE}-{HORAIRE_FERMETURE}, {', '.join([j.capitalize() for j in JOURS_OUVERTS])}.
@@ -2729,21 +2730,31 @@ def handle_appel(
         twiml.hangup()
         return str(twiml)
 
-    # ── Détection nouvel appel via CallSid ───────────────────────────────────
+    # ── CORRECTION 1 : Détection nouvel appel via CallSid ────────────────────
+    # Reset SYSTÉMATIQUE dès que le CallSid change (ou que stored_sid est vide)
     _ctx_early = get_client_context(telephone_appelant)
-    _last_callsid = _ctx_early.get("call_sid", "")
-    if CallSid and _last_callsid and CallSid != _last_callsid:
-        # CallSid différent = nouvel appel → réinitialiser état conversationnel
-        print(f"📞 [NOUVEL APPEL] CallSid={CallSid} (précédent={_last_callsid}) | réinitialisation contexte tel={telephone_appelant}")
+    _stored_sid = _ctx_early.get("call_sid", "")
+    _is_new_call = bool(CallSid and CallSid != _stored_sid)
+    if _is_new_call:
+        # Préserver uniquement les infos client durables, tout le reste est réinitialisé
         _preserved = {
             k: _ctx_early.get(k)
             for k in ("prenom", "client_id", "nb_visites", "derniere_visite", "nom")
             if _ctx_early.get(k)
         }
+        _preserved["call_sid"]    = CallSid
+        _preserved["silences"]    = 0
+        _preserved["accueil_joue"] = False
         client_context[telephone_appelant] = _preserved
         conversation_history[telephone_appelant] = []
-    # Toujours mettre à jour le CallSid courant
-    update_client_context(telephone_appelant, call_sid=CallSid)
+        print(f"📞 [NOUVEL APPEL] CallSid={CallSid} | stored={_stored_sid or 'vide'} | silences=0 | accueil_joue=False | reset=True")
+    else:
+        update_client_context(telephone_appelant, call_sid=CallSid)
+        print(f"📞 [MÊME APPEL] CallSid={CallSid} | contexte préservé")
+
+    # Log diagnostic complet
+    _ctx_diag = get_client_context(telephone_appelant)
+    print(f"🔍 [DEBUG APPEL] CallSid={CallSid} | stored_sid={_stored_sid or 'vide'} | reset={_is_new_call} | silences={_ctx_diag.get('silences', 0)} | accueil_joue={_ctx_diag.get('accueil_joue', False)}")
 
     HINTS = (
         "rendez-vous, coupe, couleur, brushing, shampoing, annuler, demain, "
@@ -2758,9 +2769,10 @@ def handle_appel(
         en_conversation = len(hist_en_cours) > 0
         accueil_joue = _ctx_sil.get("accueil_joue", False)
 
-        # ── Premier POST de l'appel : TOUJOURS jouer l'accueil ────────────────
-        # Le compteur de silences ne démarre qu'APRÈS que l'accueil a été joué
-        if not accueil_joue and not en_conversation:
+        # ── CORRECTION 2 : Si accueil pas encore joué → TOUJOURS jouer accueil ─
+        # Règle absolue : jamais de "je ne vous entends pas" si accueil_joue == False
+        # Le compteur de silences ne démarre QUE après que l'accueil a été joué
+        if not accueil_joue:
             update_client_context(telephone_appelant, accueil_joue=True, silences=0)
             ctx_accueil = _ctx_sil
             prenom_connu = ctx_accueil.get("prenom", "")
@@ -2788,12 +2800,12 @@ def handle_appel(
             gather.say(message_accueil, language="fr-FR", voice="Polly.Lea", barge_in=False)
             return str(twiml)
 
-        # ── Accueil déjà joué → compter les silences consécutifs ──────────────
+        # ── CORRECTION 3 : Accueil déjà joué → compter les silences ──────────
         nb_silences = _ctx_sil.get("silences", 0) + 1
         update_client_context(telephone_appelant, silences=nb_silences)
         print(f"🔇 [SILENCE] {nb_silences}/3 | en_conversation={en_conversation} | tel={telephone_appelant}")
 
-        # ── 3 silences → raccrocher ────────────────────────────────────────────
+        # ── 3 silences consécutifs → raccrocher ───────────────────────────────
         if nb_silences >= 3:
             twiml.say(
                 "Je ne vous entends pas bien, n'hésitez pas à rappeler. À bientôt !",
@@ -2801,9 +2813,10 @@ def handle_appel(
             )
             twiml.hangup()
             update_client_context(telephone_appelant, silences=0, accueil_joue=False)
+            print(f"📵 [FIN APPEL] raison=3_silences_consecutifs | tel={telephone_appelant}")
             return str(twiml)
 
-        # ── Conversation en cours → JAMAIS l'accueil, message contextuel ──────
+        # ── Conversation en cours → "je ne vous entends pas, répétez" ────────
         if en_conversation:
             msgs_relance = [
                 "Je ne vous ai pas bien entendu, pouvez-vous répéter ?",
@@ -2820,14 +2833,28 @@ def handle_appel(
             gather.say(_msg_relance, language="fr-FR", voice="Polly.Lea", barge_in=False)
             return str(twiml)
 
-        # ── Pas encore de conversation, silence après accueil ─────────────────
-        print(f"📡 [GATHER] silence {nb_silences}/3 post-accueil | action=/appel POST | speech_timeout=auto timeout=12")
+        # ── Accueil joué mais pas encore de conversation → rejouer accueil ────
+        # (ne jamais dire "je ne vous entends pas" si le client n'a pas encore parlé)
+        _prenom_reac = _ctx_sil.get("prenom", "")
+        _visites_reac = _ctx_sil.get("nb_visites", 0)
+        if _prenom_reac and _visites_reac > 0:
+            _accueils_retry = [
+                f"Bonjour {_prenom_reac}, ravi de vous retrouver. Que puis-je faire pour vous ?",
+                f"Bonjour {_prenom_reac}, je vous écoute, comment puis-je vous aider ?",
+            ]
+        else:
+            _accueils_retry = [
+                f"Bonjour et bienvenue chez {NOM_SALON}. Comment puis-je vous aider ?",
+                f"Bonjour, vous êtes bien chez {NOM_SALON}. Je vous écoute.",
+            ]
+        _msg_reaccueil = _rand.choice(_accueils_retry)
+        print(f"📡 [GATHER] silence {nb_silences}/3 post-accueil — rejouer accueil | action=/appel POST | speech_timeout=auto timeout=12")
         gather = twiml.gather(
             input="speech", action="/appel", method="POST",
             language="fr-FR", speech_timeout="auto",
             speech_model="phone_call", timeout=12, hints=HINTS,
         )
-        gather.say("Vous êtes toujours là ? Je vous écoute.", language="fr-FR", voice="Polly.Lea", barge_in=False)
+        gather.say(_msg_reaccueil, language="fr-FR", voice="Polly.Lea", barge_in=False)
         return str(twiml)
 
     # ── SpeechResult non vide → remettre le compteur de silences à 0 ──────────
@@ -2902,6 +2929,7 @@ def handle_appel(
         reponse_fin = _rand2.choice(REPONSES_FIN)
         twiml.say(reponse_fin, language="fr-FR", voice="Polly.Lea")
         twiml.hangup()
+        print(f"📵 [FIN APPEL] raison=au_revoir_merci | speech='{speech_lower[:60]}' | tel={telephone}")
         return str(twiml)
 
     # Message d'attente pré-outil (évite silence Twilio)
