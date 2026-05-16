@@ -1655,9 +1655,10 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
         type_client = tool_input.get("type_client", "homme")
         avec_shampoing = bool(tool_input.get("avec_shampoing", False))
         coiffeur_choisi = tool_input.get("coiffeur")
-        # Mémoriser tout le contexte RDV
+        # Mémoriser jour/heure/coiffeur/shampoing AVANT la validation prestation
+        # (ne pas stocker rdv_prestation avant qu'elle soit validée)
         update_client_context(telephone,
-            rdv_prestation=prestation, rdv_jour=jour, rdv_heure=heure,
+            rdv_jour=jour, rdv_heure=heure,
             rdv_coiffeur=coiffeur_choisi or "",
             avec_shampoing=avec_shampoing, shampoing_repondu=True)
 
@@ -1669,8 +1670,18 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
                 for p in PRESTATIONS_SALON
             )
             if not prestation_valide:
+                # Effacer rdv_prestation invalide — garder jour, heure, coiffeur, shampoing
+                update_client_context(telephone, rdv_prestation="")
                 noms = ', '.join(p.get("name", "") for p in PRESTATIONS_SALON)
-                return f"Prestation '{prestation}' non disponible. Prestations : {noms}"
+                print(f"⚠️ [PRENDRE_RDV] Prestation invalide '{prestation}' — contexte RDV conservé sans prestation")
+                return (
+                    f"Prestation '{prestation}' non disponible. "
+                    f"Prestations disponibles : {noms}. "
+                    f"Quelle prestation souhaitez-vous ?"
+                )
+
+        # Prestation valide : mémoriser dans le contexte
+        update_client_context(telephone, rdv_prestation=prestation)
 
         # Vérifier la disponibilité
         if not est_creneau_disponible(jour, heure):
