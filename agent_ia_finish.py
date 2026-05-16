@@ -2733,22 +2733,23 @@ def handle_appel(
                 "Je n'ai pas bien entendu. Pouvez-vous répéter s'il vous plaît ?",
                 "Excusez-moi, pouvez-vous répéter votre demande ?",
             ]
+            _msg_relance = _rand.choice(msgs_relance)
+            print(f"📡 [GATHER] relance mid-conv | action=/appel POST | speech_timeout=auto timeout=12 | hints={len(HINTS)}c")
             gather = twiml.gather(
                 input="speech", action="/appel", method="POST",
                 language="fr-FR", speech_timeout="auto",
                 speech_model="phone_call", timeout=12, hints=HINTS,
-                partial_result_callback="",
             )
-            gather.say(_rand.choice(msgs_relance), language="fr-FR", voice="Polly.Lea", barge_in=False)
+            gather.say(_msg_relance, language="fr-FR", voice="Polly.Lea", barge_in=False)
             return str(twiml)
 
         # Premier contact : accueil
         if nb_silences >= 2:
+            print(f"📡 [GATHER] silence#2 | action=/appel POST | speech_timeout=auto timeout=12")
             gather = twiml.gather(
                 input="speech", action="/appel", method="POST",
                 language="fr-FR", speech_timeout="auto",
                 speech_model="phone_call", timeout=12, hints=HINTS,
-                partial_result_callback="",
             )
             gather.say("Vous êtes toujours là ? Je vous écoute.", language="fr-FR", voice="Polly.Lea", barge_in=False)
             return str(twiml)
@@ -2772,11 +2773,11 @@ def handle_appel(
                 f"Bonjour, vous êtes bien chez {NOM_SALON}, comment puis-je vous aider ?",
             ]
             message_accueil = _rand.choice(accueils)
+        print(f"📡 [GATHER] accueil | action=/appel POST | speech_timeout=auto timeout=10")
         gather = twiml.gather(
             input="speech", action="/appel", method="POST",
             language="fr-FR", speech_timeout="auto",
             speech_model="phone_call", timeout=10, hints=HINTS,
-            partial_result_callback="",
         )
         gather.say(message_accueil, language="fr-FR", voice="Polly.Lea", barge_in=False)
         return str(twiml)
@@ -2857,16 +2858,53 @@ def handle_appel(
         update_client_context(telephone)  # flush (pop already done on dict)
     texte_final = (msg_attente + " " + response_text) if msg_attente else response_text
 
-    # Déterminer les paramètres du gather selon le contexte
+    # Construire les hints adaptés au contexte de la réponse
+    _resp_lower = (response_text or "").lower()
     ctx_gather = get_client_context(telephone)
-    question_shampoing = (
-        "shampoing" in (response_text or "").lower()
-        and not ctx_gather.get("shampoing_repondu")
-    )
 
-    # Hints enrichis si question shampoing en cours
-    hints_gather = HINTS + ", oui, non, avec, sans, volontiers, pas de shampoing" \
-        if question_shampoing else HINTS
+    HINTS_HEURES = (
+        "neuf heures, dix heures, onze heures, midi, treize heures, quatorze heures, "
+        "quinze heures, seize heures, dix-sept heures, dix-huit heures, "
+        "9h, 10h, 11h, 12h, 13h, 14h, 15h, 16h, 17h, 18h, "
+        "9h30, 10h30, 11h30, 14h30, 15h30, 16h30, 17h30"
+    )
+    HINTS_JOURS = (
+        "lundi, mardi, mercredi, jeudi, vendredi, samedi, "
+        "demain, après-demain, cette semaine, semaine prochaine, "
+        "le quinze, le seize, le dix-sept, le dix-huit, le dix-neuf, le vingt"
+    )
+    HINTS_SHAMPOING = "oui, non, avec, sans, volontiers, pas de shampoing"
+
+    question_heure = any(k in _resp_lower for k in [
+        "quelle heure", "pour quelle heure", "à quelle heure", "quel créneau", "quel horaire"
+    ])
+    question_jour = any(k in _resp_lower for k in [
+        "quel jour", "quelle date", "quand souhaitez", "pour quel jour", "quelle journée"
+    ])
+    question_shampoing = "shampoing" in _resp_lower and not ctx_gather.get("shampoing_repondu")
+    question_prestation = any(k in _resp_lower for k in [
+        "quelle prestation", "quel service", "que souhaitez-vous", "souhaitez-vous comme"
+    ])
+
+    hints_extra = []
+    if question_shampoing:
+        hints_extra.append(HINTS_SHAMPOING)
+    if question_heure:
+        hints_extra.append(HINTS_HEURES)
+    if question_jour:
+        hints_extra.append(HINTS_JOURS)
+    if question_prestation and PRESTATIONS_SALON:
+        prest_hints = ", ".join(p.get("name", "") for p in PRESTATIONS_SALON if p.get("name"))
+        if prest_hints:
+            hints_extra.append(prest_hints)
+
+    hints_gather = HINTS + (", " + ", ".join(hints_extra) if hints_extra else "")
+
+    _gather_ctx = (
+        f"shampoing={question_shampoing} heure={question_heure} "
+        f"jour={question_jour} prestation={question_prestation}"
+    )
+    print(f"📡 [GATHER] main | action=/appel POST | speech_timeout=auto timeout=12 | {_gather_ctx} | hints_len={len(hints_gather)}c")
 
     gather = twiml.gather(
         input="speech",
@@ -2877,7 +2915,6 @@ def handle_appel(
         speech_model="phone_call",
         timeout=12,
         hints=hints_gather,
-        partial_result_callback="",
     )
     gather.say(texte_final, language="fr-FR", voice="Polly.Lea", barge_in=False)
     twiml.say("Merci pour votre appel. À bientôt !", language="fr-FR", voice="Polly.Lea")
