@@ -1997,53 +1997,88 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
 
         update_client_context(telephone, rdv_en_cours=True)
 
-        # CORRECTION 2 : vérification étendue (rendez_vous + appointment, fenêtre 30min, per-coiffeur)
-        # Normaliser le nom du coiffeur demandé (strip + lower géré dans est_creneau_disponible_v2)
+        # ── Étape 1 : quels coiffeurs sont pris à ce créneau ? ────────────────
+        # On garde la casse pour l'affichage, la comparaison se fait en _norm() dans v2
         _coiffeur_demande = (
             tool_input.get("coiffeur") or get_client_context(telephone).get("rdv_coiffeur", "")
-        ).strip()  # pas de .lower() ici — on garde la casse pour l'affichage, la comparaison est dans v2
+        ).strip()
         _dispo = est_creneau_disponible_v2(jour, heure, coiffeur=_coiffeur_demande or None)
-        disponible = _dispo["disponible"]
-        _coiffeurs_libres = _dispo["coiffeurs_libres"]
+        _coiffeurs_libres = _dispo["coiffeurs_libres"]   # tous coiffeurs libres (sans filtre prestation)
+        _noms_libres_norm = {c.strip().lower() for c in _coiffeurs_libres}
 
-        if not disponible:
-            _heure_fmt = heure or "?"
-            _jour_fmt = jour or "?"
-            # Coiffeur spécifique pris mais alternatives libres → suggérer
-            if _coiffeur_demande and _coiffeurs_libres:
-                _alt = _coiffeurs_libres[0]
-                return (
-                    f"Disponibilité : occupé pour {_coiffeur_demande} — {_coiffeur_demande} est déjà pris à {_heure_fmt}. "
-                    f"Mais {_alt} est disponible à cette heure. "
-                    f"Demander au client : '{_coiffeur_demande} n'est pas disponible à {_heure_fmt}. "
-                    f"Souhaitez-vous prendre avec {_alt} ?'"
-                )
-            # Créneau entièrement bloqué
-            return (
-                f"Disponibilité : occupé — le créneau du {_jour_fmt} à {_heure_fmt} est déjà pris. "
-                f"Ne pas chercher automatiquement d'autres créneaux. "
-                f"Demander au client : 'Ce créneau est déjà pris. Souhaitez-vous un autre horaire ou un autre jour ?'"
-            )
-
-        statut = "libre"
-
-        # Filtrage coiffeurs compétents pour la prestation
+        # ── Étape 2 : filtrer par compétence prestation ────────────────────────
         prestation_ctx = tool_input.get("prestation") or get_client_context(telephone).get("rdv_prestation", "")
-        if prestation_ctx and len(COIFFEURS) >= 1:
-            competents = coiffeurs_competents(prestation_ctx)
+        competents = coiffeurs_competents(prestation_ctx) if (prestation_ctx and COIFFEURS) else list(COIFFEURS)
+
+        # Coiffeurs compétents ET libres à ce créneau
+        competents_libres = [c for c in competents if c["nom"].strip().lower() in _noms_libres_norm]
+
+        _heure_fmt = heure or "?"
+        _jour_fmt  = jour  or "?"
+
+        # ── Étape 3 : coiffeur spécifique demandé par le client ───────────────
+        if _coiffeur_demande:
+            coiffeur_pris = not _dispo["disponible"]
+            if coiffeur_pris:
+                # Ce coiffeur est pris — y a-t-il un autre compétent libre ?
+                _alt_competents = [c for c in competents_libres
+                                   if c["nom"].strip().lower() != _coiffeur_demande.strip().lower()]
+                if _alt_competents:
+                    _alt = _alt_competents[0]["nom"]
+                    print(f"❌ [DISPO] {_coiffeur_demande} pris à {heure} — alternative : {_alt}")
+                    return (
+                        f"Disponibilité : occupé pour {_coiffeur_demande} — est déjà pris à {_heure_fmt}. "
+                        f"Mais {_alt} est disponible. "
+                        f"Demander au client : '{_coiffeur_demande} n'est pas disponible à {_heure_fmt}. "
+                        f"Souhaitez-vous prendre avec {_alt} ?'"
+                    )
+                print(f"❌ [DISPO] {_coiffeur_demande} pris à {heure} — aucune alternative compétente")
+                return (
+                    f"Disponibilité : occupé — {_coiffeur_demande} est déjà pris à {_heure_fmt}. "
+                    f"Ne pas chercher automatiquement d'autres créneaux. "
+                    f"Demander au client : '{_coiffeur_demande} n'est pas disponible à {_heure_fmt}. "
+                    f"Souhaitez-vous un autre horaire ou un autre jour ?'"
+                )
+
+        # ── Étape 4 : pas de coiffeur spécifique — vérifier les compétents ────
+        if prestation_ctx and COIFFEURS:
             if not competents:
-                return (f"Disponibilité : {statut}. "
+                return (f"Disponibilité : libre. "
                         f"Aucun coiffeur ne propose '{prestation_ctx}' actuellement.")
-            elif len(competents) == 1:
-                update_client_context(telephone, rdv_coiffeur=competents[0]["nom"])
-                print(f"✅ [COIFFEUR] Assignation auto : {competents[0]['nom']} pour {prestation_ctx}")
-                return (f"Disponibilité : {statut}. "
-                        f"Coiffeur assigné automatiquement : {competents[0]['nom']}. "
+
+            if len(competents) == 1:
+                seul = competents[0]
+                if seul["nom"].strip().lower() not in _noms_libres_norm:
+                    # Seul compétent est pris → créneau réellement occupé
+                    print(f"❌ [DISPO] Seul coiffeur compétent ({seul['nom']}) pris à {heure} pour {prestation_ctx} — statut=occupé")
+                    return (
+                        f"Disponibilité : occupé — {seul['nom']} est le seul coiffeur compétent "
+                        f"pour {prestation_ctx} et est déjà pris à {_heure_fmt}. "
+                        f"Ne pas chercher automatiquement d'autres créneaux. "
+                        f"Demander au client : '{seul['nom']} n'est pas disponible à {_heure_fmt}. "
+                        f"Souhaitez-vous un autre horaire ou un autre jour ?'"
+                    )
+                update_client_context(telephone, rdv_coiffeur=seul["nom"])
+                print(f"✅ [COIFFEUR] Assignation auto : {seul['nom']} pour {prestation_ctx} | statut=libre")
+                return (f"Disponibilité : libre. "
+                        f"Coiffeur assigné automatiquement : {seul['nom']}. "
                         f"Ne pas poser la question de préférence coiffeur.")
+
             else:
-                noms = ', '.join(c['nom'] for c in competents)
-                return (f"Disponibilité : {statut}. "
-                        f"Plusieurs coiffeurs compétents pour {prestation_ctx} : {noms}. "
+                # Plusieurs compétents : vérifier combien sont libres
+                if not competents_libres:
+                    noms_comp = ', '.join(c['nom'] for c in competents)
+                    print(f"❌ [DISPO] Tous les coiffeurs compétents ({noms_comp}) sont pris à {heure} — statut=occupé")
+                    return (
+                        f"Disponibilité : occupé — tous les coiffeurs compétents pour {prestation_ctx} "
+                        f"({noms_comp}) sont pris à {_heure_fmt}. "
+                        f"Ne pas chercher automatiquement d'autres créneaux. "
+                        f"Demander au client : 'Ce créneau est déjà pris. Souhaitez-vous un autre horaire ou un autre jour ?'"
+                    )
+                noms_libres = ', '.join(c['nom'] for c in competents_libres)
+                print(f"✅ [DISPO] {len(competents_libres)} coiffeur(s) compétent(s) libre(s) à {heure} : {noms_libres} | statut=libre")
+                return (f"Disponibilité : libre. "
+                        f"Coiffeurs compétents pour {prestation_ctx} disponibles à {_heure_fmt} : {noms_libres}. "
                         f"Poser la question de préférence.")
 
         # Enrichir la réponse si peu de créneaux aujourd'hui
