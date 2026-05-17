@@ -495,16 +495,26 @@ def load_all_salon_data():
             .execute()
 
         if staff_result.data:
-            COIFFEURS = [
-                {
-                    "nom": e.get("full_name") or e.get("name") or e.get("first_name", ""),
-                    "id": e.get("id"),
+            COIFFEURS = []
+            for e in staff_result.data:
+                _nom_e = e.get("full_name") or e.get("name") or e.get("first_name", "")
+                if not _nom_e:
+                    continue
+                # Jours de repos : champ days_off ou jours_repos (JSON array ou liste)
+                _repos_raw = e.get("days_off") or e.get("jours_repos") or []
+                if isinstance(_repos_raw, str):
+                    try: _repos_raw = json.loads(_repos_raw)
+                    except Exception: _repos_raw = []
+                _jours_repos = [j.strip().lower() for j in (_repos_raw or []) if j]
+                COIFFEURS.append({
+                    "nom":         _nom_e,
+                    "id":          e.get("id"),
                     "specialites": _normaliser_specialites(e.get("specialties") or e.get("role")),
-                }
-                for e in staff_result.data
-                if e.get("full_name") or e.get("name") or e.get("first_name")
-            ]
-            print(f"✅ [LOAD] Coiffeurs : {[{'nom': c['nom'], 'specialites': c['specialites']} for c in COIFFEURS]}")
+                    "jours_repos": _jours_repos,
+                    "heure_debut": e.get("work_start") or e.get("heure_debut") or HORAIRE_OUVERTURE,
+                    "heure_fin":   e.get("work_end")   or e.get("heure_fin")   or HORAIRE_FERMETURE,
+                })
+            print(f"✅ [LOAD] Coiffeurs : {[{'nom': c['nom'], 'specialites': c['specialites'], 'repos': c['jours_repos']} for c in COIFFEURS]}")
         else:
             COIFFEURS = []
             print(f"⚠️ [LOAD] Aucun coiffeur pour salon_id={salon_id}")
@@ -776,13 +786,37 @@ def est_creneau_disponible_v2(jour: str, heure: str, coiffeur: str = None) -> di
         print(f"⚠️ [DISPO] Erreur vérification étendue : {e}")
         return {"disponible": True, "coiffeurs_libres": [c["nom"] for c in COIFFEURS], "rdvs_trouves": 0}
 
-    # Coiffeurs libres : ceux dont le nom normalisé n'est pas dans coiffeurs_pris
-    coiffeurs_libres = [c["nom"] for c in COIFFEURS if _norm(c["nom"]) not in coiffeurs_pris]
+    # CORRECTION 3 : exclure les coiffeurs en repos ce jour-là
+    _jour_norm_v2 = None
+    if jour:
+        try:
+            _d2 = datetime.strptime(jour, "%Y-%m-%d").date()
+            _jour_norm_v2 = NOMS_JOURS[_d2.weekday()].lower()
+        except Exception:
+            pass
+
+    def _travaille(c: dict) -> bool:
+        if not _jour_norm_v2:
+            return True
+        repos = [j.strip().lower() for j in (c.get("jours_repos") or [])]
+        # CORRECTION 6 : repos vide → travaille tous les jours d'ouverture
+        return _jour_norm_v2 not in repos if repos else True
+
+    # Coiffeurs libres = pas dans coiffeurs_pris ET pas en repos ce jour
+    coiffeurs_libres = [
+        c["nom"] for c in COIFFEURS
+        if _norm(c["nom"]) not in coiffeurs_pris and _travaille(c)
+    ]
 
     if coiffeur:
-        coiffeur_pris = _norm(coiffeur) in coiffeurs_pris
+        # Un coiffeur explicite est "pris" si en RDV OU en repos ce jour
+        _c_obj = next((c for c in COIFFEURS if _norm(c["nom"]) == _norm(coiffeur)), None)
+        coiffeur_en_rdv   = _norm(coiffeur) in coiffeurs_pris
+        coiffeur_en_repos = _c_obj and not _travaille(_c_obj)
+        coiffeur_pris = coiffeur_en_rdv or coiffeur_en_repos
         disponible = not coiffeur_pris
-        print(f"🔍 [DISPO] jour={jour} heure={heure} coiffeur={coiffeur!r} | rdvs_trouves={rdvs_trouves} | statut={'occupé' if coiffeur_pris else 'libre'}")
+        _raison = "repos" if coiffeur_en_repos else ("RDV" if coiffeur_en_rdv else "libre")
+        print(f"🔍 [DISPO] jour={jour} heure={heure} coiffeur={coiffeur!r} | rdvs_trouves={rdvs_trouves} | raison={_raison} | statut={'occupé' if coiffeur_pris else 'libre'}")
     else:
         disponible = rdvs_trouves == 0 or bool(coiffeurs_libres)
         print(f"🔍 [DISPO] jour={jour} heure={heure} | rdvs_trouves={rdvs_trouves} | coiffeurs_pris={coiffeurs_pris} | statut={'occupé' if not disponible else 'libre'}")
@@ -1057,18 +1091,48 @@ def _normaliser_specialites(raw) -> list:
         return [s.strip() for s in raw.split(",") if s.strip()]
     return []
 
-def coiffeurs_competents(prestation: str) -> list:
-    """Filtre COIFFEURS selon la prestation. Retourne tous si aucune spécialité n'est renseignée."""
+def coiffeurs_competents(prestation: str, jour: str = None) -> list:
+    """
+    Filtre COIFFEURS selon la prestation ET optionnellement le jour de travail.
+    - Si jour fourni : exclut les coiffeurs en repos ce jour-là et hors de leurs horaires.
+    - CORRECTION 6 : si jours_repos vide → coiffeur considéré disponible tous les jours.
+    """
+    # Nom du jour de semaine à partir d'une date ISO ou d'un nom déjà normalisé
+    _jour_norm = None
+    if jour:
+        try:
+            _d = datetime.strptime(jour, "%Y-%m-%d").date()
+            _jour_norm = NOMS_JOURS[_d.weekday()].lower()
+        except Exception:
+            _jour_norm = jour.strip().lower()
+
+    def _coiffeur_travaille_ce_jour(c: dict) -> bool:
+        """Retourne True si le coiffeur travaille le jour donné."""
+        if not _jour_norm:
+            return True
+        repos = [j.strip().lower() for j in (c.get("jours_repos") or [])]
+        # CORRECTION 6 : repos vide → travaille tous les jours
+        if not repos:
+            return True
+        if _jour_norm in repos:
+            print(f"🔍 [REPOS] {c['nom']} en repos le {_jour_norm} — exclu pour ce créneau")
+            return False
+        return True
+
+    # Filtrer d'abord par disponibilité du jour
+    candidats = [c for c in COIFFEURS if _coiffeur_travaille_ce_jour(c)]
+
     if not prestation:
-        return COIFFEURS
+        return candidats if candidats else list(COIFFEURS)
+
     prest_lower = prestation.lower()
     competents = [
-        c for c in COIFFEURS
+        c for c in candidats
         if any(prest_lower in s.lower() or s.lower() in prest_lower
                for s in _normaliser_specialites(c.get("specialites")))
     ]
-    # Si aucune spécialité ne matche (ou spécialités vides), considérer tous compétents
-    return competents if competents else COIFFEURS
+    # Si aucune spécialité ne matche → tous les candidats du jour sont compétents
+    return competents if competents else (candidats if candidats else list(COIFFEURS))
 
 def get_coiffeurs_disponibles(jour: str, heure: str, duree: int = 45) -> list:
     """Retourne la liste des coiffeurs disponibles à l'heure demandée."""
@@ -1465,27 +1529,35 @@ Si client dit au revoir / merci au revoir / bonne journée / c'est tout merci : 
         prompt += "COIFFEUR : Aucun coiffeur enregistré. Ne pas mentionner de coiffeur.\n"
     elif len(COIFFEURS) == 1:
         nom_unique = COIFFEURS[0]["nom"]
-        prompt += f"COIFFEUR : Un seul coiffeur — {nom_unique}. Ne jamais demander de préférence. Assigner automatiquement {nom_unique}.\n"
+        _repos_u = COIFFEURS[0].get("jours_repos") or []
+        _repos_str_u = f" | repos: {', '.join(_repos_u)}" if _repos_u else ""
+        _h_u = f"{COIFFEURS[0].get('heure_debut', HORAIRE_OUVERTURE)}-{COIFFEURS[0].get('heure_fin', HORAIRE_FERMETURE)}"
+        prompt += (f"COIFFEUR : Un seul coiffeur — {nom_unique}{_repos_str_u} | horaires: {_h_u}. "
+                   f"Ne jamais demander de préférence. Assigner automatiquement {nom_unique}.\n")
     else:
         noms_c = ', '.join([c['nom'] for c in COIFFEURS])
-        # Lignes spécialités pour chaque coiffeur (si renseignées)
-        lignes_spec = []
+        # CORRECTION 5 : bloc enrichi avec repos et horaires par coiffeur
+        lignes_coif = []
         for c in COIFFEURS:
-            specs = c.get("specialites") or []
-            if specs:
-                lignes_spec.append(f"  {c['nom']} : {', '.join(specs)}")
-        spec_block = "\nSpécialités :\n" + "\n".join(lignes_spec) + "\n" if lignes_spec else ""
+            specs  = c.get("specialites") or []
+            repos  = c.get("jours_repos") or []
+            h_deb  = c.get("heure_debut") or HORAIRE_OUVERTURE
+            h_fin  = c.get("heure_fin")   or HORAIRE_FERMETURE
+            _spec_s  = f"spécialités [{', '.join(specs)}]" if specs else "toutes prestations"
+            _repos_s = f"repos: {', '.join(repos)}" if repos else "disponible tous les jours d'ouverture"
+            lignes_coif.append(f"  - {c['nom']} : {_spec_s} | {_repos_s} | horaires: {h_deb}-{h_fin}")
+        coif_block = "\n".join(lignes_coif)
         prompt += (
-            f"GESTION COIFFEURS ({len(COIFFEURS)} disponibles : {noms_c}) :{spec_block}"
+            f"COIFFEURS ET DISPONIBILITÉS :\n{coif_block}\n"
             f"RÈGLES COIFFEUR (dans l'ordre) :\n"
             f"1. Après verifier_disponibilite, utilise le résultat 'Coiffeur assigné automatiquement' si présent → ne jamais poser la question de préférence dans ce cas.\n"
-            f"2. Si le résultat de verifier_disponibilite liste plusieurs coiffeurs compétents → poser EXACTEMENT : \"Avez-vous une préférence pour un coiffeur ?\"\n"
+            f"2. Si le résultat liste plusieurs coiffeurs compétents disponibles → poser EXACTEMENT : \"Avez-vous une préférence pour un coiffeur ?\"\n"
             f"   Ne pas citer les noms dans cette question.\n"
             f"   - Client dit non → assigner automatiquement le premier de la liste.\n"
             f"   - Client dit oui → demander \"Lequel ? Nous avons : {noms_c}.\"\n"
-            f"3. Si le client demande un coiffeur non compétent pour la prestation → répondre :\n"
+            f"3. Si le client demande un coiffeur en repos ce jour ou hors horaires → lui dire et proposer un autre créneau ou un autre coiffeur.\n"
+            f"4. Si le client demande un coiffeur non compétent pour la prestation → répondre :\n"
             f"   \"[Nom] ne propose pas cette prestation, seul [coiffeur compétent] peut vous la réaliser. Je vous confirme avec [coiffeur compétent] ?\"\n"
-            f"4. Si coiffeur demandé indisponible à ce créneau : proposer autre heure OU autre coiffeur compétent.\n"
         )
 
     # Prestations disponibles
@@ -2006,9 +2078,10 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
         _coiffeurs_libres = _dispo["coiffeurs_libres"]   # tous coiffeurs libres (sans filtre prestation)
         _noms_libres_norm = {c.strip().lower() for c in _coiffeurs_libres}
 
-        # ── Étape 2 : filtrer par compétence prestation ────────────────────────
+        # ── Étape 2 : filtrer par compétence prestation ET jour de repos ─────────
         prestation_ctx = tool_input.get("prestation") or get_client_context(telephone).get("rdv_prestation", "")
-        competents = coiffeurs_competents(prestation_ctx) if (prestation_ctx and COIFFEURS) else list(COIFFEURS)
+        # CORRECTION 4 : passer jour à coiffeurs_competents pour filtrer les repos
+        competents = coiffeurs_competents(prestation_ctx, jour=jour) if COIFFEURS else list(COIFFEURS)
 
         # Coiffeurs compétents ET libres à ce créneau
         competents_libres = [c for c in competents if c["nom"].strip().lower() in _noms_libres_norm]
@@ -2043,6 +2116,24 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
         # ── Étape 4 : pas de coiffeur spécifique — vérifier les compétents ────
         if prestation_ctx and COIFFEURS:
             if not competents:
+                # CORRECTION 3 : tous les coiffeurs compétents sont en repos ce jour ?
+                _competents_tous = coiffeurs_competents(prestation_ctx)  # sans filtre jour
+                if _competents_tous:
+                    # Calculer les jours où au moins un coiffeur compétent travaille
+                    _jours_dispo = sorted({
+                        j for c in _competents_tous
+                        for j in JOURS_OUVERTS
+                        if j.lower() not in [r.strip().lower() for r in (c.get("jours_repos") or [])]
+                    })
+                    _jours_str = ", ".join(j.capitalize() for j in _jours_dispo) or "les jours d'ouverture"
+                    _nom_jour = NOMS_JOURS[datetime.strptime(jour, "%Y-%m-%d").date().weekday()].capitalize() if jour else "ce jour"
+                    return (
+                        f"Disponibilité : occupé — aucun coiffeur compétent pour {prestation_ctx} "
+                        f"n'est disponible le {_nom_jour}. "
+                        f"Jours disponibles pour cette prestation : {_jours_str}. "
+                        f"Demander au client : 'Cette prestation n'est pas disponible le {_nom_jour}. "
+                        f"Je peux vous proposer un rendez-vous le {_jours_str}.'"
+                    )
                 return (f"Disponibilité : libre. "
                         f"Aucun coiffeur ne propose '{prestation_ctx}' actuellement.")
 
@@ -2081,20 +2172,20 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
                         f"Coiffeurs compétents pour {prestation_ctx} disponibles à {_heure_fmt} : {noms_libres}. "
                         f"Poser la question de préférence.")
 
-        # Enrichir la réponse si peu de créneaux aujourd'hui
+        # Enrichir la réponse si peu de créneaux aujourd'hui (cas sans filtre prestation)
         try:
             _np2 = now_paris()
             if jour == _np2.date().isoformat():
                 maintenant_min = _np2.hour * 60 + _np2.minute
                 heure_min_v = parse_hhmm_en_minutes(heure)
-                if heure_min_v - maintenant_min < 120 and disponible:
+                if heure_min_v - maintenant_min < 120:
                     slots_total = (parse_hhmm_en_minutes(HORAIRE_FERMETURE) - heure_min_v) // 30
                     if slots_total <= 2:
-                        return f"Disponibilité : {statut}. Il ne reste que {slots_total} créneau(x) aujourd'hui."
+                        return f"Disponibilité : libre. Il ne reste que {slots_total} créneau(x) aujourd'hui."
         except Exception:
             pass
 
-        return f"Disponibilité : {statut}"
+        return "Disponibilité : libre"
 
     elif tool_name == "annuler_rdv":
         client_id = tool_input.get("client_id")
@@ -2771,24 +2862,45 @@ async def sync_staff(request: Request):
             except Exception as e:
                 print(f"⚠️ [SYNC-STAFF] Erreur delete : {e}")
 
-        # 2. Insérer les nouveaux coiffeurs
+        # 2. Insérer les nouveaux coiffeurs (CORRECTION 2 : champs repos et horaires)
         for s in staff_list:
-            nom = (s.get("full_name") or s.get("name") or
-                   s.get("firstName") or "")
+            nom = (s.get("full_name") or s.get("name") or s.get("firstName") or "")
             if not nom:
                 continue
-            COIFFEURS.append({
-                "nom": nom.strip().title(),
-                "id": s.get("id", ""),
-                "specialites": _normaliser_specialites(s.get("specialties") or s.get("role")),
-            })
             nom = nom.strip().title()
+
+            # Jours de repos
+            _repos_raw = s.get("days_off") or s.get("jours_repos") or []
+            if isinstance(_repos_raw, str):
+                try: _repos_raw = json.loads(_repos_raw)
+                except Exception: _repos_raw = []
+            jours_repos = [j.strip().lower() for j in (_repos_raw or []) if j]
+
+            # Horaires individuels (fallback salon)
+            heure_debut = s.get("work_start") or s.get("heure_debut") or HORAIRE_OUVERTURE
+            heure_fin   = s.get("work_end")   or s.get("heure_fin")   or HORAIRE_FERMETURE
+
+            specialites = _normaliser_specialites(s.get("specialties") or s.get("role"))
+
+            COIFFEURS.append({
+                "nom":         nom,
+                "id":          s.get("id", ""),
+                "specialites": specialites,
+                "jours_repos": jours_repos,
+                "heure_debut": heure_debut,
+                "heure_fin":   heure_fin,
+            })
+            print(f"✅ [SYNC-STAFF] {nom} | spécialités: {specialites} | repos: {jours_repos} | horaires: {heure_debut}-{heure_fin}")
+
             try:
                 supabase.table("employee").insert({
-                    "id": str(uuid.uuid4()),
-                    "salon_id": sid,
-                    "full_name": nom,
+                    "id":         str(uuid.uuid4()),
+                    "salon_id":   sid,
+                    "full_name":  nom,
                     "specialties": s.get("specialties", ""),
+                    "days_off":   json.dumps(jours_repos),
+                    "work_start": heure_debut,
+                    "work_end":   heure_fin,
                 }).execute()
             except Exception as e:
                 print(f"⚠️ [SYNC-STAFF] Erreur insert : {e}")
@@ -2797,8 +2909,7 @@ async def sync_staff(request: Request):
         global SALON_DATA_CACHED_AT
         SALON_DATA_CACHED_AT = None
         load_all_salon_data()
-        print(f"✅ [SYNC-STAFF] {len(COIFFEURS)} coiffeurs : "
-              f"{[{'nom': c['nom'], 'specialites': c['specialites']} for c in COIFFEURS]}")
+        print(f"✅ [SYNC-STAFF] {len(COIFFEURS)} coiffeurs chargés")
         return {"status": "ok", "coiffeurs": len(COIFFEURS)}
     except Exception as e:
         print(f"❌ [SYNC-STAFF] {e}")
