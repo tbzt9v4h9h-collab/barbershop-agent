@@ -2869,12 +2869,24 @@ async def sync_staff(request: Request):
                 continue
             nom = nom.strip().title()
 
-            # Jours de repos
-            _repos_raw = s.get("days_off") or s.get("jours_repos") or []
-            if isinstance(_repos_raw, str):
-                try: _repos_raw = json.loads(_repos_raw)
-                except Exception: _repos_raw = []
-            jours_repos = [j.strip().lower() for j in (_repos_raw or []) if j]
+            # Jours de repos = complément des jours travaillés sur les 7 jours
+            _TOUS_LES_JOURS = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
+            _working_raw = s.get("working_days") or s.get("jours_travailles") or []
+            if isinstance(_working_raw, str):
+                try: _working_raw = json.loads(_working_raw)
+                except Exception: _working_raw = []
+            if _working_raw:
+                # Base44 envoie les jours travaillés → calculer le complément
+                _working_norm = [j.strip().lower() for j in _working_raw if j]
+                jours_repos = [j for j in _TOUS_LES_JOURS if j not in _working_norm]
+                print(f"✅ [SYNC-STAFF] {nom} | working_days: {_working_norm} | repos calculés: {jours_repos}")
+            else:
+                # Fallback : champ days_off/jours_repos fourni directement
+                _repos_raw = s.get("days_off") or s.get("jours_repos") or []
+                if isinstance(_repos_raw, str):
+                    try: _repos_raw = json.loads(_repos_raw)
+                    except Exception: _repos_raw = []
+                jours_repos = [j.strip().lower() for j in (_repos_raw or []) if j]
 
             # Horaires individuels (fallback salon)
             heure_debut = s.get("work_start") or s.get("heure_debut") or HORAIRE_OUVERTURE
