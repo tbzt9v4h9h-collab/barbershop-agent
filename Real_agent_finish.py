@@ -2893,14 +2893,20 @@ async def sync_staff(request: Request):
             print(f"✅ [SYNC-STAFF] {nom} | spécialités: {specialites} | repos: {jours_repos} | horaires: {heure_debut}-{heure_fin}")
 
             try:
+                # days_off doit être une liste Python (pas une string JSON) pour Supabase array
+                _days_off_insert = jours_repos if isinstance(jours_repos, list) else []
+                # work_start / work_end doivent être des strings non-None
+                _work_start = str(heure_debut) if heure_debut else HORAIRE_OUVERTURE
+                _work_end   = str(heure_fin)   if heure_fin   else HORAIRE_FERMETURE
+                print(f"💾 [SYNC-STAFF] Insert | nom={nom} | days_off={_days_off_insert} | work_start={_work_start} | work_end={_work_end}")
                 supabase.table("employee").insert({
-                    "id":         str(uuid.uuid4()),
-                    "salon_id":   sid,
-                    "full_name":  nom,
+                    "id":          str(uuid.uuid4()),
+                    "salon_id":    sid,
+                    "full_name":   nom,
                     "specialties": s.get("specialties", ""),
-                    "days_off":   json.dumps(jours_repos),
-                    "work_start": heure_debut,
-                    "work_end":   heure_fin,
+                    "days_off":    _days_off_insert,
+                    "work_start":  _work_start,
+                    "work_end":    _work_end,
                 }).execute()
             except Exception as e:
                 print(f"⚠️ [SYNC-STAFF] Erreur insert : {e}")
