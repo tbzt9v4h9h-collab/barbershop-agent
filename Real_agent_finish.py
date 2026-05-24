@@ -1059,17 +1059,37 @@ print("🟢 [BOOT 8/8] Module chargé — uvicorn prêt à écouter sur $PORT")
 
 
 def annuler_rdv(client_id: str, rdv_id: str) -> bool:
-    """Annule un RDV en le marquant comme 'annule'."""
+    """
+    Annule un RDV par son rdv_id uniquement.
+    client_id ignoré — GPT peut passer un téléphone par erreur au lieu d'un UUID.
+    """
+    if not rdv_id:
+        print("❌ [ANNULATION] rdv_id manquant")
+        return False
+    ok = False
     try:
-        supabase.table("rendez_vous")\
+        # Table rendez_vous (RDVs agent)
+        res_rv = supabase.table("rendez_vous")\
             .update({"statut": "annule"})\
             .eq("id", rdv_id)\
-            .eq("client_id", client_id)\
             .execute()
-        return True
+        if res_rv.data:
+            ok = True
+            print(f"✅ [ANNULATION] rendez_vous id={rdv_id} annulé")
     except Exception as e:
-        print(f"Erreur Supabase annuler_rdv: {e}")
-        return False
+        print(f"⚠️ [ANNULATION] rendez_vous : {e}")
+    try:
+        # Table appointment (RDVs Base44)
+        res_ap = supabase.table("appointment")\
+            .update({"status": "cancelled"})\
+            .eq("id", rdv_id)\
+            .execute()
+        if res_ap.data:
+            ok = True
+            print(f"✅ [ANNULATION] appointment id={rdv_id} annulé")
+    except Exception as e:
+        print(f"⚠️ [ANNULATION] appointment : {e}")
+    return ok
 
 def _normaliser_specialites(raw) -> list:
     """Convertit specialites en liste de strings, quel que soit le format reçu."""
@@ -2194,26 +2214,52 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
         return "Disponibilité : libre"
 
     elif tool_name == "annuler_rdv":
-        client_id = tool_input.get("client_id")
-        rdv_id = tool_input.get("rdv_id")
+        # client_id ignoré — peut être un téléphone passé par erreur par GPT
+        rdv_id = tool_input.get("rdv_id") or tool_input.get("id") or ""
+        print(f"🗑️ [ANNULATION] rdv_id={rdv_id} tel={telephone} (client_id GPT ignoré)")
 
-        print(f"🗑️ [ANNULATION] client_id={client_id} rdv_id={rdv_id} tel={telephone}")
+        if not rdv_id:
+            return "Erreur : l'identifiant du rendez-vous est manquant. Impossible d'annuler."
 
-        if annuler_rdv(client_id, rdv_id):
+        if annuler_rdv(None, rdv_id):
+            # SMS de confirmation
             ctx = get_client_context(telephone)
-            prenom = ctx.get("prenom") or ctx.get("nom", "").split()[0] or ""
+            prenom = ctx.get("prenom") or ""
             salutation = f"Bonjour {prenom}," if prenom else "Bonjour,"
             message_annulation = (
-                f"{salutation} votre rendez-vous "
-                f"au {NOM_SALON} a bien été annulé. "
-                f"Pour reprendre un rendez-vous, "
-                f"appelez-nous au {TELEPHONE_SALON}. "
-                f"À bientôt !"
+                f"{salutation} votre rendez-vous au {NOM_SALON} "
+                f"a bien été annulé. À bientôt !"
             )
-            ok_sms, sid = send_sms(telephone, message_annulation)
-            print(f"📱 [ANNULATION] SMS envoyé : ok={ok_sms} sid={sid}")
+            ok_sms, _sid = send_sms(telephone, message_annulation)
+            print(f"📱 [ANNULATION] SMS envoyé : ok={ok_sms}")
+
+            # Webhook vers Base44 pour annuler dans le planning
+            import urllib.request as _urlreq_ann
+            if SALON_APP_WEBHOOK_URL and APP_SALON_ID:
+                try:
+                    _ann_payload = json.dumps({
+                        "action": "cancelled",
+                        "appointment_id": rdv_id,
+                        "app_salon_id": APP_SALON_ID,
+                    }).encode("utf-8")
+                    _ann_req = _urlreq_ann.Request(
+                        SALON_APP_WEBHOOK_URL,
+                        data=_ann_payload,
+                        headers={"Content-Type": "application/json", "Accept": "application/json"},
+                        method="POST",
+                    )
+                    with _urlreq_ann.urlopen(_ann_req, timeout=10) as _ar:
+                        print(f"📡 [WEBHOOK ANNULATION] status={_ar.status}")
+                except Exception as _we:
+                    print(f"⚠️ [WEBHOOK ANNULATION] Erreur : {_we}")
+
             return "RDV annulé avec succès. SMS de confirmation envoyé au client."
-        return "Erreur lors de l'annulation."
+
+        return (
+            "Je suis désolé, une erreur technique s'est produite. "
+            "Votre rendez-vous n'a pas été annulé. "
+            "Veuillez rappeler pour que nous puissions vous aider."
+        )
 
     elif tool_name == "get_rdv_client_actif":
         # telephone (paramètre du handler) = numéro réel de l'appelant (From Twilio)
