@@ -1512,6 +1512,7 @@ Si le client modifie une information déjà fournie (jour, heure, prestation, co
 
 ANNULATION RDV :
 1. get_rdv_client_actif → lister → confirmer → annuler_rdv → "Votre rendez-vous est annulé. Vous allez recevoir un SMS."
+IMPORTANT — numéro client : le numéro de téléphone de l'appelant est {telephone or "inconnu"}. Pour get_rdv_client_actif, passer TOUJOURS ce numéro ({telephone or "inconnu"}) et jamais le numéro du salon ({TELEPHONE_SALON}).
 
 CONSEILS :
 Appeler demander_rappel_conseil puis : "Je transmets votre demande, un membre vous rappellera rapidement au [numéro]."
@@ -2210,10 +2211,18 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
         return "Erreur lors de l'annulation."
 
     elif tool_name == "get_rdv_client_actif":
-        tel = tool_input.get("telephone") or telephone
+        # telephone (paramètre du handler) = numéro réel de l'appelant (From Twilio)
+        tel_gpt  = (tool_input.get("telephone") or "").strip()
+        tel_reel = telephone  # toujours le From Twilio — source de vérité
+        # Si GPT passe un numéro différent du numéro réel (ex: numéro salon), ignorer et utiliser le vrai
+        if tel_gpt and tel_gpt != tel_reel and tel_gpt != TELEPHONE_SALON:
+            tel = tel_gpt   # GPT a passé un numéro client valide différent → l'accepter
+        else:
+            tel = tel_reel  # GPT a passé le mauvais numéro (salon) ou rien → forcer le vrai
+        print(f"📋 [RDV ACTIF] tel_gpt={tel_gpt!r} | tel_reel={tel_reel!r} | utilise={tel!r}")
         client = get_or_create_client(tel)
         client_id = client.get("id")
-        print(f"📋 [RDV ACTIF] Recherche RDVs pour client_id={client_id} tel={tel}")
+        print(f"📋 [RDV ACTIF] Recherche RDVs pour client_id={client_id}")
         rdvs = get_rdv_client(client_id)
         if not rdvs:
             return "Aucun RDV à venir pour ce client."
