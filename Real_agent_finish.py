@@ -1510,8 +1510,13 @@ Si le client modifie une information déjà fournie (jour, heure, prestation, co
 → Ne jamais ignorer silencieusement le changement.
 → Ne jamais continuer sur l'ancienne valeur sans confirmation.
 
-ANNULATION RDV :
-1. get_rdv_client_actif → lister → confirmer → annuler_rdv → "Votre rendez-vous est annulé. Vous allez recevoir un SMS."
+ANNULATION RDV — ÉTAPES OBLIGATOIRES DANS L'ORDRE STRICT :
+1. Appeler get_rdv_client_actif avec telephone={telephone or "inconnu"} pour récupérer les RDVs du client.
+2. Présenter le RDV trouvé et demander confirmation EXPLICITE : "Votre rendez-vous pour [prestation] le [date] à [heure] est bien enregistré. Souhaitez-vous vraiment l'annuler ?"
+3. Attendre la réponse du client. NE PAS appeler annuler_rdv avant d'avoir reçu un "oui" explicite.
+4. Si client confirme (oui / je confirme / oui annuler) → appeler annuler_rdv avec l'ID du RDV.
+5. Confirmer : "Votre rendez-vous est annulé. Vous allez recevoir un SMS de confirmation."
+RÈGLE ABSOLUE : Ne jamais dire "je procède à l'annulation" sans avoir appelé le tool annuler_rdv. L'annulation n'est effective que si le tool retourne un succès.
 IMPORTANT — numéro client : le numéro de téléphone de l'appelant est {telephone or "inconnu"}. Pour get_rdv_client_actif, passer TOUJOURS ce numéro ({telephone or "inconnu"}) et jamais le numéro du salon ({TELEPHONE_SALON}).
 
 CONSEILS :
@@ -3575,6 +3580,10 @@ def handle_appel(
     question_prestation = any(k in _resp_lower for k in [
         "quelle prestation", "quel service", "que souhaitez-vous", "souhaitez-vous comme"
     ])
+    question_annulation = any(k in _resp_lower for k in [
+        "souhaitez-vous vraiment", "voulez-vous annuler", "confirmer l'annulation",
+        "annuler votre rendez-vous", "bien annuler",
+    ])
 
     hints_extra = []
     if question_shampoing:
@@ -3587,12 +3596,14 @@ def handle_appel(
         prest_hints = ", ".join(p.get("name", "") for p in PRESTATIONS_SALON if p.get("name"))
         if prest_hints:
             hints_extra.append(prest_hints)
+    if question_annulation:
+        hints_extra.append("oui, non, confirmer, annuler, oui confirmer, non garder, oui je confirme")
 
     hints_gather = HINTS + (", " + ", ".join(hints_extra) if hints_extra else "")
 
     _gather_ctx = (
         f"shampoing={question_shampoing} heure={question_heure} "
-        f"jour={question_jour} prestation={question_prestation}"
+        f"jour={question_jour} prestation={question_prestation} annulation={question_annulation}"
     )
     print(f"📡 [GATHER] main | action=/appel POST | speech_timeout=auto timeout=12 | {_gather_ctx} | hints_len={len(hints_gather)}c")
 
