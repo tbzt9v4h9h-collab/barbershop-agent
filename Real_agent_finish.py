@@ -277,6 +277,10 @@ async def startup_event():
         print(f"✅ [STARTUP] Salon={NOM_SALON} | Coiffeurs={len(COIFFEURS)} | Prestations={len(PRESTATIONS_SALON)}")
     except Exception as _e:
         print(f"⚠️ [STARTUP] load_all_salon_data : {_e}")
+    if SALON_APP_WEBHOOK_URL or APP_SALON_ID or NOM_SALON != "le salon":
+        print(f"✅ [BOOT CONFIG] NOM_SALON={NOM_SALON!r} | WEBHOOK_URL={SALON_APP_WEBHOOK_URL!r} | APP_SALON_ID={APP_SALON_ID!r}")
+    else:
+        print("⚠️ [BOOT CONFIG] Aucune config sauvegardée — sync requise via /update-config")
 
 END_CALL_MESSAGE = "Merci pour votre appel. Bonne journée et à bientôt au salon."
 
@@ -446,6 +450,7 @@ def load_all_salon_data():
     global NOM_SALON, TELEPHONE_SALON, ADRESSE_SALON
     global HORAIRE_OUVERTURE, HORAIRE_FERMETURE, JOURS_OUVERTS
     global TWILIO_NUMBER, _session_salon_id, SALON_DATA_CACHED_AT
+    global SALON_APP_WEBHOOK_URL, APP_SALON_ID
 
     maintenant = now_paris()
     if SALON_DATA_CACHED_AT and \
@@ -483,10 +488,14 @@ def load_all_salon_data():
                     JOURS_OUVERTS = jours
             except Exception:
                 pass
+        if s.get("webhook_url"):  SALON_APP_WEBHOOK_URL = s["webhook_url"]
+        if s.get("app_salon_id"): APP_SALON_ID = s["app_salon_id"]
 
         print(f"✅ [LOAD] Salon : {NOM_SALON} | "
               f"{HORAIRE_OUVERTURE}-{HORAIRE_FERMETURE} | "
-              f"Jours : {JOURS_OUVERTS}")
+              f"Jours : {JOURS_OUVERTS} | "
+              f"webhook={'✅' if SALON_APP_WEBHOOK_URL else '—'} | "
+              f"app_salon_id={'✅' if APP_SALON_ID else '—'}")
 
         # 2. Charger les coiffeurs depuis table "employee"
         staff_result = supabase.table("employee")\
@@ -702,6 +711,7 @@ def enregistrer_rdv(client_id, jour, heure, type_client,
                 heure=heure,
                 rdv_id=rdv_id,
                 client_id=client_id,
+                coiffeur=coupe_detail or None,
             )
         return rdv_id
 
@@ -898,17 +908,52 @@ def save_rappel_sms(rdv_id: str | None, client_id: str | None,
 
 def send_sms_confirmation(telephone: str, client_nom: str | None,
                           prestation: str, jour: str, heure: str,
-                          rdv_id: str | None, client_id: str | None):
+                          rdv_id: str | None, client_id: str | None,
+                          coiffeur: str | None = None):
     """Envoie le SMS de confirmation immédiatement après enregistrement du RDV."""
-    prenom = (client_nom or "").split()[0] if client_nom else "vous"
-    date_str = _format_date_sms(jour)
-    # Heure sans secondes
-    heure_str = heure[:5] if heure else heure
-    message = (
-        f"Bonjour {prenom} ! Votre RDV est confirmé au {NOM_SALON} : "
-        f"{prestation} le {date_str} à {heure_str}. "
-        f"Pour annuler, appelez le {TELEPHONE_SALON}. À bientôt !"
-    )
+    try:
+        prenom = (client_nom or "").split()[0] if client_nom else ""
+        salut = f"Bonjour {prenom} !" if prenom else "Bonjour !"
+        # Date — jour de la semaine capitalisé + jour mois année
+        try:
+            _d = datetime.strptime(jour, "%Y-%m-%d").date()
+            _jour_sem = NOMS_JOURS_SMS[_d.weekday()].capitalize()
+            date_str = f"{_jour_sem} {_d.day} {NOMS_MOIS_SMS[_d.month - 1]} {_d.year}"
+        except Exception:
+            date_str = jour
+        # Heure — normaliser vers HHhMM
+        try:
+            _hp = (heure or "").split(":")
+            heure_str = f"{int(_hp[0])}h{_hp[1]}" if len(_hp) >= 2 else heure or ""
+        except Exception:
+            heure_str = heure or ""
+        # Lignes du corps
+        lignes = [
+            salut,
+            "",
+            f"Votre rendez-vous est confirmé chez {NOM_SALON} :",
+            "",
+            f"📅 {date_str}",
+            f"🕐 {heure_str}",
+            f"✂️ {prestation}",
+        ]
+        if coiffeur:
+            lignes.append(f"💈 Avec {coiffeur}")
+        lignes += [
+            "",
+            f"Pour annuler, rappelez-nous au {TELEPHONE_SALON}.",
+            "",
+            f"L'équipe {NOM_SALON} — Propulsé par S&B",
+        ]
+        message = "\n".join(lignes)
+    except Exception as _e_conf:
+        print(f"❌ [SMS] Erreur construction confirmation : {_e_conf} → fallback utilisé")
+        _prenom_fb = (client_nom or "").split()[0] if client_nom else "vous"
+        message = (
+            f"Bonjour {_prenom_fb} ! Votre RDV est confirmé au {NOM_SALON} : "
+            f"{prestation} le {_format_date_sms(jour)} à {(heure or '')[:5]}. "
+            f"Pour annuler, appelez le {TELEPHONE_SALON}. À bientôt !"
+        )
     ok, sid = send_sms(telephone, message)
     save_rappel_sms(rdv_id, client_id, telephone, message,
                     "envoye" if ok else "echec", twilio_sid=sid)
@@ -1447,7 +1492,8 @@ def build_system_prompt(telephone: str = None) -> str:
         _d_iter += timedelta(days=1)
     _dates_ref = " | ".join(_dates_prochains)
 
-    prompt = f"""Tu es la réceptionniste vocale professionnelle du salon {NOM_SALON}.
+    prompt = f"""Réponds TOUJOURS en maximum 2 phrases courtes. Jamais plus.
+Tu es la réceptionniste vocale professionnelle du salon {NOM_SALON}.
 Aujourd'hui : {date_str} à {heure_actuelle}. Date ISO : {aujourd_hui.isoformat()}.
 PROCHAINS JOURS OUVERTS — utilise UNIQUEMENT ces dates dans les tools, ne calcule jamais toi-même :
 {_dates_ref}.
@@ -1455,8 +1501,6 @@ RÈGLE : si le client dit "mardi prochain" ou "le 20", retrouve la date correspo
 Horaires : {HORAIRE_OUVERTURE}-{HORAIRE_FERMETURE}, {', '.join([j.capitalize() for j in JOURS_OUVERTS])}.
 Adresse : {ADRESSE_SALON} | Tél : {TELEPHONE_SALON}
 {shampoing_info}{rdv_context_block}
-RÈGLE N°1 ABSOLUE ET NON NÉGOCIABLE : À CHAQUE FOIS QUE LE CLIENT MENTIONNE UN JOUR OU UNE HEURE, TU DOIS OBLIGATOIREMENT APPELER verifier_disponibilite AVANT DE RÉPONDRE QUOI QUE CE SOIT. JAMAIS DE CONFIRMATION SANS CE TOOL.
-
 RÈGLE ABSOLUE PRIORITAIRE :
 Tu te concentres EXCLUSIVEMENT sur la prise de rendez-vous. Si le client parle d'autre chose, réponds uniquement : "Je suis uniquement disponible pour la prise de rendez-vous. Souhaitez-vous prendre un rendez-vous ?" Ignorer tout bruit de fond, mot isolé, ou phrase non liée à une réservation.
 
@@ -1502,23 +1546,38 @@ Si le client dit "je veux un rendez-vous", "prendre un RDV", "j'aimerais venir" 
 → JAMAIS demander le jour ou l'heure avant d'avoir la prestation.
 → JAMAIS dire "oui, pour quand ?" ou "très bien, quel jour ?" sans avoir la prestation.
 
-RÈGLE ABSOLUE — VÉRIFICATION DISPONIBILITÉ :
-Tu DOIS appeler verifier_disponibilite dès que le client donne un jour ET une heure.
-Ne jamais répondre "très bien" ou confirmer un créneau sans avoir appelé ce tool.
-Même si tu penses connaître la disponibilité, tu DOIS appeler le tool.
-Quand tu appelles verifier_disponibilite, transmets aussi le champ "jour_semaine" si le client a mentionné un nom de jour (ex: "jeudi"), pour permettre la détection d'incohérence entre le nom du jour et la date ISO.
+⚠️ RÈGLE ABSOLUE N°1 — INTERDICTION PHRASES D'ATTENTE :
+Il est STRICTEMENT INTERDIT de dire "je vais vérifier", "je vérifie", "un instant", "laissez-moi vérifier", "je consulte", "je regarde", "permettez-moi" ou toute formule similaire.
+Ces phrases sont INTERDITES. À la place, appelle IMMÉDIATEMENT le tool verifier_disponibilite sans rien dire.
+Si tu as prestation + jour + heure → appelle verifier_disponibilite TOUT DE SUITE. Pas de texte intermédiaire.
+
+⚠️ RÈGLE ABSOLUE N°2 — VÉRIFICATION DISPONIBILITÉ IMMÉDIATE :
+Dès que prestation + jour + heure sont tous les trois connus (même si fournis dans des messages séparés) → appelle verifier_disponibilite IMMÉDIATEMENT dans ta prochaine action.
+Ne jamais passer à l'étape shampoing, coiffeur ou prénom sans avoir d'abord appelé verifier_disponibilite.
+Ne jamais confirmer ni récapituler sans avoir appelé verifier_disponibilite.
+
+⚠️ RÈGLE ABSOLUE N°3 — PRENDRE_RDV INTERDIT SANS VÉRIFICATION :
+Ne jamais appeler prendre_rdv sans avoir appelé verifier_disponibilite juste avant dans cet appel.
+L'ordre est immuable : verifier_disponibilite → (shampoing/coiffeur/prénom) → prendre_rdv.
+
+⚠️ RÈGLE ABSOLUE N°4 — JAMAIS INVENTER L'HEURE :
+Ne jamais supposer, inventer ni proposer une heure. Si l'heure n'est pas donnée par le client :
+→ Demander OBLIGATOIREMENT : "À quelle heure souhaitez-vous venir ?"
+→ Attendre sa réponse. Ne jamais appeler verifier_disponibilite sans l'heure donnée par le client.
 
 FLOW PRISE DE RDV — ORDRE STRICT ET OBLIGATOIRE :
 Étape 1 — PRESTATION : "Quelle prestation souhaitez-vous ?" (TOUJOURS en premier)
-Étape 2 — JOUR ET HEURE : une fois la prestation connue uniquement
-Étape 3 — VÉRIFICATION : appeler verifier_disponibilite (obligatoire)
-  3b. Prestation indispo → redemander UNIQUEMENT la prestation. Conserver jour, heure, coiffeur, shampoing déjà donnés.
-Étape 4 — SHAMPOING : demander une seule fois si non encore répondu
-Étape 5 — COIFFEUR : préférence si plusieurs coiffeurs compétents (voir section COIFFEUR)
-Étape 6 — PRÉNOM : demander en dernier si non connu
-Étape 7 — RÉCAPITULATIF : "Je récapitule : [prestation] le [jour] à [heure] avec [coiffeur]. C'est bien cela ?"
-Étape 8 — CONFIRMATION : appeler prendre_rdv → "Votre rendez-vous est confirmé. Vous allez recevoir un SMS."
+Étape 2 — JOUR : une fois la prestation connue uniquement. "Pour quel jour souhaitez-vous ?"
+Étape 3 — HEURE : une fois le jour connu. "À quelle heure souhaitez-vous venir ?" — TOUJOURS demander, JAMAIS inventer.
+Étape 4 — appeler verifier_disponibilite (OBLIGATOIRE, IMMÉDIAT, dès que prestation+jour+heure sont connus)
+  4b. Prestation indispo → redemander UNIQUEMENT la prestation. Conserver jour, heure, coiffeur, shampoing déjà donnés.
+Étape 5 — SHAMPOING : demander une seule fois si non encore répondu
+Étape 6 — COIFFEUR : préférence si plusieurs coiffeurs compétents (voir section COIFFEUR)
+Étape 7 — PRÉNOM : demander en dernier si non connu
+Étape 8 — RÉCAPITULATIF : "Je récapitule : [prestation] le [jour] à [heure] avec [coiffeur]. C'est bien cela ?"
+Étape 9 — CONFIRMATION : appeler prendre_rdv → "Votre rendez-vous est confirmé. Vous allez recevoir un SMS."
 NE JAMAIS SAUTER UNE ÉTAPE. NE JAMAIS REVENIR EN ARRIÈRE POUR REDEMANDER UN ÉLÉMENT DÉJÀ ACQUIS.
+Quand tu appelles verifier_disponibilite, transmets aussi le champ "jour_semaine" si le client a mentionné un nom de jour (ex: "jeudi").
 
 MESSAGES D'ATTENTE — RÈGLE CRITIQUE :
 Lorsque tu appelles un outil (verifier_disponibilite, prendre_rdv, etc.), NE PAS écrire de texte d'attente dans ta réponse. Le système injecte automatiquement un message d'attente avant ton résultat. Si tu écris aussi un message d'attente, il sera dit EN DOUBLE.
@@ -1941,6 +2000,7 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
                 "heure": _heure_wh,
                 "coiffeur": coiffeur_choisi or "",
                 "avec_shampoing": avec_shampoing,
+                "source": "agent",
             }
             _payload_bytes = json.dumps(_payload_dict).encode("utf-8")
             print(f"📡 [WEBHOOK] PAYLOAD | {json.dumps(_payload_dict)}")
@@ -2221,37 +2281,175 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
         if not rdv_id:
             return "Erreur : l'identifiant du rendez-vous est manquant. Impossible d'annuler."
 
+        # ── Récupérer les détails du RDV AVANT annulation ─────────────────────
+        _rdv_prestation   = ""
+        _rdv_date_lisible = ""
+        _rdv_heure_lisible = ""
+        _rdv_coiffeur     = ""
+        _rdv_client_name  = ""
+        try:
+            _r = supabase.table("appointment")\
+                .select("service,date,time,staff_name,client_name")\
+                .eq("id", rdv_id).execute()
+            if _r.data:
+                _d = _r.data[0]
+                _rdv_prestation  = (_d.get("service") or "").strip()
+                _rdv_coiffeur    = (_d.get("staff_name") or "").strip()
+                _rdv_client_name = (_d.get("client_name") or "").strip()
+                _date_iso = (_d.get("date") or "").strip()
+                if _date_iso:
+                    try:
+                        _dt = datetime.strptime(_date_iso, "%Y-%m-%d").date()
+                        _rdv_date_lisible = f"{NOMS_JOURS_SMS[_dt.weekday()].capitalize()} {_dt.day} {NOMS_MOIS_SMS[_dt.month - 1]} {_dt.year}"
+                    except Exception:
+                        _rdv_date_lisible = _date_iso
+                _time_raw = (_d.get("time") or "").strip()
+                if _time_raw:
+                    try:
+                        _parts = _time_raw.split(":")
+                        _h, _m = int(_parts[0]), _parts[1]
+                        _rdv_heure_lisible = f"{_h}h{_m}"
+                    except Exception:
+                        _rdv_heure_lisible = _time_raw
+        except Exception as _e:
+            print(f"⚠️ [ANNULATION] Impossible de récupérer détails appointment : {_e}")
+
+        # Fallback sur rendez_vous si appointment vide
+        if not _rdv_date_lisible:
+            try:
+                _r2 = supabase.table("rendez_vous")\
+                    .select("prestation,jour,heure_debut,coupe_detail")\
+                    .eq("id", rdv_id).execute()
+                if _r2.data:
+                    _d2 = _r2.data[0]
+                    if not _rdv_prestation:
+                        _rdv_prestation = (_d2.get("prestation") or "").strip()
+                    if not _rdv_coiffeur:
+                        _rdv_coiffeur = (_d2.get("coupe_detail") or "").strip()
+                    _date_iso2 = (_d2.get("jour") or "").strip()
+                    if _date_iso2:
+                        try:
+                            _dt2 = datetime.strptime(_date_iso2, "%Y-%m-%d").date()
+                            _rdv_date_lisible = f"{NOMS_JOURS_SMS[_dt2.weekday()].capitalize()} {_dt2.day} {NOMS_MOIS_SMS[_dt2.month - 1]} {_dt2.year}"
+                        except Exception:
+                            _rdv_date_lisible = _date_iso2
+                    _heure_raw2 = (_d2.get("heure_debut") or "").strip()
+                    if _heure_raw2 and not _rdv_heure_lisible:
+                        try:
+                            _parts2 = _heure_raw2.split(":")
+                            _h2, _m2 = int(_parts2[0]), _parts2[1]
+                            _rdv_heure_lisible = f"{_h2}h{_m2}"
+                        except Exception:
+                            _rdv_heure_lisible = _heure_raw2
+            except Exception as _e2:
+                print(f"⚠️ [ANNULATION] Impossible de récupérer détails rendez_vous : {_e2}")
+
+        print(f"🗑️ [ANNULATION] détails récupérés : date={_rdv_date_lisible!r} heure={_rdv_heure_lisible!r} prestation={_rdv_prestation!r} coiffeur={_rdv_coiffeur!r}")
+
         if annuler_rdv(None, rdv_id):
-            # SMS de confirmation
+            # ── Construction SMS annulation complet ───────────────────────────
             ctx = get_client_context(telephone)
-            prenom = ctx.get("prenom") or ""
-            salutation = f"Bonjour {prenom}," if prenom else "Bonjour,"
-            message_annulation = (
-                f"{salutation} votre rendez-vous au {NOM_SALON} "
-                f"a bien été annulé. À bientôt !"
+            # Prénom : contexte session en priorité, puis client_name du RDV
+            _prenom_ann = ctx.get("prenom") or ""
+            if not _prenom_ann and _rdv_client_name:
+                _prenom_ann = _rdv_client_name.split()[0]
+
+            # Fallbacks champs optionnels
+            _prest_affichee  = _rdv_prestation or "votre prestation"
+            _date_affichee   = _rdv_date_lisible or ""
+            _heure_affichee  = _rdv_heure_lisible or ""
+
+            print(
+                f"📱 [SMS ANNULATION] Prénom={_prenom_ann!r} | prestation={_prest_affichee!r} "
+                f"| jour={_date_affichee!r} | heure={_heure_affichee!r} "
+                f"| coiffeur={_rdv_coiffeur!r} | tel={telephone}"
             )
+
+            try:
+                _salut = f"Bonjour {_prenom_ann}," if _prenom_ann else "Bonjour,"
+
+                # Ligne "votre rendez-vous du ... à ... chez ... pour ... avec ..."
+                if _date_affichee and _heure_affichee:
+                    _ligne_rdv = (
+                        f"Votre rendez-vous du {_date_affichee} à {_heure_affichee} "
+                        f"chez {NOM_SALON} pour {_prest_affichee}"
+                    )
+                    if _rdv_coiffeur:
+                        _ligne_rdv += f" avec {_rdv_coiffeur}"
+                    _ligne_rdv += " a bien été annulé."
+                else:
+                    _ligne_rdv = f"Votre rendez-vous chez {NOM_SALON} a bien été annulé."
+
+                message_annulation = (
+                    f"{_salut}\n\n"
+                    f"{_ligne_rdv}\n\n"
+                    f"Pour reprendre rendez-vous, appelez-nous au {TELEPHONE_SALON}.\n\n"
+                    f"L'équipe {NOM_SALON} — Propulsé par S&B"
+                )
+            except Exception as _e_sms:
+                print(f"❌ [SMS ANNULATION] Erreur construction : {_e_sms} → fallback utilisé")
+                _salut_fb = f"Bonjour {_prenom_ann}," if _prenom_ann else "Bonjour,"
+                message_annulation = (
+                    f"{_salut_fb} votre rendez-vous chez {NOM_SALON} a bien été annulé. "
+                    f"Nous espérons vous revoir très prochainement. "
+                    f"L'équipe {NOM_SALON} — Propulsé par S&B"
+                )
+
             ok_sms, _sid = send_sms(telephone, message_annulation)
             print(f"📱 [ANNULATION] SMS envoyé : ok={ok_sms}")
 
-            # Webhook vers Base44 pour annuler dans le planning
+            # ── Webhook vers Base44 (annulation) ─────────────────────────────
             import urllib.request as _urlreq_ann
-            if SALON_APP_WEBHOOK_URL and APP_SALON_ID:
-                try:
-                    _ann_payload = json.dumps({
-                        "action": "cancelled",
-                        "appointment_id": rdv_id,
-                        "app_salon_id": APP_SALON_ID,
-                    }).encode("utf-8")
+            import time as _time_ann
+            if not SALON_APP_WEBHOOK_URL:
+                print("❌ [WEBHOOK ANNULATION] URL VIDE — sync impossible (configurer webhook_url via /update-config)")
+            elif not APP_SALON_ID:
+                print("❌ [WEBHOOK ANNULATION] APP_SALON_ID VIDE — sync impossible (configurer app_salon_id via /update-config)")
+            else:
+                print(f"📡 [WEBHOOK ANNULATION] DÉBUT | url={SALON_APP_WEBHOOK_URL} | rdv_id={rdv_id}")
+                _ann_payload_dict = {
+                    "action": "cancelled",
+                    "appointment_id": rdv_id,
+                    "app_salon_id": APP_SALON_ID,
+                    "source": "agent",
+                }
+                _ann_payload_bytes = json.dumps(_ann_payload_dict).encode("utf-8")
+                print(f"📡 [WEBHOOK ANNULATION] PAYLOAD | {json.dumps(_ann_payload_dict)}")
+
+                def _do_ann_webhook_post():
                     _ann_req = _urlreq_ann.Request(
                         SALON_APP_WEBHOOK_URL,
-                        data=_ann_payload,
+                        data=_ann_payload_bytes,
                         headers={"Content-Type": "application/json", "Accept": "application/json"},
                         method="POST",
                     )
                     with _urlreq_ann.urlopen(_ann_req, timeout=10) as _ar:
-                        print(f"📡 [WEBHOOK ANNULATION] status={_ar.status}")
-                except Exception as _we:
-                    print(f"⚠️ [WEBHOOK ANNULATION] Erreur : {_we}")
+                        _ar_body = _ar.read().decode("utf-8", errors="replace")[:200]
+                        print(f"📡 [WEBHOOK ANNULATION] RÉPONSE | status={_ar.status} | body={_ar_body!r}")
+                        return _ar.status
+
+                _ann_ok = False
+                try:
+                    _sa1 = _do_ann_webhook_post()
+                    _ann_ok = (_sa1 == 200)
+                    if not _ann_ok:
+                        print(f"⚠️ [WEBHOOK ANNULATION] Tentative 1 — status inattendu : {_sa1}")
+                except Exception as _we1:
+                    print(f"❌ [WEBHOOK ANNULATION] ERREUR | message={_we1}")
+
+                if not _ann_ok:
+                    print("🔄 [WEBHOOK ANNULATION] Retry dans 2s…")
+                    _time_ann.sleep(2)
+                    try:
+                        _sa2 = _do_ann_webhook_post()
+                        _ann_ok = (_sa2 == 200)
+                        if not _ann_ok:
+                            print(f"⚠️ [WEBHOOK ANNULATION] Tentative 2 — status inattendu : {_sa2}")
+                    except Exception as _we2:
+                        print(f"❌ [WEBHOOK ANNULATION] ERREUR | message={_we2}")
+
+                if not _ann_ok:
+                    print(f"❌ [WEBHOOK ANNULATION] ÉCHEC DÉFINITIF — RDV {rdv_id} non synchronisé avec Base44")
 
             return "RDV annulé avec succès. SMS de confirmation envoyé au client."
 
@@ -2462,6 +2660,19 @@ def detecter_humeur(message: str) -> str:
 # ====================================================
 # AGENT PRINCIPAL AVEC GPT-4o OPTIMISÉ
 # ====================================================
+def appeler_verifier_disponibilite(prestation: str, jour: str, heure: str, telephone: str, coiffeur: str = "") -> str:
+    """
+    C5 — Appel direct à verifier_disponibilite sans passer par GPT.
+    Utilisé en fallback quand GPT refuse d'appeler le tool ou produit une réponse texte vide/invalide.
+    """
+    print(f"✅ [DISPO APPELÉE] direct Python | prestation={prestation!r} | jour={jour!r} | heure={heure!r} | coiffeur={coiffeur!r}")
+    return process_tool_call(
+        "verifier_disponibilite",
+        {"prestation": prestation, "jour": jour, "heure": heure, "coiffeur": coiffeur or ""},
+        telephone,
+    )
+
+
 def run_agent(message_user: str, telephone: str) -> str:
     """
     Exécute l'agent GPT-4o avec function calling (OPTIMISÉ)
@@ -2481,6 +2692,59 @@ def run_agent(message_user: str, telephone: str) -> str:
 
     # Ajouter le message utilisateur à l'historique
     add_to_history(telephone, "user", message_user)
+
+    # ── C4 — Scan historique complet pour reconstruire le contexte RDV ──────────
+    # Scanner TOUS les messages client de l'historique pour extraire prestation/jour/heure/coiffeur
+    # même si la session a été interrompue ou si GPT n'a pas appelé verifier_disponibilite
+    _ctx_scan = get_client_context(telephone)
+    _hist_full = get_conversation_history(telephone)
+    _all_user_text = " ".join(
+        m.get("content", "") for m in _hist_full if m.get("role") == "user"
+    ).lower()
+
+    # Prestation depuis historique
+    if not _ctx_scan.get("rdv_prestation") and PRESTATIONS_SALON:
+        for _p_scan in PRESTATIONS_SALON:
+            _nom_scan = (_p_scan.get("name") or "").lower().strip()
+            if _nom_scan and _nom_scan in _all_user_text:
+                update_client_context(telephone, rdv_prestation=_p_scan["name"])
+                break
+
+    # Heure depuis historique : "14h", "14h30", "14:00"
+    if not _ctx_scan.get("rdv_heure"):
+        _m_h_scan = re.search(r'\b(\d{1,2})h(\d{2})?\b|\b(\d{1,2}):(\d{2})\b', _all_user_text)
+        if _m_h_scan:
+            if _m_h_scan.group(1) is not None:
+                _hh_s, _mm_s = int(_m_h_scan.group(1)), _m_h_scan.group(2) or "00"
+            else:
+                _hh_s, _mm_s = int(_m_h_scan.group(3)), _m_h_scan.group(4)
+            update_client_context(telephone, rdv_heure=f"{_hh_s:02d}:{_mm_s}")
+
+    # Jour depuis historique
+    if not _ctx_scan.get("rdv_jour"):
+        _today_scan = now_paris().date()
+        _noms_j_scan = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
+        if "demain" in _all_user_text:
+            update_client_context(telephone, rdv_jour=(_today_scan + timedelta(days=1)).isoformat())
+        elif "aujourd" in _all_user_text:
+            update_client_context(telephone, rdv_jour=_today_scan.isoformat())
+        else:
+            for _idx_scan, _nom_j_scan in enumerate(_noms_j_scan):
+                if _nom_j_scan in _all_user_text:
+                    _delta_scan = (_idx_scan - _today_scan.weekday()) % 7 or 7
+                    update_client_context(telephone, rdv_jour=(_today_scan + timedelta(days=_delta_scan)).isoformat())
+                    break
+
+    # Coiffeur depuis historique
+    if not _ctx_scan.get("rdv_coiffeur") and COIFFEURS:
+        for _c_scan in COIFFEURS:
+            _nc = (_c_scan.get("nom") or "").lower()
+            if _nc and _nc in _all_user_text:
+                update_client_context(telephone, rdv_coiffeur=_c_scan["nom"])
+                break
+
+    _ctx_after_scan = get_client_context(telephone)
+    print(f"📋 [SCAN HISTORIQUE] prestation={_ctx_after_scan.get('rdv_prestation') or '—'} | jour={_ctx_after_scan.get('rdv_jour') or '—'} | heure={_ctx_after_scan.get('rdv_heure') or '—'} | coiffeur={_ctx_after_scan.get('rdv_coiffeur') or '—'}")
 
     # Détection humeur
     humeur = detecter_humeur(message_user)
@@ -2509,6 +2773,62 @@ def run_agent(message_user: str, telephone: str) -> str:
         if prenom_candidat.isalpha():
             update_client_context(telephone, prenom=prenom_candidat)
 
+    # ── PROBLÈME 1 : Extraction immédiate des infos RDV depuis le message client ──
+    # Sauvegarder prestation/jour/heure/coiffeur dans le contexte AVANT d'appeler GPT,
+    # pour que le system prompt les affiche déjà et que GPT ne les oublie pas.
+    _msg_rdv_lower = message_user.lower()
+    _ctx_rdv_pre = get_client_context(telephone)  # référence directe, toujours à jour
+
+    # Prestation
+    if not _ctx_rdv_pre.get("rdv_prestation") and PRESTATIONS_SALON:
+        for _p_rdv in PRESTATIONS_SALON:
+            _nom_p_rdv = (_p_rdv.get("name") or "").lower().strip()
+            if _nom_p_rdv and _nom_p_rdv in _msg_rdv_lower:
+                update_client_context(telephone, rdv_prestation=_p_rdv["name"])
+                print(f"📋 [CONTEXTE RDV] prestation extraite du message : {_p_rdv['name']!r}")
+                break
+
+    # Heure : "14h", "14h30" → HH:MM
+    if not _ctx_rdv_pre.get("rdv_heure"):
+        _m_h = re.search(r'\b(\d{1,2})h(\d{2})?\b', _msg_rdv_lower)
+        if _m_h:
+            _hh = int(_m_h.group(1))
+            _mm = _m_h.group(2) or "00"
+            _heure_extracted = f"{_hh:02d}:{_mm}"
+            update_client_context(telephone, rdv_heure=_heure_extracted)
+            print(f"📋 [CONTEXTE RDV] heure extraite du message : {_heure_extracted!r}")
+
+    # Jour : noms de jours ou "demain" → prochaine date ISO (Europe/Paris)
+    if not _ctx_rdv_pre.get("rdv_jour"):
+        _today_rdv = now_paris().date()
+        _noms_j_extr = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
+        if "demain" in _msg_rdv_lower:
+            _jour_iso = (_today_rdv + timedelta(days=1)).isoformat()
+            update_client_context(telephone, rdv_jour=_jour_iso)
+            print(f"📋 [CONTEXTE RDV] jour extrait du message : demain → {_jour_iso}")
+        elif "aujourd" in _msg_rdv_lower:
+            update_client_context(telephone, rdv_jour=_today_rdv.isoformat())
+            print(f"📋 [CONTEXTE RDV] jour extrait du message : aujourd'hui → {_today_rdv.isoformat()}")
+        else:
+            for _idx_j, _nom_j in enumerate(_noms_j_extr):
+                if _nom_j in _msg_rdv_lower:
+                    _delta_j = (_idx_j - _today_rdv.weekday()) % 7
+                    if _delta_j == 0:
+                        _delta_j = 7  # même nom de jour mais semaine prochaine
+                    _jour_iso = (_today_rdv + timedelta(days=_delta_j)).isoformat()
+                    update_client_context(telephone, rdv_jour=_jour_iso)
+                    print(f"📋 [CONTEXTE RDV] jour extrait du message : {_nom_j} → {_jour_iso}")
+                    break
+
+    # Coiffeur
+    if not _ctx_rdv_pre.get("rdv_coiffeur") and COIFFEURS:
+        for _c_rdv in COIFFEURS:
+            _nom_c_rdv = (_c_rdv.get("nom") or "").lower()
+            if _nom_c_rdv and _nom_c_rdv in _msg_rdv_lower:
+                update_client_context(telephone, rdv_coiffeur=_c_rdv["nom"])
+                print(f"📋 [CONTEXTE RDV] coiffeur extrait du message : {_c_rdv['nom']!r}")
+                break
+
     # Construire le system prompt (avec langue si anglais détecté)
     sys_prompt = build_system_prompt(telephone)
     if est_anglais:
@@ -2526,32 +2846,54 @@ def run_agent(message_user: str, telephone: str) -> str:
     # CORRECTION BUG 1 : Nettoyer l'historique des messages orphelins
     messages = clean_messages(messages)
 
-    # Détecter si l'historique contient un jour ET une heure non encore vérifiés
-    # → forcer tool_choice="required" pour que GPT appelle obligatoirement un tool
+    # ── C2 — Forcer verifier_disponibilite spécifiquement quand contexte complet ──
     _hist_text = " ".join(
         str(m.get("content", "")) for m in get_conversation_history(telephone)
     ).lower()
-    _jour_detecte = any(j in _hist_text for j in
-                        ["lundi", "mardi", "mercredi", "jeudi", "vendredi",
-                         "samedi", "dimanche", "demain", "aujourd", "prochain"])
-    _heure_detectee = bool(re.search(r'\b\d{1,2}h\d{0,2}\b|\d{1,2}:\d{2}', _hist_text))
     _dispos_deja_verif = "disponibilit" in _hist_text or "libre" in _hist_text or "occupé" in _hist_text
-    _force_tool = _jour_detecte and _heure_detectee and not _dispos_deja_verif
-    _tool_choice = "required" if _force_tool else "auto"
+    _ctx_force = get_client_context(telephone)
+    _rdv_p  = _ctx_force.get("rdv_prestation", "")
+    _rdv_j  = _ctx_force.get("rdv_jour", "")
+    _rdv_h  = _ctx_force.get("rdv_heure", "")
+    _ctx_has_all = bool(_rdv_p and _rdv_j and _rdv_h)
+
+    # Fallback : détection dans le texte de l'historique
+    _jour_detecte  = any(j in _hist_text for j in
+                         ["lundi", "mardi", "mercredi", "jeudi", "vendredi",
+                          "samedi", "dimanche", "demain", "aujourd", "prochain"])
+    _heure_detectee = bool(re.search(r'\b\d{1,2}h\d{0,2}\b|\d{1,2}:\d{2}', _hist_text))
+
+    if _ctx_has_all and not _dispos_deja_verif:
+        # Forcer SPÉCIFIQUEMENT verifier_disponibilite — GPT ne peut PAS répondre en texte
+        _tool_choice = {"type": "function", "function": {"name": "verifier_disponibilite"}}
+        print(f"🔧 [FORCE TOOL] prestation={_rdv_p!r} jour={_rdv_j!r} heure={_rdv_h!r} → tool_choice=verifier_disponibilite")
+    elif _rdv_p and not _rdv_j:
+        _tool_choice = "auto"
+        print(f"🔧 [FORCE TOOL] prestation={_rdv_p!r} jour=— heure=— → tool_choice=auto (demander le jour)")
+    elif _rdv_p and _rdv_j and not _rdv_h:
+        _tool_choice = "auto"
+        print(f"🔧 [FORCE TOOL] prestation={_rdv_p!r} jour={_rdv_j!r} heure=— → tool_choice=auto (demander l'heure)")
+    elif (_jour_detecte and _heure_detectee) and not _dispos_deja_verif:
+        _tool_choice = "required"
+        print(f"🔧 [FORCE TOOL] jour+heure détectés dans historique → tool_choice=required")
+    else:
+        _tool_choice = "auto"
+
+    # ── C7 — Log contexte RDV avant GPT ─────────────────────────────────────
+    print(f"📋 [CONTEXTE RDV AVANT GPT] prestation={_rdv_p or '—'} | jour={_rdv_j or '—'} | heure={_rdv_h or '—'} | coiffeur={_ctx_force.get('rdv_coiffeur') or '—'}")
 
     # Appeler GPT-4o avec function calling
     if not TOOLS:
         print("❌ [ERROR] tools vide — TOOLS non chargé, function calling désactivé")
-    else:
-        print(f"🛠️ [GPT] {len(TOOLS)} tools | tool_choice={_tool_choice}")
+    print(f"🔧 [GPT INPUT] tool_choice={_tool_choice} | messages_count={len(messages)}")
     try:
         response = client_openai.chat.completions.create(
             model="gpt-4o-mini",
             messages=messages,
             tools=TOOLS,
             tool_choice=_tool_choice,
-            temperature=0.3,
-            max_tokens=200,
+            temperature=0.1,
+            max_tokens=100,
             presence_penalty=0.0,
             frequency_penalty=0.0,
             stream=False,
@@ -2574,6 +2916,10 @@ def run_agent(message_user: str, telephone: str) -> str:
 
     # Traiter la réponse
     choice = response.choices[0]
+    # ── C7 — Log output GPT ──────────────────────────────────────────────────
+    _gpt_out_type = "tool_call" if choice.message.tool_calls else "text"
+    _gpt_out_content = str(choice.message.content or "")[:50] if not choice.message.tool_calls else choice.message.tool_calls[0].function.name
+    print(f"🔧 [GPT OUTPUT] type={_gpt_out_type} | content={_gpt_out_content!r}")
 
     # Boucle tool calls — max 3 itérations (gère les chaînes de tools)
     import random as _random
@@ -2633,8 +2979,8 @@ def run_agent(message_user: str, telephone: str) -> str:
                 messages=messages,
                 tools=TOOLS,
                 tool_choice="none",  # forcer réponse vocale — pas de chaîne de tools
-                temperature=0.3,
-                max_tokens=200,
+                temperature=0.1,
+                max_tokens=100,
                 presence_penalty=0.0,
                 frequency_penalty=0.0,
                 stream=False,
@@ -2659,10 +3005,78 @@ def run_agent(message_user: str, telephone: str) -> str:
     # Extraire la réponse texte
     response_text = choice.message.content
 
-    # Garde-fou : réponse vide après boucle tool — ne jamais raccrocher, toujours parler au client
-    if not response_text or len(response_text.strip()) < 5:
-        print("⚠️ [GPT] Réponse vide/courte après tool call — fallback vocale")
-        response_text = "Je vérifie, un instant s'il vous plaît."
+    # ── C1 + C3 — Interception "je vais vérifier" et réponse vide ───────────
+    PHRASES_ATTENTE_INTERDITES = [
+        "je vais vérifier", "je vérifie", "je vais chercher", "je vais regarder",
+        "un instant", "laissez-moi", "je consulte", "je regarde", "permettez-moi",
+        "je recherche", "je vais contrôler", "je vais consulter",
+    ]
+    _ctx_intercept = get_client_context(telephone)
+    _rdv_pi = _ctx_intercept.get("rdv_prestation", "")
+    _rdv_ji = _ctx_intercept.get("rdv_jour", "")
+    _rdv_hi = _ctx_intercept.get("rdv_heure", "")
+    _context_complet = bool(_rdv_pi and _rdv_ji and _rdv_hi)
+
+    _resp_lower_i = (response_text or "").lower()
+    _est_phrase_attente = any(p in _resp_lower_i for p in PHRASES_ATTENTE_INTERDITES)
+
+    # C1 : GPT a dit "je vais vérifier" au lieu d'appeler le tool → forcer l'appel direct
+    if _est_phrase_attente and _context_complet:
+        print(f"⚠️ [INTERCEPTION] GPT a dit '{response_text[:60]}' au lieu d'appeler verifier_disponibilite → appel forcé")
+        _dispo_result = appeler_verifier_disponibilite(_rdv_pi, _rdv_ji, _rdv_hi, telephone, _ctx_intercept.get("rdv_coiffeur", ""))
+        # Relancer GPT pour transformer le résultat en réponse vocale
+        _fake_tool_id = f"forced_{int(now_paris().timestamp())}"
+        add_assistant_message_with_tools(telephone, content=None, tool_calls=[{
+            "id": _fake_tool_id, "type": "function",
+            "function": {"name": "verifier_disponibilite", "arguments": json.dumps({"prestation": _rdv_pi, "jour": _rdv_ji, "heure": _rdv_hi})},
+        }])
+        add_tool_result(telephone, _fake_tool_id, _dispo_result)
+        try:
+            _msg_post = [{"role": "system", "content": sys_prompt}] + get_conversation_history(telephone)
+            _msg_post = clean_messages(_msg_post)
+            _resp2 = client_openai.chat.completions.create(
+                model="gpt-4o-mini", messages=_msg_post, tools=TOOLS,
+                tool_choice="none", temperature=0.1, max_tokens=100, stream=False,
+            )
+            session_tokens_input += _resp2.usage.prompt_tokens
+            session_tokens_output += _resp2.usage.completion_tokens
+            session_tokens_total += _resp2.usage.total_tokens
+            response_text = _resp2.choices[0].message.content or ""
+            print(f"⚠️ [INTERCEPTION] Réponse post-tool : {response_text[:80]!r}")
+        except Exception as _e_int:
+            print(f"⚠️ [INTERCEPTION] Erreur relance GPT : {_e_int}")
+            response_text = _dispo_result  # fallback: dire directement le résultat
+
+    # C3 : Réponse vide ET contexte complet → appel direct verifier_disponibilite sans GPT
+    elif (not response_text or len(response_text.strip()) < 5) and _context_complet:
+        print(f"⚠️ [RÉPONSE VIDE] Appel direct verifier_disponibilite sans GPT | prestation={_rdv_pi!r} jour={_rdv_ji!r} heure={_rdv_hi!r}")
+        _dispo_result = appeler_verifier_disponibilite(_rdv_pi, _rdv_ji, _rdv_hi, telephone, _ctx_intercept.get("rdv_coiffeur", ""))
+        _fake_tool_id2 = f"forced_empty_{int(now_paris().timestamp())}"
+        add_assistant_message_with_tools(telephone, content=None, tool_calls=[{
+            "id": _fake_tool_id2, "type": "function",
+            "function": {"name": "verifier_disponibilite", "arguments": json.dumps({"prestation": _rdv_pi, "jour": _rdv_ji, "heure": _rdv_hi})},
+        }])
+        add_tool_result(telephone, _fake_tool_id2, _dispo_result)
+        try:
+            _msg_post2 = [{"role": "system", "content": sys_prompt}] + get_conversation_history(telephone)
+            _msg_post2 = clean_messages(_msg_post2)
+            _resp3 = client_openai.chat.completions.create(
+                model="gpt-4o-mini", messages=_msg_post2, tools=TOOLS,
+                tool_choice="none", temperature=0.1, max_tokens=100, stream=False,
+            )
+            session_tokens_input += _resp3.usage.prompt_tokens
+            session_tokens_output += _resp3.usage.completion_tokens
+            session_tokens_total += _resp3.usage.total_tokens
+            response_text = _resp3.choices[0].message.content or ""
+            print(f"⚠️ [RÉPONSE VIDE] Réponse post-tool : {response_text[:80]!r}")
+        except Exception as _e_empty:
+            print(f"⚠️ [RÉPONSE VIDE] Erreur relance GPT : {_e_empty}")
+            response_text = _dispo_result
+
+    # Garde-fou ultime : si toujours vide, ne jamais raccrocher
+    elif not response_text or len(response_text.strip()) < 5:
+        print("⚠️ [GPT] Réponse vide/courte sans contexte complet — fallback vocale")
+        response_text = "Je suis désolé, pouvez-vous répéter s'il vous plaît ?"
 
     # Garde-fou : phrase de fin en plein flow RDV
     PHRASES_FIN_FLOW = ["bonne journée", "au revoir", "à bientôt", "merci pour votre appel"]
@@ -2736,6 +3150,7 @@ async def sync_config(request: Request):
         global HORAIRE_OUVERTURE, HORAIRE_FERMETURE, JOURS_OUVERTS
         global COIFFEURS, PRESTATIONS_SALON, BASE_URL, TWILIO_NUMBER
         global SALON_SUPABASE_URL, SALON_SUPABASE_KEY, SALON_APP_WEBHOOK_URL, APP_SALON_ID
+        global _session_salon_id
 
         # ── Config salon de base ──────────────────────────────────
         if data.get("salon_name"):
@@ -2823,21 +3238,24 @@ async def sync_config(request: Request):
 
         # ── Persistance salon dans Supabase ───────────────────────
         if supabase:
+            salon_row = {
+                "salon_id":          _session_salon_id,
+                "twilio_number":     TWILIO_NUMBER,
+                "nom":               NOM_SALON,
+                "telephone":         TELEPHONE_SALON,
+                "adresse":           data.get("address", ""),
+                "horaire_ouverture": HORAIRE_OUVERTURE,
+                "horaire_fermeture": HORAIRE_FERMETURE,
+                "jours_ouverts":     json.dumps(JOURS_OUVERTS),
+                "webhook_url":       SALON_APP_WEBHOOK_URL,
+                "app_salon_id":      APP_SALON_ID,
+            }
+            print(f"💾 [UPSERT] salon_row = {salon_row}")
             try:
-                salon_row = {
-                    "twilio_number": TWILIO_NUMBER,
-                    "nom": NOM_SALON,
-                    "telephone": TELEPHONE_SALON,
-                    "adresse": ADRESSE_SALON,
-                    "horaire_ouverture": HORAIRE_OUVERTURE,
-                    "horaire_fermeture": HORAIRE_FERMETURE,
-                    "jours_ouverts": json.dumps(JOURS_OUVERTS),
-                }
-                print(f"💾 [UPSERT] Sauvegarde salon : {salon_row}")
-                supabase.table("salon").upsert(salon_row, on_conflict="twilio_number").execute()
-                print(f"💾 [UPSERT] OK")
-            except Exception as e_db:
-                print(f"⚠️ [SYNC SUPABASE] Erreur persistance salon : {e_db}")
+                supabase.table("salon").upsert(salon_row, on_conflict="salon_id").execute()
+                print(f"💾 [UPSERT] OK | webhook_url='{SALON_APP_WEBHOOK_URL}' | app_salon_id='{APP_SALON_ID}'")
+            except Exception as e:
+                print(f"❌ [UPSERT] Erreur : {e}")
 
         # CORRECTION 2 : log récapitulatif de toutes les variables critiques
         print(
@@ -2854,15 +3272,34 @@ async def sync_config(request: Request):
 
 @app.get("/test-webhook")
 async def test_webhook():
-    """CORRECTION 3 : endpoint de test webhook — appelle SALON_APP_WEBHOOK_URL avec un payload de test."""
+    """Teste les deux webhooks (RDV + annulation) vers SALON_APP_WEBHOOK_URL."""
     import urllib.request as _urlreq2
+
+    def _call_webhook(payload_dict: dict) -> dict:
+        _payload_bytes = json.dumps(payload_dict).encode("utf-8")
+        _req = _urlreq2.Request(
+            SALON_APP_WEBHOOK_URL,
+            data=_payload_bytes,
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            method="POST",
+        )
+        try:
+            with _urlreq2.urlopen(_req, timeout=10) as _r:
+                _body = _r.read().decode("utf-8", errors="replace")
+                print(f"📡 [TEST-WEBHOOK] status={_r.status} | body={_body[:200]!r}")
+                return {"status": _r.status, "body": _body[:500], "error": None}
+        except Exception as _te:
+            print(f"❌ [TEST-WEBHOOK] Erreur : {_te}")
+            return {"status": None, "body": None, "error": f"{type(_te).__name__}: {_te}"}
+
     result = {
         "webhook_url": SALON_APP_WEBHOOK_URL,
         "app_salon_id": APP_SALON_ID,
-        "status": None,
-        "body": None,
+        "rdv": None,
+        "annulation": None,
         "error": None,
     }
+
     if not SALON_APP_WEBHOOK_URL:
         result["error"] = "SALON_APP_WEBHOOK_URL est vide — configurer via /update-config"
         return result
@@ -2870,7 +3307,8 @@ async def test_webhook():
         result["error"] = "APP_SALON_ID est vide — configurer via /update-config"
         return result
 
-    _test_payload = json.dumps({
+    # Test 1 — webhook RDV
+    _rdv_payload = {
         "event": "rdv_created",
         "app_salon_id": APP_SALON_ID,
         "client_telephone": "+33600000000",
@@ -2880,24 +3318,22 @@ async def test_webhook():
         "heure": "10:00",
         "coiffeur": "",
         "avec_shampoing": False,
+        "source": "agent",
         "_test": True,
-    }).encode("utf-8")
+    }
+    print(f"📡 [TEST-WEBHOOK] Test RDV | payload={json.dumps(_rdv_payload)}")
+    result["rdv"] = _call_webhook(_rdv_payload)
 
-    _req = _urlreq2.Request(
-        SALON_APP_WEBHOOK_URL,
-        data=_test_payload,
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
-        method="POST",
-    )
-    try:
-        with _urlreq2.urlopen(_req, timeout=10) as _r:
-            _body = _r.read().decode("utf-8", errors="replace")
-            result["status"] = _r.status
-            result["body"] = _body[:500]
-            print(f"📡 [TEST-WEBHOOK] status={_r.status} | body={_body[:200]!r}")
-    except Exception as _te:
-        result["error"] = f"{type(_te).__name__}: {_te}"
-        print(f"❌ [TEST-WEBHOOK] Erreur : {_te}")
+    # Test 2 — webhook annulation
+    _ann_payload = {
+        "action": "cancelled",
+        "appointment_id": "test-rdv-id-000",
+        "app_salon_id": APP_SALON_ID,
+        "source": "agent",
+        "_test": True,
+    }
+    print(f"📡 [TEST-WEBHOOK] Test Annulation | payload={json.dumps(_ann_payload)}")
+    result["annulation"] = _call_webhook(_ann_payload)
 
     return result
 
@@ -3393,8 +3829,8 @@ def handle_appel(
             for k in ("prenom", "client_id", "nb_visites", "derniere_visite", "nom")
             if _ctx_early.get(k)
         }
-        _preserved["call_sid"]    = CallSid
-        _preserved["silences"]    = 0
+        _preserved["call_sid"]     = CallSid
+        _preserved["silences"]     = 0
         _preserved["accueil_joue"] = False
         client_context[telephone_appelant] = _preserved
         conversation_history[telephone_appelant] = []
@@ -3412,7 +3848,6 @@ def handle_appel(
         "lundi, mardi, mercredi, jeudi, vendredi, samedi, bonjour, oui, non, "
         "merci, au revoir, barbe, dégradé, soin, balayage, mèches, prénom, heure"
     )
-
     if not SpeechResult:
         import random as _rand
         _ctx_sil = get_client_context(telephone_appelant)
@@ -3475,11 +3910,11 @@ def handle_appel(
                 "Excusez-moi, pouvez-vous répéter votre réponse ?",
             ]
             _msg_relance = _rand.choice(msgs_relance)
-            print(f"📡 [GATHER] silence {nb_silences}/3 mid-conv | action=/appel POST | speech_timeout=auto timeout=12")
+            print(f"📡 [GATHER] silence {nb_silences}/3 mid-conv | action=/appel POST | speech_timeout=2 timeout=8")
             gather = twiml.gather(
                 input="speech", action="/appel", method="POST",
-                language="fr-FR", speech_timeout="auto",
-                speech_model="phone_call", timeout=12, hints=HINTS,
+                language="fr-FR", speech_timeout="2",
+                speech_model="phone_call", timeout=8, hints=HINTS,
             )
             gather.say(_msg_relance, language="fr-FR", voice="Polly.Lea", barge_in=False)
             return str(twiml)
@@ -3499,11 +3934,11 @@ def handle_appel(
                 f"Bonjour, vous êtes bien chez {NOM_SALON}. Je vous écoute.",
             ]
         _msg_reaccueil = _rand.choice(_accueils_retry)
-        print(f"📡 [GATHER] silence {nb_silences}/3 post-accueil — rejouer accueil | action=/appel POST | speech_timeout=auto timeout=12")
+        print(f"📡 [GATHER] silence {nb_silences}/3 post-accueil — rejouer accueil | action=/appel POST | speech_timeout=2 timeout=8")
         gather = twiml.gather(
             input="speech", action="/appel", method="POST",
-            language="fr-FR", speech_timeout="auto",
-            speech_model="phone_call", timeout=12, hints=HINTS,
+            language="fr-FR", speech_timeout="2",
+            speech_model="phone_call", timeout=8, hints=HINTS,
         )
         gather.say(_msg_reaccueil, language="fr-FR", voice="Polly.Lea", barge_in=False)
         return str(twiml)
@@ -3651,16 +4086,16 @@ def handle_appel(
         f"shampoing={question_shampoing} heure={question_heure} "
         f"jour={question_jour} prestation={question_prestation} annulation={question_annulation}"
     )
-    print(f"📡 [GATHER] main | action=/appel POST | speech_timeout=auto timeout=12 | {_gather_ctx} | hints_len={len(hints_gather)}c")
+    print(f"📡 [GATHER] main | action=/appel POST | speech_timeout=2 timeout=8 | {_gather_ctx} | hints_len={len(hints_gather)}c")
 
     gather = twiml.gather(
         input="speech",
         action="/appel",
         method="POST",
         language="fr-FR",
-        speech_timeout="auto",
+        speech_timeout="2",
         speech_model="phone_call",
-        timeout=12,
+        timeout=8,
         hints=hints_gather,
     )
     gather.say(texte_final, language="fr-FR", voice="Polly.Lea", barge_in=False)
