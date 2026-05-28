@@ -3239,7 +3239,7 @@ async def sync_config(request: Request):
         # ── Persistance salon dans Supabase ───────────────────────
         if supabase:
             salon_row = {
-                "salon_id":          _session_salon_id,
+                "id":                 _session_salon_id,
                 "twilio_number":     TWILIO_NUMBER,
                 "nom":               NOM_SALON,
                 "telephone":         TELEPHONE_SALON,
@@ -3252,7 +3252,7 @@ async def sync_config(request: Request):
             }
             print(f"💾 [UPSERT] salon_row = {salon_row}")
             try:
-                supabase.table("salon").upsert(salon_row, on_conflict="salon_id").execute()
+                supabase.table("salon").upsert(salon_row, on_conflict="id").execute()
                 print(f"💾 [UPSERT] OK | webhook_url='{SALON_APP_WEBHOOK_URL}' | app_salon_id='{APP_SALON_ID}'")
             except Exception as e:
                 print(f"❌ [UPSERT] Erreur : {e}")
