@@ -1607,6 +1607,7 @@ ANNULATION RDV — ÉTAPES OBLIGATOIRES DANS L'ORDRE STRICT :
 4. Si client confirme (oui / je confirme / oui annuler) → appeler annuler_rdv avec l'ID du RDV.
 5. Confirmer : "Votre rendez-vous est annulé. Vous allez recevoir un SMS de confirmation."
 RÈGLE ABSOLUE : Ne jamais dire "je procède à l'annulation" sans avoir appelé le tool annuler_rdv. L'annulation n'est effective que si le tool retourne un succès.
+⚠️ RÈGLE ABSOLUE : Ne jamais dire "je vais récupérer", "je cherche", "un instant" ou toute phrase d'attente. Appeler IMMÉDIATEMENT get_rdv_client_actif dès que le client mentionne une annulation. Pas de texte intermédiaire.
 IMPORTANT — numéro client : le numéro de téléphone de l'appelant est {telephone or "inconnu"}. Pour get_rdv_client_actif, passer TOUJOURS ce numéro ({telephone or "inconnu"}) et jamais le numéro du salon ({TELEPHONE_SALON}).
 
 CONSEILS :
@@ -2874,7 +2875,15 @@ def run_agent(message_user: str, telephone: str) -> str:
                           "samedi", "dimanche", "demain", "aujourd", "prochain"])
     _heure_detectee = bool(re.search(r'\b\d{1,2}h\d{0,2}\b|\d{1,2}:\d{2}', _hist_text))
 
-    if _ctx_has_all and not _dispos_deja_verif:
+    # ── C2-ANNULATION — Forcer get_rdv_client_actif quand client parle d'annulation ──
+    _mots_annulation = ["annuler", "annulation", "supprimer", "effacer", "enlever", "mon rendez-vous"]
+    _ctx_annulation = any(m in message_user.lower() for m in _mots_annulation)
+    _rdv_deja_recupere = "rdv trouvé" in _hist_text or "aucun rdv" in _hist_text or "get_rdv_client_actif" in _hist_text
+
+    if _ctx_annulation and not _rdv_deja_recupere:
+        _tool_choice = {"type": "function", "function": {"name": "get_rdv_client_actif"}}
+        print(f"🔧 [FORCE TOOL] Annulation détectée → tool_choice=get_rdv_client_actif")
+    elif _ctx_has_all and not _dispos_deja_verif:
         # Forcer SPÉCIFIQUEMENT verifier_disponibilite — GPT ne peut PAS répondre en texte
         _tool_choice = {"type": "function", "function": {"name": "verifier_disponibilite"}}
         print(f"🔧 [FORCE TOOL] prestation={_rdv_p!r} jour={_rdv_j!r} heure={_rdv_h!r} → tool_choice=verifier_disponibilite")
@@ -3016,17 +3025,29 @@ def run_agent(message_user: str, telephone: str) -> str:
     # Extraire la réponse texte
     response_text = choice.message.content
 
-    # ── C1 + C3 — Interception "je vais vérifier" et réponse vide ───────────
+    # ── C1 + C3 — Interception "je vais vérifier" / "je vais récupérer" et réponse vide ──
     PHRASES_ATTENTE_INTERDITES = [
         "je vais vérifier", "je vérifie", "je vais chercher", "je vais regarder",
         "un instant", "laissez-moi", "je consulte", "je regarde", "permettez-moi",
         "je recherche", "je vais contrôler", "je vais consulter",
+        "je vais récupérer", "je récupère", "je vais chercher vos",
+        "je vais consulter vos", "je vais regarder vos", "je recherche vos",
+        "laissez-moi chercher",
     ]
     _ctx_intercept = get_client_context(telephone)
     _rdv_pi = _ctx_intercept.get("rdv_prestation", "")
     _rdv_ji = _ctx_intercept.get("rdv_jour", "")
     _rdv_hi = _ctx_intercept.get("rdv_heure", "")
     _context_complet = bool(_rdv_pi and _rdv_ji and _rdv_hi)
+
+    _hist_text_i = " ".join(
+        str(m.get("content", "")) for m in get_conversation_history(telephone)
+    ).lower()
+    _rdv_deja_recupere_i = "rdv trouvé" in _hist_text_i or "aucun rdv" in _hist_text_i
+    _ctx_annulation_intercept = (
+        any(m in message_user.lower() for m in ["annuler", "annulation", "supprimer", "effacer", "enlever", "mon rendez-vous"])
+        and not _rdv_deja_recupere_i
+    )
 
     _resp_lower_i = (response_text or "").lower()
     _est_phrase_attente = any(p in _resp_lower_i for p in PHRASES_ATTENTE_INTERDITES)
@@ -3083,6 +3104,32 @@ def run_agent(message_user: str, telephone: str) -> str:
         except Exception as _e_empty:
             print(f"⚠️ [RÉPONSE VIDE] Erreur relance GPT : {_e_empty}")
             response_text = _dispo_result
+
+    # C1-ANNULATION : GPT a dit "je vais récupérer" au lieu d'appeler get_rdv_client_actif
+    elif _est_phrase_attente and _ctx_annulation_intercept:
+        print(f"⚠️ [INTERCEPTION ANNULATION] GPT a dit '{(response_text or '')[:60]}' → appel forcé get_rdv_client_actif")
+        _rdv_result = process_tool_call("get_rdv_client_actif", {"telephone": telephone}, telephone)
+        _fake_tool_id_ann = f"forced_ann_{int(now_paris().timestamp())}"
+        add_assistant_message_with_tools(telephone, content=None, tool_calls=[{
+            "id": _fake_tool_id_ann, "type": "function",
+            "function": {"name": "get_rdv_client_actif", "arguments": json.dumps({"telephone": telephone})},
+        }])
+        add_tool_result(telephone, _fake_tool_id_ann, _rdv_result)
+        try:
+            _msg_post_ann = [{"role": "system", "content": sys_prompt}] + get_conversation_history(telephone)
+            _msg_post_ann = clean_messages(_msg_post_ann)
+            _resp_ann = client_openai.chat.completions.create(
+                model="gpt-4o-mini", messages=_msg_post_ann, tools=TOOLS,
+                tool_choice="none", temperature=0.1, max_tokens=100, stream=False,
+            )
+            session_tokens_input += _resp_ann.usage.prompt_tokens
+            session_tokens_output += _resp_ann.usage.completion_tokens
+            session_tokens_total += _resp_ann.usage.total_tokens
+            response_text = _resp_ann.choices[0].message.content or ""
+            print(f"⚠️ [INTERCEPTION ANNULATION] Réponse post-tool : {response_text[:80]!r}")
+        except Exception as _e_ann:
+            print(f"⚠️ [INTERCEPTION ANNULATION] Erreur relance GPT : {_e_ann}")
+            response_text = _rdv_result
 
     # Garde-fou ultime : si toujours vide, ne jamais raccrocher
     elif not response_text or len(response_text.strip()) < 5:
