@@ -2924,8 +2924,48 @@ def run_agent(message_user: str, telephone: str) -> str:
     else:
         _tool_choice = "auto"
 
+    # ── VALIDATION 1 — Prestation sans coiffeur : vérifier compétences ──────
+    _rdv_coiffeur_v = _ctx_force.get("rdv_coiffeur", "")
+    if _rdv_p and not _rdv_coiffeur_v and COIFFEURS:
+        _comp_v1 = coiffeurs_competents(_rdv_p)
+        print(f"🔍 [VALID 1] prestation={_rdv_p!r} | compétents : {[c['nom'] for c in _comp_v1]}")
+        if len(_comp_v1) == 0:
+            _prest_list_v1 = ", ".join([p.get("name", "") for p in PRESTATIONS_SALON if p.get("name")]) or "nos prestations"
+            _resp_v1 = (f"Je suis désolé, aucun de nos coiffeurs ne propose la prestation \"{_rdv_p}\". "
+                        f"Voici nos prestations disponibles : {_prest_list_v1}. Laquelle vous intéresse ?")
+            add_to_history(telephone, "assistant", _resp_v1)
+            return _resp_v1
+        elif len(_comp_v1) == 1:
+            _rdv_coiffeur_v = _comp_v1[0]["nom"]
+            update_client_context(telephone, rdv_coiffeur=_rdv_coiffeur_v)
+            print(f"✅ [VALID 1] Un seul coiffeur compétent → assigné automatiquement : {_rdv_coiffeur_v!r}")
+
+    # ── VALIDATION 2 — Jour + coiffeur : vérifier jour de repos ──────────────
+    _rdv_coiffeur_v = get_client_context(telephone).get("rdv_coiffeur", "") or _rdv_coiffeur_v
+    if _rdv_j and _rdv_coiffeur_v:
+        _noms_jours_v = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
+        try:
+            _nom_jour_v = _noms_jours_v[date.fromisoformat(_rdv_j).weekday()]
+        except Exception:
+            _nom_jour_v = ""
+        if _nom_jour_v:
+            _coif_obj_v = next((c for c in COIFFEURS if c["nom"].lower() == _rdv_coiffeur_v.lower()), None)
+            if _coif_obj_v:
+                _repos_v = [r.lower() for r in (_coif_obj_v.get("jours_repos") or [])]
+                if _nom_jour_v in _repos_v:
+                    _coifs_alt_v = [c["nom"] for c in COIFFEURS
+                                    if c["nom"].lower() != _rdv_coiffeur_v.lower()
+                                    and _nom_jour_v not in [r.lower() for r in (c.get("jours_repos") or [])]]
+                    _alt_str_v = f" {_coifs_alt_v[0]} est disponible ce jour-là." if _coifs_alt_v else ""
+                    _inject_v2 = (
+                        f"SYSTÈME — VALIDATION : {_rdv_coiffeur_v} est en repos le {_nom_jour_v}. "
+                        f"Dis-le immédiatement au client et propose un autre jour ou un autre coiffeur.{_alt_str_v}"
+                    )
+                    messages.append({"role": "user", "content": _inject_v2})
+                    print(f"⚠️ [VALID 2] {_rdv_coiffeur_v} en repos le {_nom_jour_v} → injection dans messages")
+
     # ── C7 — Log contexte RDV avant GPT ─────────────────────────────────────
-    print(f"📋 [CONTEXTE RDV AVANT GPT] prestation={_rdv_p or '—'} | jour={_rdv_j or '—'} | heure={_rdv_h or '—'} | coiffeur={_ctx_force.get('rdv_coiffeur') or '—'}")
+    print(f"📋 [CONTEXTE RDV AVANT GPT] prestation={_rdv_p or '—'} | jour={_rdv_j or '—'} | heure={_rdv_h or '—'} | coiffeur={_rdv_coiffeur_v or '—'}")
 
     # Appeler GPT-4o avec function calling
     if not TOOLS:
