@@ -569,6 +569,7 @@ def get_or_create_client(telephone: str) -> dict:
                 .insert({"telephone": telephone})\
                 .execute()
             client = nouveau.data[0]
+            update_client_context(telephone, client_nouveau=True)
         # Enrichir le contexte avec les RDVs passés
         try:
             rdvs = supabase.table("rendez_vous")\
@@ -1083,6 +1084,34 @@ def send_rapport_hebdo():
     except Exception as e:
         print(f"⚠️ send_rapport_hebdo erreur : {e}")
 
+def send_stats_quotidiennes():
+    """Calcule et log les stats d'appels du jour pour chaque salon (23h55)."""
+    if not supabase:
+        return
+    try:
+        auj = now_paris().date().isoformat()
+        res = supabase.table("call_stats").select("*").gte("started_at", auj).execute()
+        rows = res.data or []
+        if not rows:
+            print(f"📊 [STATS QUOTIDIENNES] Aucun appel enregistré aujourd'hui ({auj})")
+            return
+        total        = len(rows)
+        nb_rdv       = sum(1 for r in rows if r.get("rdv_pris"))
+        taux         = round(nb_rdv / total * 100, 1) if total else 0
+        durees       = [r["duration_seconds"] for r in rows if r.get("duration_seconds")]
+        duree_moy    = round(sum(durees) / len(durees)) if durees else 0
+        nb_abandons  = sum(1 for r in rows if r.get("motif_echec") == "abandon")
+        nb_silences  = sum(1 for r in rows if r.get("motif_echec") == "silence")
+        nb_pas_dispo = sum(1 for r in rows if r.get("motif_echec") == "pas_de_dispo")
+        nb_ferme     = sum(1 for r in rows if r.get("motif_echec") == "fermé")
+        print(
+            f"📊 [STATS {auj}] total_appels={total} | rdv_pris={nb_rdv} | taux={taux}% "
+            f"| durée_moy={duree_moy}s | abandons={nb_abandons} | silences={nb_silences} "
+            f"| pas_dispo={nb_pas_dispo} | fermé={nb_ferme}"
+        )
+    except Exception as _e:
+        print(f"⚠️ [STATS QUOTIDIENNES] Erreur : {_e}")
+
 # ── Scheduler rappels SMS J-24h (10h00 chaque matin) ──────────────────────
 print("🔵 [BOOT 7/8] Démarrage APScheduler…")
 try:
@@ -1095,6 +1124,8 @@ try:
                       id="rapport_hebdo", replace_existing=True)
     scheduler.add_job(nettoyer_historiques, "cron", minute=30,
                       id="nettoyage_historiques", replace_existing=True)
+    scheduler.add_job(send_stats_quotidiennes, "cron", hour=23, minute=55,
+                      id="stats_quotidiennes", replace_existing=True)
     scheduler.start()
     print("🔵 [BOOT 7/8] Scheduler OK — rappels 10h00, rappels 1h, rapport lundi 8h")
 except Exception as _e_sched:
@@ -1967,7 +1998,7 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
             mettre_a_jour_nom_client(client_id, client_nom)
 
         # Enregistrer le RDV (déclenche SMS de confirmation)
-        enregistrer_rdv(
+        _rdv_id_cree = enregistrer_rdv(
             client_id=client_id,
             jour=jour,
             heure=heure,
@@ -1980,6 +2011,12 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
             avec_shampoing=avec_shampoing,
             telephone=telephone,
             client_nom=client_nom,
+        )
+        # Sauvegarder pour call_stats avant de vider le contexte RDV
+        update_client_context(telephone,
+            rdv_id_cree=_rdv_id_cree,
+            last_rdv_prestation=prestation,
+            last_rdv_coiffeur=coiffeur_choisi or "",
         )
         # Sauvegarder préférences dans la table clients
         if client_id and supabase:
@@ -3263,6 +3300,81 @@ def salon_id_from_twilio() -> str:
     except Exception:
         return None
 
+def _insert_call_stat(call_sid: str, telephone: str) -> None:
+    """Insère une ligne dans call_stats au début de chaque nouvel appel."""
+    if not supabase or not call_sid:
+        return
+    try:
+        sid = _session_salon_id or salon_id_from_twilio()
+        if not sid:
+            print("⚠️ [CALL_STATS] salon_id inconnu — insert ignoré")
+            return
+        supabase.table("call_stats").insert({
+            "salon_id":   sid,
+            "call_sid":   call_sid,
+            "started_at": now_paris().isoformat(),
+            "client_phone": telephone,
+        }).execute()
+        print(f"📊 [CALL_STATS] Appel démarré | CallSid={call_sid}")
+    except Exception as _e:
+        print(f"⚠️ [CALL_STATS] Erreur insert : {_e}")
+
+def _deduire_motif_echec(telephone: str) -> str:
+    """Déduit le motif d'échec depuis le contexte et l'historique de conversation."""
+    ctx = get_client_context(telephone)
+    if ctx.get("motif_echec_detecte"):
+        return ctx["motif_echec_detecte"]
+    hist = " ".join(
+        str(m.get("content", "")) for m in get_conversation_history(telephone)
+    ).lower()
+    if "aucun créneau" in hist or "pas de créneau" in hist or "complet" in hist:
+        return "pas_de_dispo"
+    if "fermé" in hist and any(j in hist for j in ["lundi", "dimanche", "jour"]):
+        return "fermé"
+    return "abandon"
+
+def _update_call_stat(call_sid: str, telephone: str, motif_echec: str = "abandon") -> None:
+    """Met à jour la ligne call_stats à la fin de l'appel."""
+    if not supabase or not call_sid:
+        return
+    try:
+        ctx      = get_client_context(telephone)
+        ended_at = now_paris()
+        # Calculer la durée depuis started_at
+        duration = None
+        try:
+            _row = supabase.table("call_stats").select("started_at")\
+                .eq("call_sid", call_sid).limit(1).execute()
+            if _row.data:
+                from datetime import datetime as _dt
+                _started = _dt.fromisoformat(_row.data[0]["started_at"])
+                if _started.tzinfo is None:
+                    _started = _started.replace(tzinfo=timezone.utc)
+                duration = max(0, int((ended_at - _started).total_seconds()))
+        except Exception:
+            pass
+        rdv_pris = bool(ctx.get("rdv_pris", False))
+        motif    = None if rdv_pris else _deduire_motif_echec(telephone) if motif_echec == "abandon" else motif_echec
+        update_data = {
+            "ended_at":        ended_at.isoformat(),
+            "duration_seconds": duration,
+            "rdv_pris":        rdv_pris,
+            "rdv_id":          ctx.get("rdv_id_cree") or None,
+            "prestation":      ctx.get("last_rdv_prestation") or None,
+            "coiffeur":        ctx.get("last_rdv_coiffeur") or None,
+            "client_phone":    telephone,
+            "client_nouveau":  bool(ctx.get("client_nouveau", False)),
+            "motif_echec":     motif,
+            "nb_silences":     ctx.get("silences_total", 0),
+        }
+        supabase.table("call_stats").update(update_data).eq("call_sid", call_sid).execute()
+        print(
+            f"📊 [CALL_STATS] Appel terminé | CallSid={call_sid} | rdv_pris={rdv_pris} "
+            f"| durée={duration}s | motif={motif or '—'}"
+        )
+    except Exception as _e:
+        print(f"⚠️ [CALL_STATS] Erreur update : {_e}")
+
 @app.post("/update-config")
 async def sync_config(request: Request):
     try:
@@ -3958,6 +4070,7 @@ def handle_appel(
         client_context[telephone_appelant] = _preserved
         conversation_history[telephone_appelant] = []
         print(f"📞 [NOUVEL APPEL] CallSid={CallSid} | stored={_stored_sid or 'vide'} | silences=0 | accueil_joue=False | reset=True")
+        _insert_call_stat(CallSid, telephone_appelant)
     else:
         update_client_context(telephone_appelant, call_sid=CallSid)
         print(f"📞 [MÊME APPEL] CallSid={CallSid} | contexte préservé")
@@ -4011,8 +4124,9 @@ def handle_appel(
 
         # ── CORRECTION 3 : Accueil déjà joué → compter les silences ──────────
         nb_silences = _ctx_sil.get("silences", 0) + 1
-        update_client_context(telephone_appelant, silences=nb_silences)
-        print(f"🔇 [SILENCE] {nb_silences}/3 | en_conversation={en_conversation} | tel={telephone_appelant}")
+        _silences_total = _ctx_sil.get("silences_total", 0) + 1
+        update_client_context(telephone_appelant, silences=nb_silences, silences_total=_silences_total)
+        print(f"🔇 [SILENCE] {nb_silences}/3 (total={_silences_total}) | en_conversation={en_conversation} | tel={telephone_appelant}")
 
         # ── 3 silences consécutifs → raccrocher ───────────────────────────────
         if nb_silences >= 3:
@@ -4021,6 +4135,8 @@ def handle_appel(
                 language="fr-FR", voice="Polly.Lea",
             )
             twiml.hangup()
+            _call_sid_sil = get_client_context(telephone_appelant).get("call_sid", CallSid)
+            _update_call_stat(_call_sid_sil, telephone_appelant, motif_echec="silence")
             update_client_context(telephone_appelant, silences=0, accueil_joue=False)
             print(f"📵 [FIN APPEL] raison=3_silences_consecutifs | tel={telephone_appelant}")
             return str(twiml)
@@ -4138,6 +4254,8 @@ def handle_appel(
         reponse_fin = _rand2.choice(REPONSES_FIN)
         twiml.say(reponse_fin, language="fr-FR", voice="Polly.Lea")
         twiml.hangup()
+        _call_sid_fin = get_client_context(telephone).get("call_sid", CallSid)
+        _update_call_stat(_call_sid_fin, telephone, motif_echec="abandon")
         print(f"📵 [FIN APPEL] raison=au_revoir_merci | speech='{speech_lower[:60]}' | tel={telephone}")
         return str(twiml)
 
