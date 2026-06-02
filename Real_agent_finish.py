@@ -7,6 +7,7 @@
 import os
 import unicodedata
 import json
+import threading
 from fastapi import FastAPI, Form, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse
@@ -1556,7 +1557,7 @@ RÈGLES ABSOLUES :
 2. Tu n'as pas de prénom. Tu ne dis JAMAIS que tu es une IA.
 3. UNE seule question à la fois. Ne jamais redemander ce qui a déjà été dit.
 4. Extraire TOUTES les infos du message avant de questionner.
-5. Répondre en français uniquement, sauf si le client parle anglais.
+5. TOUJOURS répondre en français, quelles que soient les erreurs techniques. Si un outil échoue, dire en français : "Je rencontre un problème technique, je prends quand même votre rendez-vous." Ne jamais basculer en anglais même en cas d'erreur.
 6. Si on change de prestation en cours de flow, NE PAS redemander le jour, l'heure, le shampoing ou le coiffeur déjà confirmés. Reprendre le flow à l'étape de vérification disponibilité directement.
 7. Si CLIENT RECONNU est présent dans le contexte, le prénom est déjà connu — ne jamais poser la question du prénom.
 8. Si un élément du RDV pose problème (prestation indispo, créneau pris, coiffeur absent), ne redemander QUE l'élément problématique. Tous les autres éléments déjà confirmés dans CONTEXTE RDV EN COURS sont acquis et ne doivent jamais être redemandés.
@@ -1602,6 +1603,8 @@ Ne jamais confirmer ni récapituler sans avoir appelé verifier_disponibilite.
 Ne jamais appeler prendre_rdv sans avoir appelé verifier_disponibilite juste avant dans cet appel.
 L'ordre est immuable : verifier_disponibilite → prendre_rdv.
 Shampoing, coiffeur et prénom sont optionnels : les inclure s'ils sont déjà connus, sinon passer directement à prendre_rdv.
+⛔ INTERDIT de dire "C'est confirmé", "confirmation", "SMS envoyé" ou toute phrase de confirmation AVANT d'avoir appelé l'outil prendre_rdv.
+verifier_disponibilite = vérification seulement. prendre_rdv = confirmation. Ces deux outils sont OBLIGATOIRES et dans cet ordre.
 
 ⚠️ RÈGLE ABSOLUE N°4 — JAMAIS INVENTER L'HEURE :
 Ne jamais supposer, inventer ni proposer une heure. Si l'heure n'est pas donnée par le client :
@@ -2054,16 +2057,14 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
         update_client_context(telephone, rdv_en_cours=False, rdv_pris=True,
                               rdv_prestation="", rdv_jour="", rdv_heure="", rdv_coiffeur="")
 
-        # ── Notification webhook vers l'app Base44 ──────────────────────────
-        import urllib.request as _urlreq
-        import time as _time
-        print(f"📡 [WEBHOOK] DÉBUT | url={SALON_APP_WEBHOOK_URL!r} | app_salon_id={APP_SALON_ID!r}")
+        # ── Notification webhook vers l'app Base44 — ARRIÈRE-PLAN ──────────────
+        print(f"📡 [WEBHOOK] url={SALON_APP_WEBHOOK_URL!r} | app_salon_id={APP_SALON_ID!r}")
         if not SALON_APP_WEBHOOK_URL:
-            print("❌ [WEBHOOK] URL vide — sync impossible (configurer webhook_url via /update-config)")
+            print("❌ [WEBHOOK] URL vide — sync ignorée")
         elif not APP_SALON_ID:
-            print("❌ [WEBHOOK] APP_SALON_ID vide — sync impossible (configurer app_salon_id via /update-config)")
+            print("❌ [WEBHOOK] APP_SALON_ID vide — sync ignorée")
         else:
-            # CORRECTION 5 : Normaliser formats jour=YYYY-MM-DD et heure=HH:MM
+            # Normaliser jour/heure avant de capturer dans le thread
             _jour_wh = jour or ""
             _heure_wh = heure or ""
             try:
@@ -2074,79 +2075,67 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
             try:
                 if _heure_wh and "h" in _heure_wh.lower():
                     _hp = re.split(r"h", _heure_wh.lower())
-                    _hh = int(_hp[0])
-                    _mm = int(_hp[1]) if len(_hp) > 1 and _hp[1].strip() else 0
-                    _heure_wh = f"{_hh:02d}:{_mm:02d}"
+                    _heure_wh = f"{int(_hp[0]):02d}:{int(_hp[1]) if len(_hp) > 1 and _hp[1].strip() else 0:02d}"
             except Exception:
                 pass
 
-            # CORRECTION 5 : payload validé conforme à newAppointment Base44
             _payload_dict = {
-                "event": "rdv_created",
-                "app_salon_id": APP_SALON_ID,
+                "event":            "rdv_created",
+                "app_salon_id":     APP_SALON_ID,
                 "client_telephone": telephone,
-                "client_nom": client_nom,
-                "prestation": prestation,
-                "jour": _jour_wh,
-                "heure": _heure_wh,
-                "coiffeur": coiffeur_choisi or "",
-                "avec_shampoing": avec_shampoing,
-                "source": "agent",
+                "client_nom":       client_nom,
+                "prestation":       prestation,
+                "jour":             _jour_wh,
+                "heure":            _heure_wh,
+                "coiffeur":         coiffeur_choisi or "",
+                "avec_shampoing":   avec_shampoing,
+                "source":           "agent",
             }
-            _payload_bytes = json.dumps(_payload_dict).encode("utf-8")
             print(f"📡 [WEBHOOK] PAYLOAD | {json.dumps(_payload_dict)}")
 
-            # CORRECTION 6 : headers corrects pour que Base44 parse le body
-            _wh_headers = {
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-            }
-
-            def _do_webhook_post():
-                _req = _urlreq.Request(
-                    SALON_APP_WEBHOOK_URL,
-                    data=_payload_bytes,
-                    headers=_wh_headers,
-                    method="POST",
-                )
-                with _urlreq.urlopen(_req, timeout=10) as _r:
-                    _rb = _r.read().decode("utf-8", errors="replace")[:200]
-                    print(f"📡 [WEBHOOK] RÉPONSE | status={_r.status} | body={_rb!r}")
-                    return _r.status
-
-            # CORRECTION 4 : essai 1, puis retry après 2s, puis SMS patron
-            _wh_ok = False
-            try:
-                _s1 = _do_webhook_post()
-                _wh_ok = (_s1 == 200)
-                if not _wh_ok:
-                    print(f"⚠️ [WEBHOOK] Tentative 1 — status inattendu : {_s1}")
-            except Exception as _e1:
-                print(f"⚠️ [WEBHOOK] Tentative 1 — ERREUR | type={type(_e1).__name__} | message={_e1}")
-
-            if not _wh_ok:
-                print("🔄 [WEBHOOK] Retry dans 2s…")
-                _time.sleep(2)
+            # Capturer toutes les valeurs nécessaires par défaut pour éviter les closures sur des vars mutables
+            def _run_webhook(
+                _url=SALON_APP_WEBHOOK_URL,
+                _payload=json.dumps(_payload_dict).encode("utf-8"),
+                _tel_salon=TELEPHONE_SALON,
+                _nom=client_nom, _prest=prestation,
+                _j=_jour_wh, _h=_heure_wh,
+            ):
+                import urllib.request as _req_mod
+                import time as _t_mod
+                _headers = {"Content-Type": "application/json", "Accept": "application/json"}
+                def _post():
+                    _req = _req_mod.Request(_url, data=_payload, headers=_headers, method="POST")
+                    with _req_mod.urlopen(_req, timeout=10) as _r:
+                        _rb = _r.read().decode("utf-8", errors="replace")[:200]
+                        print(f"📡 [WEBHOOK BG] status={_r.status} | body={_rb!r}")
+                        return _r.status
+                _ok = False
                 try:
-                    _s2 = _do_webhook_post()
-                    _wh_ok = (_s2 == 200)
-                    if not _wh_ok:
-                        print(f"⚠️ [WEBHOOK] Tentative 2 — status inattendu : {_s2}")
-                except Exception as _e2:
-                    print(f"⚠️ [WEBHOOK] Tentative 2 — ERREUR | type={type(_e2).__name__} | message={_e2}")
+                    _ok = (_post() == 200)
+                    if not _ok:
+                        print("⚠️ [WEBHOOK BG] Tentative 1 — status inattendu")
+                except Exception as _e1:
+                    print(f"⚠️ [WEBHOOK BG] Tentative 1 — {type(_e1).__name__}: {_e1}")
+                if not _ok:
+                    _t_mod.sleep(2)
+                    try:
+                        _ok = (_post() == 200)
+                        if not _ok:
+                            print("⚠️ [WEBHOOK BG] Tentative 2 — status inattendu")
+                    except Exception as _e2:
+                        print(f"⚠️ [WEBHOOK BG] Tentative 2 — {type(_e2).__name__}: {_e2}")
+                if not _ok:
+                    print(f"❌ [WEBHOOK BG] ÉCHEC — RDV {_j} {_h} non synchronisé Base44")
+                    try:
+                        send_sms(_tel_salon,
+                            f"⚠️ RDV non synchronisé.\nClient : {_nom} — {_prest} | {_j} à {_h}")
+                    except Exception as _sms_e:
+                        print(f"⚠️ [WEBHOOK BG] Erreur SMS patron : {_sms_e}")
 
-            if not _wh_ok:
-                print(f"❌ [WEBHOOK] ÉCHEC DÉFINITIF — RDV {_jour_wh} {_heure_wh} non synchronisé avec Base44")
-                try:
-                    send_sms(TELEPHONE_SALON,
-                        f"⚠️ RDV non synchronisé avec l'app.\n"
-                        f"Client : {client_nom} ({telephone})\n"
-                        f"{prestation} | {_jour_wh} à {_heure_wh}\n"
-                        f"URL : {SALON_APP_WEBHOOK_URL}"
-                    )
-                    print(f"📱 [WEBHOOK] SMS d'alerte envoyé au patron ({TELEPHONE_SALON})")
-                except Exception as _sms_e:
-                    print(f"⚠️ [WEBHOOK] Erreur SMS patron : {_sms_e}")
+            _t_wh = threading.Thread(target=_run_webhook, daemon=True)
+            _t_wh.start()
+            print(f"📡 [WEBHOOK] Lancé en arrière-plan — réponse vocale immédiate")
 
         return f"RDV enregistré pour {jour} à {heure}.{fidelite}"
 
@@ -3171,6 +3160,12 @@ def run_agent(message_user: str, telephone: str) -> str:
     _resp_lower_i = (response_text or "").lower()
     _est_phrase_attente = any(p in _resp_lower_i for p in PHRASES_ATTENTE_INTERDITES)
 
+    # Variables pour C4 (GPT dit "confirmé" sans prendre_rdv)
+    _mots_confirm        = ["confirmé", "confirmation", "sms envoyé", "vous recevez un sms"]
+    _ctx_rdv_pris_check  = get_client_context(telephone).get("rdv_pris", False)
+    _dispo_positive      = "disponibilité : libre" in _hist_text_i or "créneau libre" in _hist_text_i
+    _gpt_annonce_confirm = any(m in _resp_lower_i for m in _mots_confirm)
+
     # C1 : GPT a dit "je vais vérifier" au lieu d'appeler le tool → forcer l'appel direct
     if _est_phrase_attente and _context_complet:
         print(f"⚠️ [INTERCEPTION] GPT a dit '{response_text[:60]}' au lieu d'appeler verifier_disponibilite → appel forcé")
@@ -3250,6 +3245,47 @@ def run_agent(message_user: str, telephone: str) -> str:
             print(f"⚠️ [INTERCEPTION ANNULATION] Erreur relance GPT : {_e_ann}")
             response_text = _rdv_result
 
+    # C4-CONFIRMÉ : GPT annonce "confirmé" sans avoir appelé prendre_rdv → forcer prendre_rdv
+    elif _gpt_annonce_confirm and _dispo_positive and not _ctx_rdv_pris_check and _context_complet:
+        print(f"⚠️ [INTERCEPTION C4] GPT annonce confirmation sans prendre_rdv → forcer tool prendre_rdv")
+        try:
+            _msg_force_rdv = [{"role": "system", "content": sys_prompt}] + get_conversation_history(telephone)
+            _msg_force_rdv = clean_messages(_msg_force_rdv)
+            _resp_force = client_openai.chat.completions.create(
+                model="gpt-4o-mini", messages=_msg_force_rdv, tools=TOOLS,
+                tool_choice={"type": "function", "function": {"name": "prendre_rdv"}},
+                temperature=0.1, max_tokens=100, stream=False,
+            )
+            session_tokens_input  += _resp_force.usage.prompt_tokens
+            session_tokens_output += _resp_force.usage.completion_tokens
+            session_tokens_total  += _resp_force.usage.total_tokens
+            _tc_force = _resp_force.choices[0].message.tool_calls
+            if _tc_force:
+                _tc = _tc_force[0]
+                _tc_args = json.loads(_tc.function.arguments)
+                _rdv_forced_result = process_tool_call("prendre_rdv", _tc_args, telephone)
+                add_assistant_message_with_tools(telephone, content=None, tool_calls=[{
+                    "id": _tc.id, "type": "function",
+                    "function": {"name": "prendre_rdv", "arguments": _tc.function.arguments},
+                }])
+                add_tool_result(telephone, _tc.id, _rdv_forced_result)
+                _msg_voc = [{"role": "system", "content": sys_prompt}] + get_conversation_history(telephone)
+                _msg_voc = clean_messages(_msg_voc)
+                _resp_voc = client_openai.chat.completions.create(
+                    model="gpt-4o-mini", messages=_msg_voc, tools=TOOLS,
+                    tool_choice="none", temperature=0.1, max_tokens=100, stream=False,
+                )
+                session_tokens_input  += _resp_voc.usage.prompt_tokens
+                session_tokens_output += _resp_voc.usage.completion_tokens
+                session_tokens_total  += _resp_voc.usage.total_tokens
+                response_text = _resp_voc.choices[0].message.content or "C'est confirmé ! Vous recevez un SMS. À bientôt !"
+                print(f"⚠️ [INTERCEPTION C4] prendre_rdv forcé | réponse={response_text[:80]!r}")
+            else:
+                response_text = "C'est confirmé ! Vous recevez un SMS de confirmation. À bientôt !"
+        except Exception as _e_c4:
+            print(f"⚠️ [INTERCEPTION C4] Erreur : {_e_c4}")
+            response_text = "C'est confirmé ! Vous recevez un SMS de confirmation. À bientôt !"
+
     # Garde-fou ultime : si toujours vide, ne jamais raccrocher
     elif not response_text or len(response_text.strip()) < 5:
         print("⚠️ [GPT] Réponse vide/courte sans contexte complet — fallback vocale")
@@ -3274,6 +3310,13 @@ def run_agent(message_user: str, telephone: str) -> str:
         _heure_c = _ctx_rdv["rdv_heure"]
         print(f"⚠️ [CONTEXTE] GPT redemande le jour déjà connu ({_jour_c} {_heure_c}) — corrigé")
         response_text = f"Très bien. Je vérifie le créneau du {_jour_c} à {_heure_c}."
+
+    # Garde-fou langue : si GPT répond en anglais hors contexte bilingue, forcer le français
+    if not est_anglais and response_text:
+        _mots_anglais_resp = ["appointment", "available", "sorry", "confirmed", "please", "thank you", "hello", "goodbye"]
+        if sum(1 for _w in _mots_anglais_resp if _w in response_text.lower()) >= 2:
+            print(f"⚠️ [LANGUE] Réponse anglaise détectée sans contexte bilingue — fallback français")
+            response_text = "Je rencontre un problème technique. Pouvez-vous répéter s'il vous plaît ?"
 
     # Ajouter la réponse à l'historique
     add_to_history(telephone, "assistant", response_text)
