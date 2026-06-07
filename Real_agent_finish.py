@@ -1025,8 +1025,9 @@ def send_rappels_sms():
         telephone  = client_row[0].get("telephone", "")
         client_nom = client_row[0].get("nom")
 
-        if not telephone or telephone in ("console_test",):
-            print(f"ℹ️   [RAPPELS] Téléphone invalide pour client {client_id}, ignoré.")
+        if (not telephone or telephone in ("console_test",)
+                or not telephone.startswith("+") or len(telephone) < 8):
+            print(f"⚠️ [SMS] Numéro invalide ignoré : {telephone}")
             continue
 
         prenom = (client_nom or "").split()[0] if client_nom else "vous"
@@ -1240,13 +1241,26 @@ def coiffeurs_competents(prestation: str, jour: str = None) -> list:
         return candidats if candidats else list(COIFFEURS)
 
     prest_norm = normaliser_texte(prestation)
-    competents = [
-        c for c in candidats
-        if any(prest_norm in normaliser_texte(s) or normaliser_texte(s) in prest_norm
-               for s in _normaliser_specialites(c.get("specialites")))
-    ]
-    # Si aucune spécialité ne matche → tous les candidats du jour sont compétents
-    return competents if competents else (candidats if candidats else list(COIFFEURS))
+
+    def _peut_faire(c: dict) -> bool:
+        return any(prest_norm in normaliser_texte(s) or normaliser_texte(s) in prest_norm
+                   for s in _normaliser_specialites(c.get("specialites")))
+
+    # Coiffeurs compétents disponibles ce jour
+    competents = [c for c in candidats if _peut_faire(c)]
+
+    if competents:
+        return competents
+
+    # Aucun compétent disponible ce jour — distinguer les deux cas :
+    # A) Personne ne fait cette prestation → fallback tous candidats (prestation générique)
+    # B) Des spécialistes existent mais sont tous en repos ce jour → retourner [] (pas de fallback)
+    competents_globaux = [c for c in COIFFEURS if _peut_faire(c)]
+    if competents_globaux:
+        # Cas B : spécialistes connus mais indisponibles ce jour → [] signale "repos"
+        return []
+    # Cas A : aucune spécialité définie pour cette prestation → tous candidats disponibles
+    return candidats if candidats else list(COIFFEURS)
 
 def get_coiffeurs_disponibles(jour: str, heure: str, duree: int = 45) -> list:
     """Retourne la liste des coiffeurs disponibles à l'heure demandée."""
@@ -2169,6 +2183,103 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
             _t_wh = threading.Thread(target=_run_webhook, daemon=True)
             _t_wh.start()
             print(f"📡 [WEBHOOK] Lancé en arrière-plan — réponse vocale immédiate")
+
+        # ── Notification fidélité Base44 agentRdvConfirmed — ARRIÈRE-PLAN ───────
+        if _rdv_id_cree and APP_SALON_ID:
+            _prenom_fid = (client_nom or "").split()[0] if client_nom else ""
+            _jour_fid = jour or ""
+            _heure_fid = heure or ""
+            try:
+                if _jour_fid and not (_jour_fid.count("-") == 2 and len(_jour_fid) == 10):
+                    _jour_fid = datetime.strptime(_jour_fid, "%d/%m/%Y").strftime("%Y-%m-%d")
+            except Exception:
+                pass
+            try:
+                if _heure_fid and "h" in _heure_fid.lower():
+                    _hp_fid = re.split(r"h", _heure_fid.lower())
+                    _heure_fid = f"{int(_hp_fid[0]):02d}:{int(_hp_fid[1]) if len(_hp_fid) > 1 and _hp_fid[1].strip() else 0:02d}"
+            except Exception:
+                pass
+            _fid_payload = json.dumps({
+                "client_telephone": telephone,
+                "client_nom":       _prenom_fid,
+                "prestation":       prestation,
+                "jour":             _jour_fid,
+                "heure":            _heure_fid,
+                "coiffeur":         coiffeur_choisi or "",
+                "appointment_id":   _rdv_id_cree,
+                "salon_id":         APP_SALON_ID,
+            }).encode("utf-8")
+
+            def _run_fidelite(
+                _url="https://snb-software.com/api/functions/agentRdvConfirmed",
+                _payload=_fid_payload,
+                _prenom=_prenom_fid,
+                _appt_id=_rdv_id_cree,
+            ):
+                import urllib.request as _req_fid
+                try:
+                    _req = _req_fid.Request(
+                        _url, data=_payload,
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with _req_fid.urlopen(_req, timeout=10) as _r:
+                        print(f"📊 [FIDELITE] Points envoyés pour {_prenom} | "
+                              f"appointment_id={_appt_id} | statut={_r.status}")
+                except Exception as _ef:
+                    print(f"⚠️ [FIDELITE] Échec silencieux : {_ef}")
+
+            threading.Thread(target=_run_fidelite, daemon=True).start()
+
+            # Lookup prix depuis PRESTATIONS_SALON (champ price) — match exact normalisé
+            _prest_norm_pts = normaliser_texte(prestation)
+            _prix_pts = next(
+                (p.get("price") or 0 for p in PRESTATIONS_SALON
+                 if normaliser_texte(p.get("name", "")) == _prest_norm_pts),
+                0
+            ) or 0
+
+            _pts_payload = json.dumps({
+                "client_telephone": telephone,
+                "client_nom":       _prenom_fid,
+                "prestation":       prestation,
+                "jour":             _jour_fid,
+                "heure":            _heure_fid,
+                "coiffeur":         coiffeur_choisi or "",
+                "appointment_id":   _rdv_id_cree,
+                "app_salon_id":     APP_SALON_ID,
+                "total_price":      _prix_pts,
+            }).encode("utf-8")
+
+            def _run_points(
+                _url="https://snb-software.com/api/functions/agentRdvPoints",
+                _payload=_pts_payload,
+                _prenom=_prenom_fid,
+                _appt_id=_rdv_id_cree,
+            ):
+                import urllib.request as _req_pts
+                import json as _json_pts
+                try:
+                    _req = _req_pts.Request(
+                        _url, data=_payload,
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with _req_pts.urlopen(_req, timeout=10) as _r:
+                        _rb = _r.read().decode("utf-8", errors="replace")
+                        try:
+                            _rj = _json_pts.loads(_rb)
+                            _pts_added = _rj.get("points_added", "?")
+                            _pts_total = _rj.get("total", "?")
+                        except Exception:
+                            _pts_added, _pts_total = "?", "?"
+                        print(f"✅ [FIDELITE] Points envoyés | client={_prenom} | "
+                              f"points={_pts_added}")
+                except Exception as _ep:
+                    print(f"⚠️ [FIDELITE] Échec | erreur={_ep}")
+
+            threading.Thread(target=_run_points, daemon=True).start()
 
         return f"RDV enregistré pour {jour} à {heure}.{fidelite}"
 
@@ -3499,7 +3610,7 @@ def _update_call_stat(call_sid: str, telephone: str, motif_echec: str = "abandon
                 duration = max(0, int((ended_at - _started).total_seconds()))
         except Exception:
             pass
-        rdv_pris = bool(ctx.get("rdv_pris", False))
+        rdv_pris = bool(ctx.get("rdv_pris", False) or ctx.get("rdv_id_cree"))
         motif    = None if rdv_pris else _deduire_motif_echec(telephone) if motif_echec == "abandon" else motif_echec
         update_data = {
             "ended_at":        ended_at.isoformat(),
@@ -3547,14 +3658,20 @@ async def sync_config(request: Request):
             HORAIRE_OUVERTURE = data["open_time"]
         if data.get("close_time"):
             HORAIRE_FERMETURE = data["close_time"]
-        _pd_raw = data.get("pause_debut") or data.get("break_start") or data.get("lunch_start")
-        _pf_raw = data.get("pause_fin")   or data.get("break_end")   or data.get("lunch_end")
-        if _pd_raw is not None:
-            PAUSE_DEBUT = str(_pd_raw)[:5] if _pd_raw else None
-            print(f"✅ [SYNC] PAUSE_DEBUT = {PAUSE_DEBUT}")
-        if _pf_raw is not None:
-            PAUSE_FIN = str(_pf_raw)[:5] if _pf_raw else None
-            print(f"✅ [SYNC] PAUSE_FIN = {PAUSE_FIN}")
+        pause_debut = (
+            data.get("lunch_break_start") or data.get("pause_debut")
+            or data.get("break_start") or None
+        )
+        pause_fin = (
+            data.get("lunch_break_end") or data.get("pause_fin")
+            or data.get("break_end") or None
+        )
+        PAUSE_DEBUT = pause_debut
+        PAUSE_FIN = pause_fin
+        if pause_debut:
+            print(f"✅ [SYNC] PAUSE = {pause_debut}-{pause_fin}")
+        else:
+            print(f"⚠️ [SYNC] PAUSE non configurée")
         if data.get("open_days"):
             jours_map = {
                 "Lundi": "lundi", "Mardi": "mardi",
@@ -3642,6 +3759,8 @@ async def sync_config(request: Request):
                 "webhook_url":       SALON_APP_WEBHOOK_URL,
                 "app_salon_id":      APP_SALON_ID,
             }
+            salon_row["pause_debut"] = pause_debut
+            salon_row["pause_fin"]   = pause_fin
             print(f"💾 [UPSERT] salon_row = {salon_row}")
             try:
                 supabase.table("salon").upsert(salon_row, on_conflict="id").execute()
