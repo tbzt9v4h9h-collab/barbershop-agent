@@ -929,179 +929,39 @@ def send_sms_confirmation(telephone: str, client_nom: str | None,
                           prestation: str, jour: str, heure: str,
                           rdv_id: str | None, client_id: str | None,
                           coiffeur: str | None = None):
-    """Envoie le SMS de confirmation immédiatement après enregistrement du RDV."""
+    """SMS confirmation court — 1 segment (< 160 chars, 1 émoji)."""
+    # Guard anti-doublon : 1 seul SMS par rdv_id
+    if rdv_id and supabase:
+        try:
+            if supabase.table("rappels_sms").select("id").eq("rdv_id", rdv_id).limit(1).execute().data:
+                print(f"⚠️ [SMS CONF] Déjà envoyé pour rdv_id={rdv_id} — ignoré")
+                return
+        except Exception:
+            pass
     try:
-        prenom = (client_nom or "").split()[0] if client_nom else ""
-        salut = f"Bonjour {prenom} !" if prenom else "Bonjour !"
-        # Date — jour de la semaine capitalisé + jour mois année
-        try:
-            _d = datetime.strptime(jour, "%Y-%m-%d").date()
-            _jour_sem = NOMS_JOURS_SMS[_d.weekday()].capitalize()
-            date_str = f"{_jour_sem} {_d.day} {NOMS_MOIS_SMS[_d.month - 1]} {_d.year}"
-        except Exception:
-            date_str = jour
-        # Heure — normaliser vers HHhMM
-        try:
-            _hp = (heure or "").split(":")
-            heure_str = f"{int(_hp[0])}h{_hp[1]}" if len(_hp) >= 2 else heure or ""
-        except Exception:
-            heure_str = heure or ""
-        # Lignes du corps
-        lignes = [
-            salut,
-            "",
-            f"Votre rendez-vous est confirmé chez {NOM_SALON} :",
-            "",
-            f"📅 {date_str}",
-            f"🕐 {heure_str}",
-            f"✂️ {prestation}",
-        ]
-        if coiffeur:
-            lignes.append(f"💈 Avec {coiffeur}")
-        lignes += [
-            "",
-            f"Pour annuler ou corriger une erreur, rappelez-nous au {TELEPHONE_SALON}.",
-            "",
-            f"L'équipe {NOM_SALON} — Propulsé par S&B",
-        ]
-        message = "\n".join(lignes)
-    except Exception as _e_conf:
-        print(f"❌ [SMS] Erreur construction confirmation : {_e_conf} → fallback utilisé")
-        _prenom_fb = (client_nom or "").split()[0] if client_nom else "vous"
-        message = (
-            f"Bonjour {_prenom_fb} ! Votre RDV est confirmé au {NOM_SALON} : "
-            f"{prestation} le {_format_date_sms(jour)} à {(heure or '')[:5]}. "
-            f"Pour annuler, appelez le {TELEPHONE_SALON}. À bientôt !"
-        )
+        _d = datetime.strptime(jour, "%Y-%m-%d").date()
+        _jour_court = f"{NOMS_JOURS_SMS[_d.weekday()][:3].capitalize()} {_d.day} {NOMS_MOIS_SMS[_d.month - 1]}"
+    except Exception:
+        _jour_court = jour
+    try:
+        _hp = (heure or "").split(":")
+        heure_str = f"{int(_hp[0])}h{_hp[1]}" if len(_hp) >= 2 else (heure or "")
+    except Exception:
+        heure_str = heure or ""
+    lignes = [
+        "RDV confirme",
+        f"{prestation} le {_jour_court} a {heure_str}",
+    ]
+    if coiffeur:
+        lignes.append(f"Coiffeur : {coiffeur}")
+    lignes.append(f"{NOM_SALON} - {TELEPHONE_SALON}")
+    message = "\n".join(lignes)
+    print(f"📱 [SMS CONF] {len(message)} chars | {telephone}")
     ok, sid = send_sms(telephone, message)
     save_rappel_sms(rdv_id, client_id, telephone, message,
                     "envoye" if ok else "echec", twilio_sid=sid)
 
 
-def send_rappels_sms():
-    """
-    TÂCHE 2 — Lance les SMS de rappel J-24h.
-    Lit les RDV de demain, envoie un SMS à chaque client,
-    enregistre le résultat dans rappels_sms.
-    Appelée automatiquement à 10h chaque matin par APScheduler.
-    """
-    demain = (date.today() + timedelta(days=1)).isoformat()
-    print(f"📨  [RAPPELS] Envoi des rappels pour le {demain}...")
-
-    try:
-        rdvs = supabase.table("rendez_vous")\
-            .select("id, client_id, jour, heure_debut, prestation")\
-            .eq("jour", demain)\
-            .eq("statut", "confirme")\
-            .execute().data or []
-    except Exception as e:
-        print(f"❌  [RAPPELS] Impossible de lire les RDV : {e}")
-        return
-
-    if not rdvs:
-        print(f"ℹ️   [RAPPELS] Aucun RDV pour demain ({demain}).")
-        return
-
-    for rdv in rdvs:
-        rdv_id    = rdv.get("id")
-        client_id = rdv.get("client_id")
-        jour      = rdv.get("jour", demain)
-        heure     = (rdv.get("heure_debut") or "")[:5]
-        prestation = rdv.get("prestation", "rendez-vous")
-
-        # Récupérer le téléphone du client
-        try:
-            client_row = supabase.table("clients")\
-                .select("telephone, nom")\
-                .eq("id", client_id)\
-                .limit(1).execute().data
-        except Exception as e:
-            print(f"⚠️  [RAPPELS] Client {client_id} introuvable : {e}")
-            continue
-
-        if not client_row:
-            continue
-
-        telephone  = client_row[0].get("telephone", "")
-        client_nom = client_row[0].get("nom")
-
-        if (not telephone or telephone in ("console_test",)
-                or not telephone.startswith("+") or len(telephone) < 8):
-            print(f"⚠️ [SMS] Numéro invalide ignoré : {telephone}")
-            continue
-
-        prenom = (client_nom or "").split()[0] if client_nom else "vous"
-        date_str = _format_date_sms(jour)
-        message = (
-            f"Rappel : Votre RDV au {NOM_SALON} est demain "
-            f"{date_str} à {heure} pour {prestation}. "
-            f"En cas d'empêchement, appelez le {TELEPHONE_SALON}. À demain !"
-        )
-        ok, sid = send_sms(telephone, message)
-        save_rappel_sms(rdv_id, client_id, telephone, message,
-                        "envoye" if ok else "echec", twilio_sid=sid)
-
-    print(f"✅  [RAPPELS] Traitement terminé ({len(rdvs)} RDV).")
-
-
-def send_rappel_1h(rdv_id, telephone, client_nom, jour, heure, prestation):
-    """Envoie un rappel SMS 1h avant le RDV."""
-    prenom = (client_nom or "").split()[0] if client_nom else ""
-    salut = f"Bonjour {prenom} ! " if prenom else "Bonjour ! "
-    message = (f"{salut}Rappel : votre RDV au {NOM_SALON} "
-               f"est dans 1 heure à {heure[:5]} pour {prestation}. À tout à l'heure !")
-    ok, sid = send_sms(telephone, message)
-    save_rappel_sms(rdv_id, None, telephone, message, "envoye" if ok else "echec", twilio_sid=sid)
-
-def check_rappels_1h():
-    """Tourne toutes les heures — envoie rappels pour les RDV dans ~1h."""
-    if not supabase:
-        return
-    try:
-        maintenant = now_paris()
-        dans_1h = (maintenant + timedelta(hours=1)).strftime("%H:%M")
-        aujourdhui = maintenant.date().isoformat()
-        rdvs = supabase.table("rendez_vous").select("*")\
-            .eq("jour", aujourdhui).eq("statut", "confirme")\
-            .eq("heure_debut", dans_1h + ":00").execute().data or []
-        for rdv in rdvs:
-            client_id = rdv.get("client_id")
-            telephone = None
-            nom = None
-            if client_id and supabase:
-                try:
-                    c = supabase.table("clients").select("telephone,nom").eq("id", client_id).execute()
-                    if c.data:
-                        telephone = c.data[0].get("telephone")
-                        nom = c.data[0].get("nom")
-                except Exception:
-                    pass
-            if telephone:
-                send_rappel_1h(rdv.get("id"), telephone, nom,
-                               rdv.get("jour"), rdv.get("heure_debut", dans_1h),
-                               rdv.get("prestation", ""))
-    except Exception as e:
-        print(f"⚠️ check_rappels_1h erreur : {e}")
-
-def send_rapport_hebdo():
-    """Envoie un rapport SMS hebdomadaire au salon chaque lundi à 8h."""
-    if not supabase or not twilio_client:
-        return
-    try:
-        lundi = (date.today() - timedelta(days=date.today().weekday())).isoformat()
-        dimanche = (date.today() - timedelta(days=date.today().weekday() - 6)).isoformat()
-        rdvs = supabase.table("rendez_vous").select("*")\
-            .gte("jour", lundi).lte("jour", dimanche).eq("statut", "confirme").execute().data or []
-        nb_rdv = len(rdvs)
-        ca_estime = nb_rdv * 30
-        # Nouveaux clients cette semaine
-        nouveaux = supabase.table("clients").select("id")\
-            .gte("created_at", lundi + "T00:00:00").execute().data or []
-        msg = (f"📊 Rapport semaine :\nRDV pris : {nb_rdv}\n"
-               f"CA estimé : {ca_estime}€\nNouveaux clients : {len(nouveaux)}\nBonne semaine !")
-        twilio_client.messages.create(to=TELEPHONE_SALON, from_=TWILIO_NUMBER, body=msg)
-    except Exception as e:
-        print(f"⚠️ send_rapport_hebdo erreur : {e}")
 
 def send_stats_quotidiennes():
     """Calcule et log les stats d'appels du jour pour chaque salon (23h55)."""
@@ -1131,22 +991,16 @@ def send_stats_quotidiennes():
     except Exception as _e:
         print(f"⚠️ [STATS QUOTIDIENNES] Erreur : {_e}")
 
-# ── Scheduler rappels SMS J-24h (10h00 chaque matin) ──────────────────────
+# ── Scheduler — nettoyage historiques + stats quotidiennes ─────────────────
 print("🔵 [BOOT 7/8] Démarrage APScheduler…")
 try:
     scheduler = BackgroundScheduler(timezone="Europe/Paris")
-    scheduler.add_job(send_rappels_sms, "cron", hour=10, minute=0,
-                      id="rappels_sms_quotidiens", replace_existing=True)
-    scheduler.add_job(check_rappels_1h, "cron", minute=0,
-                      id="rappels_1h", replace_existing=True)
-    scheduler.add_job(send_rapport_hebdo, "cron", day_of_week="mon", hour=8,
-                      id="rapport_hebdo", replace_existing=True)
     scheduler.add_job(nettoyer_historiques, "cron", minute=30,
                       id="nettoyage_historiques", replace_existing=True)
     scheduler.add_job(send_stats_quotidiennes, "cron", hour=23, minute=55,
                       id="stats_quotidiennes", replace_existing=True)
     scheduler.start()
-    print("🔵 [BOOT 7/8] Scheduler OK — rappels 10h00, rappels 1h, rapport lundi 8h")
+    print("🔵 [BOOT 7/8] Scheduler OK — nettoyage :30 | stats 23h55")
 except Exception as _e_sched:
     print(f"⚠️  [BOOT 7/8] Scheduler non démarré : {_e_sched}")
 
@@ -2603,35 +2457,16 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
                 f"| coiffeur={_rdv_coiffeur!r} | tel={telephone}"
             )
 
-            try:
-                _salut = f"Bonjour {_prenom_ann}," if _prenom_ann else "Bonjour,"
-
-                # Ligne "votre rendez-vous du ... à ... chez ... pour ... avec ..."
-                if _date_affichee and _heure_affichee:
-                    _ligne_rdv = (
-                        f"Votre rendez-vous du {_date_affichee} à {_heure_affichee} "
-                        f"chez {NOM_SALON} pour {_prest_affichee}"
-                    )
-                    if _rdv_coiffeur:
-                        _ligne_rdv += f" avec {_rdv_coiffeur}"
-                    _ligne_rdv += " a bien été annulé."
-                else:
-                    _ligne_rdv = f"Votre rendez-vous chez {NOM_SALON} a bien été annulé."
-
-                message_annulation = (
-                    f"{_salut}\n\n"
-                    f"{_ligne_rdv}\n\n"
-                    f"Pour reprendre rendez-vous, appelez-nous au {TELEPHONE_SALON}.\n\n"
-                    f"L'équipe {NOM_SALON} — Propulsé par S&B"
+            _ann_lignes = ["RDV annule"]
+            if _date_affichee and _heure_affichee:
+                _ann_lignes.append(
+                    f"{_prest_affichee} le {_date_affichee} a {_heure_affichee}"
                 )
-            except Exception as _e_sms:
-                print(f"❌ [SMS ANNULATION] Erreur construction : {_e_sms} → fallback utilisé")
-                _salut_fb = f"Bonjour {_prenom_ann}," if _prenom_ann else "Bonjour,"
-                message_annulation = (
-                    f"{_salut_fb} votre rendez-vous chez {NOM_SALON} a bien été annulé. "
-                    f"Nous espérons vous revoir très prochainement. "
-                    f"L'équipe {NOM_SALON} — Propulsé par S&B"
-                )
+            if _rdv_coiffeur:
+                _ann_lignes.append(f"Coiffeur : {_rdv_coiffeur}")
+            _ann_lignes.append(f"{NOM_SALON} - {TELEPHONE_SALON}")
+            message_annulation = "\n".join(_ann_lignes)
+            print(f"📱 [SMS ANNUL] {len(message_annulation)} chars | {telephone}")
 
             ok_sms, _sid = send_sms(telephone, message_annulation)
             print(f"📱 [ANNULATION] SMS envoyé : ok={ok_sms}")
@@ -4425,11 +4260,11 @@ def handle_appel(
                 "Excusez-moi, pouvez-vous répéter votre réponse ?",
             ]
             _msg_relance = _rand.choice(msgs_relance)
-            print(f"📡 [GATHER] silence {nb_silences}/3 mid-conv | action=/appel POST | speech_timeout=2 timeout=8")
+            print(f"📡 [GATHER] silence {nb_silences}/3 mid-conv | action=/appel POST | speech_timeout=2 timeout=5")
             gather = twiml.gather(
                 input="speech", action="/appel", method="POST",
                 language="fr-FR", speech_timeout="2",
-                speech_model="phone_call", timeout=8, hints=HINTS,
+                speech_model="phone_call", timeout=5, hints=HINTS,
             )
             gather.say(_msg_relance, language="fr-FR", voice="Polly.Lea", barge_in=False)
             return str(twiml)
@@ -4449,11 +4284,11 @@ def handle_appel(
                 f"Bonjour, vous êtes bien chez {NOM_SALON}. Je vous écoute.",
             ]
         _msg_reaccueil = _rand.choice(_accueils_retry)
-        print(f"📡 [GATHER] silence {nb_silences}/3 post-accueil — rejouer accueil | action=/appel POST | speech_timeout=2 timeout=8")
+        print(f"📡 [GATHER] silence {nb_silences}/3 post-accueil — rejouer accueil | action=/appel POST | speech_timeout=2 timeout=5")
         gather = twiml.gather(
             input="speech", action="/appel", method="POST",
             language="fr-FR", speech_timeout="2",
-            speech_model="phone_call", timeout=8, hints=HINTS,
+            speech_model="phone_call", timeout=5, hints=HINTS,
         )
         gather.say(_msg_reaccueil, language="fr-FR", voice="Polly.Lea", barge_in=False)
         return str(twiml)
@@ -4603,7 +4438,7 @@ def handle_appel(
         f"shampoing={question_shampoing} heure={question_heure} "
         f"jour={question_jour} prestation={question_prestation} annulation={question_annulation}"
     )
-    print(f"📡 [GATHER] main | action=/appel POST | speech_timeout=2 timeout=8 | {_gather_ctx} | hints_len={len(hints_gather)}c")
+    print(f"📡 [GATHER] main | action=/appel POST | speech_timeout=2 timeout=5 | {_gather_ctx} | hints_len={len(hints_gather)}c")
 
     gather = twiml.gather(
         input="speech",
@@ -4612,7 +4447,7 @@ def handle_appel(
         language="fr-FR",
         speech_timeout="2",
         speech_model="phone_call",
-        timeout=8,
+        timeout=5,
         hints=hints_gather,
     )
     gather.say(texte_final, language="fr-FR", voice="Polly.Lea", barge_in=False)
