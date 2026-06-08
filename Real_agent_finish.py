@@ -580,12 +580,12 @@ def get_or_create_client(telephone: str) -> dict:
                 .execute()
             client = nouveau.data[0]
             update_client_context(telephone, client_nouveau=True)
-        # Enrichir le contexte avec les RDVs passés
+        # Enrichir le contexte avec les RDVs passés (appointment)
         try:
-            rdvs = supabase.table("rendez_vous")\
+            rdvs = supabase.table("appointment")\
                 .select("*")\
-                .eq("client_id", client.get("id"))\
-                .order("jour", desc=True).limit(5).execute().data or []
+                .eq("client_phone", telephone)\
+                .order("date", desc=True).limit(5).execute().data or []
             derniere_visite = rdvs[0] if rdvs else None
             update_client_context(telephone,
                 nb_visites=client.get("nb_visites", 0),
@@ -644,63 +644,42 @@ def enregistrer_rdv(client_id, jour, heure, type_client,
             print(f"⚠️ [RDV] Erreur salon_id : {e}")
 
     try:
-        heure_fin = ajouter_minutes_hhmm(heure, duree_max)
-        row = {
-            "client_id":      client_id,
-            "salon_id":       salon_id,
-            "jour":           jour,
-            "heure_debut":    heure,
-            "heure_fin":      heure_fin,
-            "prestation":     prestation,
-            "type_client":    type_client,
-            "coupe_detail":   coupe_detail,
-            "couleur_detail": couleur_detail,
-            "avec_shampoing": avec_shampoing,
-            "prix":           prix,
-            "statut":         "confirme",
+        heure_fin = ajouter_minutes_hhmm(heure, 30)
+        salon_id_eff = salon_id or _session_salon_id
+
+        if not salon_id_eff:
+            res = supabase.table("salon").select("id")\
+                .eq("twilio_number", TWILIO_NUMBER)\
+                .limit(1).execute()
+            if res.data:
+                salon_id_eff = res.data[0]["id"]
+
+        print(f"💾 [APPOINTMENT] salon_id={salon_id_eff} "
+              f"client={client_nom} jour={jour} heure={heure}")
+
+        appt_row = {
+            "salon_id":       salon_id_eff,
+            "client_name":    client_nom or telephone or "Inconnu",
+            "client_phone":   telephone or "",
+            "status":         "confirme",
+            "date":           jour,
+            "time":           heure + ":00" if len(heure) == 5 else heure,
+            "heure_fin":      heure_fin + ":00" if len(heure_fin) == 5 else heure_fin,
+            "service":        prestation,
+            "staff_name":     coupe_detail or "",
+            "coupe_detail":   coupe_detail or "",
+            "type_client":    type_client or "homme",
+            "avec_shampoing": bool(avec_shampoing),
+            "price":          prix or 0,
+            "source":         "agent_vocal",
+            "rappel_envoye":  False,
+            "created_at":     datetime.now(timezone.utc).isoformat(),
+            "notes":          json.dumps({"source": "agent_vocal"}),
         }
-        result = supabase.table("rendez_vous").insert(row).execute()
-        rdv_id = result.data[0]["id"] if result.data else None
 
-        # Écriture simultanée dans la table "appointment"
-        try:
-            salon_id_eff = salon_id or _session_salon_id
-
-            # Résoudre salon_id si toujours None
-            if not salon_id_eff:
-                res = supabase.table("salon").select("id")\
-                    .eq("twilio_number", TWILIO_NUMBER)\
-                    .limit(1).execute()
-                if res.data:
-                    salon_id_eff = res.data[0]["id"]
-
-            print(f"💾 [APPOINTMENT] salon_id={salon_id_eff} "
-                  f"client={client_nom} jour={jour} heure={heure}")
-
-            appt_row = {
-                "salon_id":     salon_id_eff,
-                "client_name":  client_nom or telephone or "Inconnu",
-                "client_phone": telephone or "",
-                "status":       "confirme",
-                "date":         jour,
-                "time":         heure + ":00" if len(heure) == 5 else heure,
-                "service":      prestation,
-                "staff_name":   coupe_detail or "",
-                "price":        prix or 0,
-                "created_at":   datetime.now(timezone.utc).isoformat(),
-                "notes":        json.dumps({"source": "agent"}),
-            }
-
-            appt_result = supabase.table("appointment")\
-                .insert(appt_row).execute()
-            appt_id = appt_result.data[0]["id"] \
-                      if appt_result.data else None
-            print(f"✅ [APPOINTMENT] Inséré id={appt_id}")
-
-        except Exception as e_appt:
-            print(f"❌ [APPOINTMENT] ERREUR : {e_appt}")
-            import traceback
-            traceback.print_exc()
+        appt_result = supabase.table("appointment").insert(appt_row).execute()
+        rdv_id = appt_result.data[0]["id"] if appt_result.data else None
+        print(f"✅ [APPOINTMENT] Inséré id={rdv_id}")
 
         if client_id:
             client_row = supabase.table("clients")\
@@ -728,6 +707,8 @@ def enregistrer_rdv(client_id, jour, heure, type_client,
 
     except Exception as e:
         print(f"Erreur Supabase enregistrer_rdv: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 def sync_appointment_columns():
@@ -744,13 +725,15 @@ def sync_appointment_columns():
         print(f"⚠️ [APPOINTMENT] Erreur lecture colonnes : {e}")
 
 def est_creneau_disponible(jour: str, heure: str) -> bool:
-    """Vérifie la disponibilité d'un créneau dans Supabase (table rendez_vous, heure exacte)."""
+    """Vérifie la disponibilité d'un créneau dans appointment (heure exacte)."""
     try:
-        result = supabase.table("rendez_vous")\
+        time_sql = heure + ":00" if len(heure) == 5 else heure
+        result = supabase.table("appointment")\
             .select("id")\
-            .eq("jour", jour)\
-            .eq("heure_debut", heure)\
-            .eq("statut", "confirme")\
+            .eq("date", jour)\
+            .eq("time", time_sql)\
+            .neq("status", "cancelled")\
+            .neq("status", "annule")\
             .execute()
         return len(result.data) == 0
     except Exception as e:
@@ -759,7 +742,7 @@ def est_creneau_disponible(jour: str, heure: str) -> bool:
 
 def est_creneau_disponible_v2(jour: str, heure: str, coiffeur: str = None) -> dict:
     """
-    Vérification étendue : rendez_vous + appointment, fenêtre chevauchement 30min, per-coiffeur.
+    Vérification étendue : appointment, fenêtre chevauchement 30min, per-coiffeur.
     Retourne : {"disponible": bool, "coiffeurs_libres": list[str], "rdvs_trouves": int}
     """
     rdvs_trouves = 0
@@ -771,26 +754,7 @@ def est_creneau_disponible_v2(jour: str, heure: str, coiffeur: str = None) -> di
     try:
         heure_min = parse_hhmm_en_minutes(heure)
 
-        # ── Table rendez_vous (RDVs pris par l'agent) ──────────────────────────
-        # Si un coiffeur est connu, filtrer côté DB pour n'examiner QUE ses RDVs
-        q_rv = supabase.table("rendez_vous")\
-            .select("heure_debut, heure_fin, coupe_detail")\
-            .eq("jour", jour).eq("statut", "confirme")
-        if coiffeur:
-            q_rv = q_rv.eq("coupe_detail", coiffeur)
-        res_rv = q_rv.execute()
-        for rdv in (res_rv.data or []):
-            try:
-                h_deb = parse_hhmm_en_minutes(rdv.get("heure_debut") or "00:00")
-                h_fin = parse_hhmm_en_minutes(rdv.get("heure_fin") or "00:00")
-                if h_deb <= heure_min < h_fin:
-                    rdvs_trouves += 1
-                    if rdv.get("coupe_detail"):
-                        coiffeurs_pris.add(_norm(rdv["coupe_detail"]))
-            except Exception:
-                pass
-
-        # ── Table appointment (RDVs pris via app Base44) ───────────────────────
+        # ── Table appointment (source unique de vérité) ────────────────────────
         q_ap = supabase.table("appointment")\
             .select("time, staff_name, duration_minutes")\
             .eq("date", jour).neq("status", "cancelled")
@@ -852,17 +816,20 @@ def est_creneau_disponible_v2(jour: str, heure: str, coiffeur: str = None) -> di
 
     return {"disponible": disponible, "coiffeurs_libres": coiffeurs_libres, "rdvs_trouves": rdvs_trouves}
 
-def get_rdv_client(client_id: str) -> list:
-    """Récupère les RDV à venir d'un client."""
+def get_rdv_client(telephone: str) -> list:
+    """Récupère les RDV à venir d'un client depuis appointment."""
     try:
         today = now_paris().date().isoformat()
-        result = supabase.table("rendez_vous")\
+        q = supabase.table("appointment")\
             .select("*")\
-            .eq("client_id", client_id)\
-            .eq("statut", "confirme")\
-            .gte("jour", today)\
-            .order("jour")\
-            .execute()
+            .eq("client_phone", telephone)\
+            .neq("status", "cancelled")\
+            .neq("status", "annule")\
+            .gte("date", today)\
+            .order("date")
+        if _session_salon_id:
+            q = q.eq("salon_id", _session_salon_id)
+        result = q.execute()
         return result.data or []
     except Exception as e:
         print(f"Erreur Supabase get_rdv_client: {e}")
@@ -1015,30 +982,18 @@ def annuler_rdv(client_id: str, rdv_id: str) -> bool:
     if not rdv_id:
         print("❌ [ANNULATION] rdv_id manquant")
         return False
-    ok = False
     try:
-        # Table rendez_vous (RDVs agent)
-        res_rv = supabase.table("rendez_vous")\
-            .update({"statut": "annule"})\
-            .eq("id", rdv_id)\
-            .execute()
-        if res_rv.data:
-            ok = True
-            print(f"✅ [ANNULATION] rendez_vous id={rdv_id} annulé")
-    except Exception as e:
-        print(f"⚠️ [ANNULATION] rendez_vous : {e}")
-    try:
-        # Table appointment (RDVs Base44)
         res_ap = supabase.table("appointment")\
             .update({"status": "cancelled"})\
             .eq("id", rdv_id)\
             .execute()
-        if res_ap.data:
-            ok = True
+        ok = bool(res_ap.data)
+        if ok:
             print(f"✅ [ANNULATION] appointment id={rdv_id} annulé")
+        return ok
     except Exception as e:
         print(f"⚠️ [ANNULATION] appointment : {e}")
-    return ok
+        return False
 
 def _normaliser_specialites(raw) -> list:
     """Convertit specialites en liste de strings, quel que soit le format reçu."""
@@ -1119,9 +1074,11 @@ def coiffeurs_competents(prestation: str, jour: str = None) -> list:
 def get_coiffeurs_disponibles(jour: str, heure: str, duree: int = 45) -> list:
     """Retourne la liste des coiffeurs disponibles à l'heure demandée."""
     try:
-        rdvs = supabase.table("rendez_vous").select("coupe_detail")\
-            .eq("jour", jour).eq("heure_debut", heure).eq("statut", "confirme").execute()
-        coiffeurs_pris = {(r.get("coupe_detail") or "").strip().lower() for r in (rdvs.data or [])}
+        time_sql = heure + ":00" if len(heure) == 5 else heure
+        rdvs = supabase.table("appointment").select("staff_name")\
+            .eq("date", jour).eq("time", time_sql)\
+            .neq("status", "cancelled").neq("status", "annule").execute()
+        coiffeurs_pris = {(r.get("staff_name") or "").strip().lower() for r in (rdvs.data or [])}
         disponibles = [c for c in COIFFEURS if c["nom"].strip().lower() not in coiffeurs_pris]
         return disponibles if disponibles else COIFFEURS
     except Exception as e:
@@ -2229,11 +2186,13 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
                     maintenant_min = _np.hour * 60 + _np.minute
                     if heure_min - maintenant_min < 120:
                         try:
-                            reste = supabase.table("rendez_vous")\
+                            heure_sql = heure + ":00" if len(heure) == 5 else heure
+                            reste = supabase.table("appointment")\
                                 .select("id")\
-                                .eq("jour", aujourd_hui)\
-                                .eq("statut", "confirme")\
-                                .gte("heure_debut", heure)\
+                                .eq("date", aujourd_hui)\
+                                .neq("status", "cancelled")\
+                                .neq("status", "annule")\
+                                .gte("time", heure_sql)\
                                 .execute()
                             nb_pris = len(reste.data) if reste.data else 0
                             slots_total = (ferm_min - heure_min) // 30
@@ -2406,36 +2365,6 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
         except Exception as _e:
             print(f"⚠️ [ANNULATION] Impossible de récupérer détails appointment : {_e}")
 
-        # Fallback sur rendez_vous si appointment vide
-        if not _rdv_date_lisible:
-            try:
-                _r2 = supabase.table("rendez_vous")\
-                    .select("prestation,jour,heure_debut,coupe_detail")\
-                    .eq("id", rdv_id).execute()
-                if _r2.data:
-                    _d2 = _r2.data[0]
-                    if not _rdv_prestation:
-                        _rdv_prestation = (_d2.get("prestation") or "").strip()
-                    if not _rdv_coiffeur:
-                        _rdv_coiffeur = (_d2.get("coupe_detail") or "").strip()
-                    _date_iso2 = (_d2.get("jour") or "").strip()
-                    if _date_iso2:
-                        try:
-                            _dt2 = datetime.strptime(_date_iso2, "%Y-%m-%d").date()
-                            _rdv_date_lisible = f"{NOMS_JOURS_SMS[_dt2.weekday()].capitalize()} {_dt2.day} {NOMS_MOIS_SMS[_dt2.month - 1]} {_dt2.year}"
-                        except Exception:
-                            _rdv_date_lisible = _date_iso2
-                    _heure_raw2 = (_d2.get("heure_debut") or "").strip()
-                    if _heure_raw2 and not _rdv_heure_lisible:
-                        try:
-                            _parts2 = _heure_raw2.split(":")
-                            _h2, _m2 = int(_parts2[0]), _parts2[1]
-                            _rdv_heure_lisible = f"{_h2}h{_m2}"
-                        except Exception:
-                            _rdv_heure_lisible = _heure_raw2
-            except Exception as _e2:
-                print(f"⚠️ [ANNULATION] Impossible de récupérer détails rendez_vous : {_e2}")
-
         print(f"🗑️ [ANNULATION] détails récupérés : date={_rdv_date_lisible!r} heure={_rdv_heure_lisible!r} prestation={_rdv_prestation!r} coiffeur={_rdv_coiffeur!r}")
 
         if annuler_rdv(None, rdv_id):
@@ -2544,15 +2473,15 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str) -> str:
         print(f"📋 [RDV ACTIF] tel_gpt={tel_gpt!r} | tel_reel={tel_reel!r} | utilise={tel!r}")
         client = get_or_create_client(tel)
         client_id = client.get("id")
-        print(f"📋 [RDV ACTIF] Recherche RDVs pour client_id={client_id}")
-        rdvs = get_rdv_client(client_id)
+        print(f"📋 [RDV ACTIF] Recherche RDVs pour tel={tel}")
+        rdvs = get_rdv_client(tel)
         if not rdvs:
             return "Aucun RDV à venir pour ce client."
         rdvs_str = []
         for r in rdvs:
             rdvs_str.append(
-                f"ID:{r['id']} | {r['jour']} à "
-                f"{r['heure_debut']} | {r['prestation']}"
+                f"ID:{r['id']} | {r.get('date', '')} à "
+                f"{(r.get('time') or '')[:5]} | {r.get('service', '')}"
             )
         update_client_context(tel, client_id=client_id)
         return "RDV trouvés : " + " /// ".join(rdvs_str)
@@ -3834,15 +3763,6 @@ async def annuler_rdv_base44(request: Request):
 
         print(f"🗑️ [ANNULATION BASE44] rdv_id={rdv_id} tel={telephone}")
 
-        # Annuler dans rendez_vous
-        try:
-            supabase.table("rendez_vous")\
-                .update({"statut": "annule"})\
-                .eq("id", rdv_id)\
-                .execute()
-        except Exception as e:
-            print(f"⚠️ [ANNULATION] rendez_vous : {e}")
-
         # Annuler dans appointment
         try:
             supabase.table("appointment")\
@@ -3952,24 +3872,6 @@ async def sync_appointment(request: Request):
                 appt_res = supabase.table("appointment").insert(appt_row).execute()
                 supabase_id = appt_res.data[0]["id"] if appt_res.data else None
 
-            # ── Insertion dans rendez_vous pour que l'agent voie ce créneau ────────
-            try:
-                rv_row = {
-                    "salon_id":      salon_id_eff,
-                    "jour":          jour,
-                    "heure_debut":   heure,
-                    "heure_fin":     ajouter_minutes_hhmm(heure, 30),
-                    "prestation":    prestation,
-                    "coupe_detail":  coiffeur,
-                    "statut":        "confirme",
-                    "avec_shampoing": avec_shampoing,
-                    "prix":          0,
-                    "type_client":   "app",
-                }
-                supabase.table("rendez_vous").insert(rv_row).execute()
-            except Exception as e_rv:
-                print(f"⚠️ [SYNC-APPOINTMENT] Erreur insert rendez_vous : {e_rv}")
-
             print(f"✅ [SYNC-APPOINTMENT] Créé | supabase_id={supabase_id} | doublon=False")
             return {"success": True, "supabase_id": supabase_id, "doublon": False}
 
@@ -3992,14 +3894,6 @@ async def sync_appointment(request: Request):
                     "date": jour, "time": time_sql,
                     "staff_name": coiffeur, "service": prestation,
                 }).eq("id", target_id).execute()
-                # Sync rendez_vous
-                try:
-                    supabase.table("rendez_vous").update({
-                        "heure_debut": heure, "heure_fin": ajouter_minutes_hhmm(heure, 30),
-                        "prestation": prestation, "coupe_detail": coiffeur,
-                    }).eq("jour", jour).eq("coupe_detail", coiffeur).eq("statut", "confirme").execute()
-                except Exception:
-                    pass
                 print(f"✅ [SYNC-APPOINTMENT] Mis à jour | supabase_id={target_id}")
                 return {"success": True, "supabase_id": target_id, "doublon": False}
             else:
@@ -4023,12 +3917,6 @@ async def sync_appointment(request: Request):
 
             if target_id:
                 supabase.table("appointment").update({"status": "cancelled"}).eq("id", target_id).execute()
-                # Sync rendez_vous
-                try:
-                    supabase.table("rendez_vous").update({"statut": "annule"})\
-                        .eq("jour", jour).eq("heure_debut", heure).eq("statut", "confirme").execute()
-                except Exception:
-                    pass
                 print(f"✅ [SYNC-APPOINTMENT] Annulé | supabase_id={target_id}")
                 return {"success": True, "supabase_id": target_id}
             else:
