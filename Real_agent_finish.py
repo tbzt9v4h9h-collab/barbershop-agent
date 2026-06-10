@@ -710,7 +710,8 @@ def est_creneau_disponible(jour: str, heure: str) -> bool:
         print(f"Erreur Supabase est_creneau_disponible: {e}")
         return True
 
-def est_creneau_disponible_v2(jour: str, heure: str, coiffeur: str = None, coiffeurs: list = None) -> dict:
+def est_creneau_disponible_v2(jour: str, heure: str, coiffeur: str = None,
+                               coiffeurs: list = None, salon_id: str = None) -> dict:
     """
     Vérification étendue : appointment, fenêtre chevauchement 30min, per-coiffeur.
     Retourne : {"disponible": bool, "coiffeurs_libres": list[str], "rdvs_trouves": int}
@@ -727,6 +728,8 @@ def est_creneau_disponible_v2(jour: str, heure: str, coiffeur: str = None, coiff
         q_ap = supabase.table("appointment")\
             .select("time, staff_name, duration_minutes")\
             .eq("date", jour).neq("status", "cancelled")
+        if salon_id:
+            q_ap = q_ap.eq("salon_id", salon_id)
         if coiffeur:
             q_ap = q_ap.eq("staff_name", coiffeur)
         res_ap = q_ap.execute()
@@ -774,10 +777,10 @@ def est_creneau_disponible_v2(jour: str, heure: str, coiffeur: str = None, coiff
         coiffeur_pris = coiffeur_en_rdv or coiffeur_en_repos
         disponible = not coiffeur_pris
         _raison = "repos" if coiffeur_en_repos else ("RDV" if coiffeur_en_rdv else "libre")
-        print(f"🔍 [DISPO] jour={jour} heure={heure} coiffeur={coiffeur!r} | rdvs_trouves={rdvs_trouves} | raison={_raison} | statut={'occupé' if coiffeur_pris else 'libre'}")
+        print(f"🔍 [DISPO] salon_id={salon_id} | coiffeur={coiffeur!r} | rdvs_trouves={rdvs_trouves} | raison={_raison} | statut={'occupé' if coiffeur_pris else 'libre'}")
     else:
         disponible = rdvs_trouves == 0 or bool(coiffeurs_libres)
-        print(f"🔍 [DISPO] jour={jour} heure={heure} | rdvs_trouves={rdvs_trouves} | coiffeurs_pris={coiffeurs_pris} | statut={'occupé' if not disponible else 'libre'}")
+        print(f"🔍 [DISPO] salon_id={salon_id} | coiffeur=any | rdvs_trouves={rdvs_trouves} | coiffeurs_pris={coiffeurs_pris} | statut={'occupé' if not disponible else 'libre'}")
 
     return {"disponible": disponible, "coiffeurs_libres": coiffeurs_libres, "rdvs_trouves": rdvs_trouves}
 
@@ -1053,11 +1056,13 @@ def get_prochains_creneaux_disponibles(jour: str, heure_souhaitee: str, nb: int 
                                         salon: dict = None) -> list:
     """Retourne les nb prochains créneaux libres à partir de l'heure souhaitée, pour le coiffeur donné."""
     coiffeurs = coiffeurs or []
+    _salon_id_pcc = (salon or {}).get("id")
     creneaux = []
     heure_courante = heure_souhaitee or (salon or {}).get("horaire_ouverture", "09:00")
     for _ in range(20):
         if heure_valide_format(heure_courante) and est_horaire_ouverture(heure_courante, salon=salon):
-            _d = est_creneau_disponible_v2(jour, heure_courante, coiffeur=coiffeur or None, coiffeurs=coiffeurs)
+            _d = est_creneau_disponible_v2(jour, heure_courante, coiffeur=coiffeur or None,
+                                            coiffeurs=coiffeurs, salon_id=_salon_id_pcc)
             if _d["disponible"]:
                 creneaux.append(heure_courante)
                 if len(creneaux) >= nb:
@@ -1834,7 +1839,8 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str,
         update_client_context(ctx_key, rdv_prestation=prestation)
 
         # Vérifier la disponibilité par coiffeur (pas de blocage global)
-        _check_rdv = est_creneau_disponible_v2(jour, heure, coiffeur=coiffeur_choisi, coiffeurs=coiffeurs)
+        _check_rdv = est_creneau_disponible_v2(jour, heure, coiffeur=coiffeur_choisi,
+                                               coiffeurs=coiffeurs, salon_id=salon.get("id"))
         if not _check_rdv["disponible"]:
             print(f"❌ [PRENDRE_RDV] Créneau indisponible pour {coiffeur_choisi or 'tout coiffeur'} à {heure} le {jour}")
             return f"Créneau indisponible. Merci de vérifier."
@@ -2144,6 +2150,7 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str,
                         pause_deb_min = parse_hhmm_en_minutes(_pause_deb)
                         pause_fin_min = parse_hhmm_en_minutes(_pause_fin_s)
                         if pause_deb_min <= heure_min < pause_fin_min:
+                            print(f"⏸️ [{nom_salon}] [PAUSE] heure={heure} dans pause {_pause_deb}-{_pause_fin_s} → refusé")
                             return (
                                 f"Indisponible - le salon est en pause déjeuner "
                                 f"de {_pause_deb} à {_pause_fin_s}. "
@@ -2188,7 +2195,8 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str,
         _coiffeur_demande = (
             tool_input.get("coiffeur") or get_client_context(ctx_key).get("rdv_coiffeur", "")
         ).strip()
-        _dispo = est_creneau_disponible_v2(jour, heure, coiffeur=_coiffeur_demande or None, coiffeurs=coiffeurs)
+        _dispo = est_creneau_disponible_v2(jour, heure, coiffeur=_coiffeur_demande or None,
+                                            coiffeurs=coiffeurs, salon_id=salon.get("id"))
         _coiffeurs_libres = _dispo["coiffeurs_libres"]
         _noms_libres_norm = {c.strip().lower() for c in _coiffeurs_libres}
 
@@ -2879,8 +2887,9 @@ def run_agent(message_user: str, telephone: str,
     # ── VALIDATION 1 — Prestation sans coiffeur : vérifier compétences ──────
     _rdv_coiffeur_v = _ctx_force.get("rdv_coiffeur", "")
     if _rdv_p and not _rdv_coiffeur_v and coiffeurs:
-        _comp_v1 = coiffeurs_competents(_rdv_p, coiffeurs=coiffeurs)
-        print(f"🔍 [{nom_salon}] [VALID 1] prestation={_rdv_p!r} | compétents : {[c['nom'] for c in _comp_v1]}")
+        # Passer jour pour exclure dès ici les coiffeurs en repos ce jour-là
+        _comp_v1 = coiffeurs_competents(_rdv_p, jour=_rdv_j or None, coiffeurs=coiffeurs)
+        print(f"🔍 [{nom_salon}] [VALID 1] prestation={_rdv_p!r} jour={_rdv_j or '—'} | compétents : {[c['nom'] for c in _comp_v1]}")
         if len(_comp_v1) == 0:
             _prest_list_v1 = ", ".join([p.get("name", "") for p in prestations if p.get("name")]) or "nos prestations"
             _resp_v1 = (f"Je suis désolé, aucun de nos coiffeurs ne propose la prestation \"{_rdv_p}\". "
@@ -2892,6 +2901,27 @@ def run_agent(message_user: str, telephone: str,
             update_client_context(ctx_key, rdv_coiffeur=_rdv_coiffeur_v)
             print(f"✅ [{nom_salon}] [VALID 1] Un seul coiffeur compétent → assigné automatiquement : {_rdv_coiffeur_v!r}")
 
+    # ── VALIDATION 1b — Coiffeur déjà en contexte : vérifier ses compétences ─
+    elif _rdv_p and _rdv_coiffeur_v and coiffeurs:
+        _comp_v1b = coiffeurs_competents(_rdv_p, coiffeurs=coiffeurs)
+        _coif_norm_v1b = _rdv_coiffeur_v.strip().lower()
+        _est_competent_v1b = any(
+            c["nom"].strip().lower() == _coif_norm_v1b
+            or _coif_norm_v1b in c["nom"].strip().lower()
+            or c["nom"].strip().lower() in _coif_norm_v1b
+            for c in _comp_v1b
+        )
+        if not _est_competent_v1b:
+            _alt_names_v1b = [c["nom"] for c in _comp_v1b]
+            _alt_str_v1b = " et ".join(_alt_names_v1b) if _alt_names_v1b else "nos autres coiffeurs"
+            _resp_v1b = (
+                f"{_rdv_coiffeur_v} ne fait pas {_rdv_p}. "
+                f"Cette prestation est réalisée par {_alt_str_v1b}."
+            )
+            add_to_history(ctx_key, "assistant", _resp_v1b)
+            print(f"⚠️ [{nom_salon}] [VALID 1b] {_rdv_coiffeur_v!r} incompétent pour {_rdv_p!r} → retour immédiat")
+            return _resp_v1b
+
     # ── VALIDATION 2 — Jour + coiffeur : vérifier jour de repos ──────────────
     _rdv_coiffeur_v = get_client_context(ctx_key).get("rdv_coiffeur", "") or _rdv_coiffeur_v
     if _rdv_j and _rdv_coiffeur_v:
@@ -2901,20 +2931,29 @@ def run_agent(message_user: str, telephone: str,
         except Exception:
             _nom_jour_v = ""
         if _nom_jour_v:
-            _coif_obj_v = next((c for c in coiffeurs if c["nom"].lower() == _rdv_coiffeur_v.lower()), None)
+            _coif_norm_v2 = _rdv_coiffeur_v.strip().lower()
+            # Matching tolérant : exact, ou nom en context dans nom complet, ou inverse
+            _coif_obj_v = next(
+                (c for c in coiffeurs if
+                 c["nom"].strip().lower() == _coif_norm_v2
+                 or _coif_norm_v2 in c["nom"].strip().lower()
+                 or c["nom"].strip().lower() in _coif_norm_v2),
+                None
+            )
             if _coif_obj_v:
+                # Lire days_off depuis le dict coiffeur (champ jours_repos normalisé par get_coiffeurs)
                 _repos_v = [r.lower() for r in (_coif_obj_v.get("jours_repos") or [])]
                 if _nom_jour_v in _repos_v:
                     _coifs_alt_v = [c["nom"] for c in coiffeurs
-                                    if c["nom"].lower() != _rdv_coiffeur_v.lower()
+                                    if c["nom"].strip().lower() != _coif_obj_v["nom"].strip().lower()
                                     and _nom_jour_v not in [r.lower() for r in (c.get("jours_repos") or [])]]
                     _alt_str_v = f" {_coifs_alt_v[0]} est disponible ce jour-là." if _coifs_alt_v else ""
                     _inject_v2 = (
-                        f"SYSTÈME — VALIDATION : {_rdv_coiffeur_v} est en repos le {_nom_jour_v}. "
+                        f"SYSTÈME — VALIDATION : {_coif_obj_v['nom']} est en repos le {_nom_jour_v}. "
                         f"Dis-le immédiatement au client et propose un autre jour ou un autre coiffeur.{_alt_str_v}"
                     )
                     messages.append({"role": "user", "content": _inject_v2})
-                    print(f"⚠️ [{nom_salon}] [VALID 2] {_rdv_coiffeur_v} en repos le {_nom_jour_v} → injection")
+                    print(f"⚠️ [VALID 2] {_coif_obj_v['nom']} en repos {_nom_jour_v}")
 
     # ── C7 — Log contexte RDV avant GPT ─────────────────────────────────────
     print(f"📋 [CONTEXTE RDV AVANT GPT] prestation={_rdv_p or '—'} | jour={_rdv_j or '—'} | heure={_rdv_h or '—'} | coiffeur={_rdv_coiffeur_v or '—'}")
@@ -3579,19 +3618,32 @@ async def sync_staff(request: Request):
         print(f"📥 [SYNC-STAFF] Reçu : {data}")
 
         twilio_phone = data.get("twilio_phone") or data.get("twilio_number") or ""
+        direct_sid   = data.get("salon_id") or ""
         staff_list   = data.get("staff") or data.get("employees") or []
 
-        # Résoudre salon_id depuis twilio_phone
+        # Résoudre salon_id : priorité à salon_id direct, sinon depuis twilio_phone
         sid = None
-        if twilio_phone and supabase:
+        nom_salon_log = ""
+        if direct_sid and supabase:
             try:
-                res = supabase.table("salon").select("id").eq("twilio_number", twilio_phone).limit(1).execute()
-                sid = res.data[0]["id"] if res.data else None
+                _sr = supabase.table("salon").select("id,nom").eq("id", direct_sid).limit(1).execute()
+                if _sr.data:
+                    sid = _sr.data[0]["id"]
+                    nom_salon_log = _sr.data[0].get("nom", direct_sid)
+            except Exception as _e:
+                print(f"⚠️ [SYNC-STAFF] Erreur résolution par salon_id : {_e}")
+        if not sid and twilio_phone and supabase:
+            try:
+                res = supabase.table("salon").select("id,nom").eq("twilio_number", twilio_phone).limit(1).execute()
+                if res.data:
+                    sid = res.data[0]["id"]
+                    nom_salon_log = res.data[0].get("nom", twilio_phone)
             except Exception as _e:
                 print(f"⚠️ [SYNC-STAFF] Erreur résolution salon_id : {_e}")
 
         if not sid:
-            raise HTTPException(status_code=400, detail="salon_id inconnu — fournir twilio_phone valide")
+            raise HTTPException(status_code=400, detail="salon_id inconnu — fournir twilio_phone ou salon_id valide")
+        print(f"✅ [SYNC-STAFF] Salon identifié : {nom_salon_log} (id={sid})")
 
         # Supprimer puis réinsérer
         try:
@@ -3951,7 +4003,7 @@ async def get_dispos(jour: str, salon_id: str = None, twilio_phone: str = None):
         # Pour chaque créneau et chaque coiffeur, vérifier la dispo
         creneaux_result = []
         for heure in creneaux_bruts:
-            dispo = est_creneau_disponible_v2(jour, heure, coiffeurs=_coiffeurs_dispos)
+            dispo = est_creneau_disponible_v2(jour, heure, coiffeurs=_coiffeurs_dispos, salon_id=_sid_dispos)
             coiffeurs_libres = dispo["coiffeurs_libres"]
             if _coiffeurs_dispos:
                 for c in _coiffeurs_dispos:
