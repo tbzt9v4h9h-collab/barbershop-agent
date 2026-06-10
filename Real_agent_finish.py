@@ -1949,19 +1949,24 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str,
                 _tel_salon=tel_salon,
                 _nom=client_nom, _prest=prestation,
                 _j=_jour_wh, _h=_heure_wh,
+                _supabase=supabase,
+                _rdv_id=_rdv_id_cree,
             ):
                 import urllib.request as _req_mod
                 import time as _t_mod
+                import json as _json_wh
                 _headers = {"Content-Type": "application/json", "Accept": "application/json"}
                 def _post():
                     _req = _req_mod.Request(_url, data=_payload, headers=_headers, method="POST")
                     with _req_mod.urlopen(_req, timeout=10) as _r:
-                        _rb = _r.read().decode("utf-8", errors="replace")[:200]
+                        _rb = _r.read().decode("utf-8", errors="replace")[:500]
                         print(f"📡 [WEBHOOK BG] status={_r.status} | body={_rb!r}")
-                        return _r.status
+                        return _r.status, _rb
                 _ok = False
+                _body_ok = ""
                 try:
-                    _ok = (_post() == 200)
+                    _status, _body_ok = _post()
+                    _ok = (_status == 200)
                     if not _ok:
                         print("⚠️ [WEBHOOK BG] Tentative 1 — status inattendu")
                 except Exception as _e1:
@@ -1969,11 +1974,25 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str,
                 if not _ok:
                     _t_mod.sleep(2)
                     try:
-                        _ok = (_post() == 200)
+                        _status, _body_ok = _post()
+                        _ok = (_status == 200)
                         if not _ok:
                             print("⚠️ [WEBHOOK BG] Tentative 2 — status inattendu")
                     except Exception as _e2:
                         print(f"⚠️ [WEBHOOK BG] Tentative 2 — {type(_e2).__name__}: {_e2}")
+                if _ok and _body_ok and _supabase and _rdv_id:
+                    try:
+                        _resp_json = _json_wh.loads(_body_ok)
+                        _b44_id = (_resp_json.get("appointment_id") or "").strip()
+                        if _b44_id:
+                            _supabase.table("appointment")\
+                                .update({"base44_id": _b44_id})\
+                                .eq("id", _rdv_id).execute()
+                            print(f"✅ [WEBHOOK] base44_id sauvegardé | rdv_id={_rdv_id} | base44_id={_b44_id}")
+                        else:
+                            print(f"⚠️ [WEBHOOK BG] appointment_id absent du body Base44")
+                    except Exception as _b44_e:
+                        print(f"⚠️ [WEBHOOK BG] Erreur sauvegarde base44_id : {_b44_e}")
                 if not _ok:
                     print(f"❌ [WEBHOOK BG] ÉCHEC — RDV {_j} {_h} non synchronisé Base44")
                     try:
