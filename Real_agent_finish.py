@@ -1518,6 +1518,7 @@ ANNULATION RDV — ÉTAPES OBLIGATOIRES DANS L'ORDRE STRICT :
 RÈGLE ABSOLUE : Ne jamais dire "je procède à l'annulation" sans avoir appelé le tool annuler_rdv. L'annulation n'est effective que si le tool retourne un succès.
 ⚠️ RÈGLE ABSOLUE : Ne jamais dire "je vais récupérer", "je cherche", "un instant" ou toute phrase d'attente. Appeler IMMÉDIATEMENT get_rdv_client_actif dès que le client mentionne une annulation. Pas de texte intermédiaire.
 IMPORTANT — numéro client : le numéro de téléphone de l'appelant est {telephone or "inconnu"}. Pour get_rdv_client_actif, passer TOUJOURS ce numéro ({telephone or "inconnu"}) et jamais le numéro du salon ({tel_salon}).
+⛔ RÈGLE ABSOLUE ANNULATION — CONFIRMATION OBLIGATOIRE : Après avoir trouvé le RDV via get_rdv_client_actif et demandé confirmation au client, attends UNIQUEMENT "oui" ou "non". "Au revoir" sans "oui" explicite = le client ne veut PAS annuler → ne jamais annuler, répondre "Bien entendu, votre RDV est conservé. Bonne journée !" et laisser l'appel se terminer normalement.
 
 CONSEILS :
 Appeler demander_rappel_conseil puis : "Je transmets votre demande, un membre vous rappellera rapidement au [numéro]."
@@ -2324,15 +2325,17 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str,
         _rdv_heure_lisible = ""
         _rdv_coiffeur     = ""
         _rdv_client_name  = ""
+        _base44_id_ann = None
         try:
             _r = supabase.table("appointment")\
-                .select("service,date,time,staff_name,client_name")\
+                .select("service,date,time,staff_name,client_name,base44_id")\
                 .eq("id", rdv_id).execute()
             if _r.data:
                 _d = _r.data[0]
                 _rdv_prestation  = (_d.get("service") or "").strip()
                 _rdv_coiffeur    = (_d.get("staff_name") or "").strip()
                 _rdv_client_name = (_d.get("client_name") or "").strip()
+                _base44_id_ann   = (_d.get("base44_id") or "").strip() or None
                 _date_iso = (_d.get("date") or "").strip()
                 if _date_iso:
                     try:
@@ -2354,6 +2357,7 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str,
         print(f"🗑️ [ANNULATION] détails récupérés : date={_rdv_date_lisible!r} heure={_rdv_heure_lisible!r} prestation={_rdv_prestation!r} coiffeur={_rdv_coiffeur!r}")
 
         if annuler_rdv(None, rdv_id):
+            update_client_context(ctx_key, en_attente_confirmation_annulation=False)
             # ── Construction SMS annulation complet ───────────────────────────
             ctx = get_client_context(ctx_key)
             _prenom_ann = ctx.get("prenom") or ""
@@ -2388,7 +2392,9 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str,
             # ── Webhook vers Base44 (annulation) ─────────────────────────────
             import urllib.request as _urlreq_ann
             import time as _time_ann
-            if not webhook_url:
+            if not _base44_id_ann:
+                print(f"⚠️ [{nom_salon}] [WEBHOOK ANNULATION] Skippé — pas de base44_id pour rdv_id={rdv_id}")
+            elif not webhook_url:
                 print(f"❌ [{nom_salon}] [WEBHOOK ANNULATION] URL VIDE — sync impossible")
             elif not app_salon_id:
                 print(f"❌ [{nom_salon}] [WEBHOOK ANNULATION] app_salon_id VIDE — sync impossible")
@@ -2465,7 +2471,8 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str,
                 f"ID:{r['id']} | {r.get('date', '')} à "
                 f"{(r.get('time') or '')[:5]} | {r.get('service', '')}"
             )
-        update_client_context(ctx_key, client_id=client_id)
+        update_client_context(ctx_key, client_id=client_id, en_attente_confirmation_annulation=True)
+        print(f"🔒 [{nom_salon}] [VALID ANN] en_attente_confirmation_annulation=True")
         return "RDV trouvés : " + " /// ".join(rdvs_str)
 
     elif tool_name == "get_services":
@@ -2823,14 +2830,68 @@ def run_agent(message_user: str, telephone: str,
                     print(f"📋 [{nom_salon}] [CONTEXTE RDV] jour extrait : {_nom_j} → {_jour_iso}")
                     break
 
-    # Coiffeur
+    # Coiffeur — insensible aux accents, essaie nom complet puis chaque partie
+    _msg_norm_coif = normaliser_texte(_msg_rdv_lower)
     if not _ctx_rdv_pre.get("rdv_coiffeur") and coiffeurs:
         for _c_rdv in coiffeurs:
-            _nom_c_rdv = (_c_rdv.get("nom") or "").lower()
-            if _nom_c_rdv and _nom_c_rdv in _msg_rdv_lower:
+            _nom_c_norm = normaliser_texte(_c_rdv.get("nom") or "")
+            if not _nom_c_norm:
+                continue
+            if _nom_c_norm in _msg_norm_coif:
                 update_client_context(ctx_key, rdv_coiffeur=_c_rdv["nom"])
                 print(f"📋 [{nom_salon}] [CONTEXTE RDV] coiffeur extrait : {_c_rdv['nom']!r}")
                 break
+            _parties_nom = [p for p in _nom_c_norm.split() if len(p) >= 3]
+            if any(p in _msg_norm_coif for p in _parties_nom):
+                update_client_context(ctx_key, rdv_coiffeur=_c_rdv["nom"])
+                print(f"📋 [{nom_salon}] [CONTEXTE RDV] coiffeur extrait (partiel) : {_c_rdv['nom']!r}")
+                break
+
+    # ── VALIDATION 1c — Coiffeur extrait ce tour + prestation dans le message : vérifier compétence ──
+    _coif_juste_1c = (
+        not _ctx_rdv_pre.get("rdv_coiffeur")
+        and get_client_context(ctx_key).get("rdv_coiffeur", "")
+    )
+    if _coif_juste_1c and not get_client_context(ctx_key).get("rdv_prestation", "") and prestations:
+        print(f"🔍 [{nom_salon}] [VALID 1c] coiffeur {_coif_juste_1c!r} détecté dans speech — scan prestation")
+        _prest_msg_1c = None
+        _msg_norm_1c = normaliser_texte(_msg_rdv_lower)
+        for _p_1c in prestations:
+            _p_nom_1c = normaliser_texte(_p_1c.get("name") or "")
+            if not _p_nom_1c:
+                continue
+            if _p_nom_1c in _msg_norm_1c:
+                _prest_msg_1c = _p_1c.get("name")
+                break
+            for _word_1c in _msg_norm_1c.split():
+                if len(_word_1c) >= 4 and _word_1c in _p_nom_1c:
+                    _prest_msg_1c = _p_1c.get("name")
+                    break
+            if _prest_msg_1c:
+                break
+        if _prest_msg_1c and coiffeurs:
+            _comp_1c = coiffeurs_competents(_prest_msg_1c, coiffeurs=coiffeurs)
+            _coif_nom_1c = _coif_juste_1c
+            _coif_norm_1c = normaliser_texte(_coif_nom_1c)
+            _est_comp_1c = any(
+                normaliser_texte(c["nom"]) == _coif_norm_1c
+                or _coif_norm_1c in normaliser_texte(c["nom"])
+                or normaliser_texte(c["nom"]) in _coif_norm_1c
+                for c in _comp_1c
+            )
+            if not _est_comp_1c:
+                _alt_1c = [c["nom"] for c in _comp_1c]
+                _alt_str_1c = " et ".join(_alt_1c) if _alt_1c else "nos autres coiffeurs"
+                _resp_1c = (
+                    f"{_coif_nom_1c} ne fait pas {_prest_msg_1c}. "
+                    f"Cette prestation est réalisée par {_alt_str_1c}."
+                )
+                add_to_history(ctx_key, "assistant", _resp_1c)
+                print(f"❌ [{nom_salon}] [VALID 1c] {_coif_nom_1c!r} non compétent pour {_prest_msg_1c!r} → réponse directe sans GPT")
+                return _resp_1c
+            else:
+                update_client_context(ctx_key, rdv_prestation=_prest_msg_1c)
+                print(f"✅ [{nom_salon}] [VALID 1c] {_coif_nom_1c!r} compétent pour {_prest_msg_1c!r} → prestation stockée")
 
     # Construire le system prompt
     sys_prompt = build_system_prompt(ctx_key, telephone, salon, coiffeurs, prestations)
@@ -2874,6 +2935,53 @@ def run_agent(message_user: str, telephone: str,
         _tool_choice = {"type": "function", "function": {"name": "get_rdv_client_actif"}}
         print(f"🔧 [FORCE TOOL] Annulation détectée → tool_choice=get_rdv_client_actif")
     elif _ctx_has_all and not _dispos_deja_verif:
+        # Vérifier repos AVANT de forcer verifier_disponibilite
+        if _rdv_p and coiffeurs:
+            _NOMS_J_FT = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
+            _comp_ft = coiffeurs_competents(_rdv_p, coiffeurs=coiffeurs)
+            logging.info(f"🔍 [DEBUG FT] _rdv_p='{_rdv_p}' | coiffeurs={[c['nom'] for c in coiffeurs]} | _comp_ft={_comp_ft}")
+            if not _comp_ft:
+                _prest_list_ft = ", ".join([p.get("name", "") for p in prestations if p.get("name")]) or "nos prestations"
+                _resp_ft_a = (f"Je suis désolé, aucun de nos coiffeurs ne propose \"{_rdv_p}\". "
+                              f"Voici nos prestations : {_prest_list_ft}. Laquelle vous intéresse ?")
+                add_to_history(ctx_key, "assistant", _resp_ft_a)
+                return _resp_ft_a
+            _nom_jour_ft = ""
+            _comp_ft_dispo = list(_comp_ft)
+            try:
+                _nom_jour_ft = _NOMS_J_FT[date.fromisoformat(_rdv_j).weekday()]
+                _comp_ft_dispo = [
+                    c for c in _comp_ft
+                    if _nom_jour_ft not in [r.lower() for r in (c.get("jours_repos") or [])]
+                ]
+            except Exception:
+                pass
+            logging.info(f"🔍 [DEBUG FT] _nom_jour_ft='{_nom_jour_ft}' | _rdv_j='{_rdv_j}' | _comp_ft_dispo={_comp_ft_dispo}")
+            logging.info(f"🔍 [DEBUG FT] CAS B check: _nom_jour_ft='{_nom_jour_ft}' | not _comp_ft_dispo={not _comp_ft_dispo}")
+            if _nom_jour_ft and not _comp_ft_dispo:
+                _coif_ft = _comp_ft[0]
+                _jours_ouv_ft = [j.lower() for j in (salon.get("jours_ouverts") or [])]
+                _next_travail_ft = None
+                try:
+                    _d_rdv_ft = date.fromisoformat(_rdv_j)
+                    for _di_ft in range(1, 8):
+                        _d_next_ft = _d_rdv_ft + timedelta(days=_di_ft)
+                        _nom_next_ft = _NOMS_J_FT[_d_next_ft.weekday()]
+                        _repos_next_ft = [r.lower() for r in (_coif_ft.get("jours_repos") or [])]
+                        _est_ouv_ft = not _jours_ouv_ft or _nom_next_ft in _jours_ouv_ft
+                        if _nom_next_ft not in _repos_next_ft and _est_ouv_ft:
+                            _next_travail_ft = _nom_next_ft
+                            break
+                except Exception:
+                    pass
+                _resp_ft_b = (
+                    f"{_coif_ft['nom']} fait les {_rdv_p} mais ne travaille pas le {_nom_jour_ft}. "
+                    + (f"Il reprend le {_next_travail_ft}." if _next_travail_ft
+                       else "Souhaitez-vous choisir un autre jour ?")
+                )
+                add_to_history(ctx_key, "assistant", _resp_ft_b)
+                print(f"⚠️ [{nom_salon}] [FORCE TOOL] {_coif_ft['nom']!r} compétent mais en repos {_nom_jour_ft} → reprend {_next_travail_ft or '?'} → TwiML direct")
+                return _resp_ft_b
         # Forcer SPÉCIFIQUEMENT verifier_disponibilite — GPT ne peut PAS répondre en texte
         _tool_choice = {"type": "function", "function": {"name": "verifier_disponibilite"}}
         print(f"🔧 [FORCE TOOL] prestation={_rdv_p!r} jour={_rdv_j!r} heure={_rdv_h!r} → tool_choice=verifier_disponibilite")
@@ -2889,22 +2997,66 @@ def run_agent(message_user: str, telephone: str,
     else:
         _tool_choice = "auto"
 
-    # ── VALIDATION 1 — Prestation sans coiffeur : vérifier compétences ──────
+    # ── VALIDATION 1 — Prestation sans coiffeur : vérifier compétences ────────
+    _NOMS_J_V1 = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
     _rdv_coiffeur_v = _ctx_force.get("rdv_coiffeur", "")
     if _rdv_p and not _rdv_coiffeur_v and coiffeurs:
-        # Passer jour pour exclure dès ici les coiffeurs en repos ce jour-là
-        _comp_v1 = coiffeurs_competents(_rdv_p, jour=_rdv_j or None, coiffeurs=coiffeurs)
-        print(f"🔍 [{nom_salon}] [VALID 1] prestation={_rdv_p!r} jour={_rdv_j or '—'} | compétents : {[c['nom'] for c in _comp_v1]}")
-        if len(_comp_v1) == 0:
+        # Étape 1 — compétents sans filtre repos
+        _comp_v1 = coiffeurs_competents(_rdv_p, coiffeurs=coiffeurs)
+        print(f"🔍 [{nom_salon}] [VALID 1] prestation={_rdv_p!r} | compétents (tous) : {[c['nom'] for c in _comp_v1]}")
+
+        # CAS A — vraiment aucun coiffeur ne fait cette prestation
+        if not _comp_v1:
             _prest_list_v1 = ", ".join([p.get("name", "") for p in prestations if p.get("name")]) or "nos prestations"
             _resp_v1 = (f"Je suis désolé, aucun de nos coiffeurs ne propose la prestation \"{_rdv_p}\". "
                         f"Voici nos prestations disponibles : {_prest_list_v1}. Laquelle vous intéresse ?")
             add_to_history(ctx_key, "assistant", _resp_v1)
             return _resp_v1
-        elif len(_comp_v1) == 1:
-            _rdv_coiffeur_v = _comp_v1[0]["nom"]
+
+        # Étape 2 — filtrer par disponibilité ce jour (repos)
+        _nom_jour_v1 = ""
+        _comp_v1_dispo = list(_comp_v1)
+        if _rdv_j:
+            try:
+                _nom_jour_v1 = _NOMS_J_V1[date.fromisoformat(_rdv_j).weekday()]
+                _comp_v1_dispo = [
+                    c for c in _comp_v1
+                    if _nom_jour_v1 not in [r.lower() for r in (c.get("jours_repos") or [])]
+                ]
+            except Exception:
+                pass
+
+        # CAS B — compétents existent mais tous en repos ce jour
+        if _nom_jour_v1 and not _comp_v1_dispo:
+            _coif_b = _comp_v1[0]
+            _jours_ouv_v1 = [j.lower() for j in (salon.get("jours_ouverts") or [])]
+            _next_travail_v1 = None
+            try:
+                _d_rdv_v1 = date.fromisoformat(_rdv_j)
+                for _di_v1 in range(1, 8):
+                    _d_next_v1 = _d_rdv_v1 + timedelta(days=_di_v1)
+                    _nom_next_v1 = _NOMS_J_V1[_d_next_v1.weekday()]
+                    _repos_next_v1 = [r.lower() for r in (_coif_b.get("jours_repos") or [])]
+                    _est_ouv_v1 = not _jours_ouv_v1 or _nom_next_v1 in _jours_ouv_v1
+                    if _nom_next_v1 not in _repos_next_v1 and _est_ouv_v1:
+                        _next_travail_v1 = _nom_next_v1
+                        break
+            except Exception:
+                pass
+            _resp_v1_repos = (
+                f"{_coif_b['nom']} fait les {_rdv_p} mais ne travaille pas le {_nom_jour_v1}. "
+                + (f"Il reprend le {_next_travail_v1}." if _next_travail_v1
+                   else "Souhaitez-vous choisir un autre jour ?")
+            )
+            add_to_history(ctx_key, "assistant", _resp_v1_repos)
+            print(f"⚠️ [{nom_salon}] [VALID 1] {_coif_b['nom']!r} compétent mais en repos {_nom_jour_v1} → reprend {_next_travail_v1 or '?'}")
+            return _resp_v1_repos
+
+        # Étape 3 — auto-assigner si un seul compétent disponible
+        if len(_comp_v1_dispo) == 1:
+            _rdv_coiffeur_v = _comp_v1_dispo[0]["nom"]
             update_client_context(ctx_key, rdv_coiffeur=_rdv_coiffeur_v)
-            print(f"✅ [{nom_salon}] [VALID 1] Un seul coiffeur compétent → assigné automatiquement : {_rdv_coiffeur_v!r}")
+            print(f"✅ [{nom_salon}] [VALID 1] Un seul coiffeur compétent dispo → assigné : {_rdv_coiffeur_v!r}")
 
     # ── VALIDATION 1b — Coiffeur déjà en contexte : vérifier ses compétences ─
     elif _rdv_p and _rdv_coiffeur_v and coiffeurs:
@@ -2952,13 +3104,37 @@ def run_agent(message_user: str, telephone: str,
                     _coifs_alt_v = [c["nom"] for c in coiffeurs
                                     if c["nom"].strip().lower() != _coif_obj_v["nom"].strip().lower()
                                     and _nom_jour_v not in [r.lower() for r in (c.get("jours_repos") or [])]]
-                    _alt_str_v = f" {_coifs_alt_v[0]} est disponible ce jour-là." if _coifs_alt_v else ""
-                    _inject_v2 = (
-                        f"SYSTÈME — VALIDATION : {_coif_obj_v['nom']} est en repos le {_nom_jour_v}. "
-                        f"Dis-le immédiatement au client et propose un autre jour ou un autre coiffeur.{_alt_str_v}"
-                    )
+                    # Calculer le prochain jour de travail du coiffeur
+                    _next_travail_v = None
+                    try:
+                        _noms_j_7_v = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
+                        _jours_ouv_v = [j.lower() for j in (salon.get("jours_ouverts") or [])]
+                        _d_rdv_v = date.fromisoformat(_rdv_j)
+                        for _di_v in range(1, 8):
+                            _d_next_v = _d_rdv_v + timedelta(days=_di_v)
+                            _nom_next_v = _noms_j_7_v[_d_next_v.weekday()]
+                            _repos_next_v = [r.lower() for r in (_coif_obj_v.get("jours_repos") or [])]
+                            _est_ouv_v = not _jours_ouv_v or _nom_next_v in _jours_ouv_v
+                            if _nom_next_v not in _repos_next_v and _est_ouv_v:
+                                _next_travail_v = _nom_next_v
+                                break
+                    except Exception:
+                        pass
+                    if _coifs_alt_v:
+                        _inject_v2 = (
+                            f"VALIDATION : {_coif_obj_v['nom']} ne travaille pas le {_nom_jour_v} (repos). "
+                            + (f"Il reprend le {_next_travail_v}. " if _next_travail_v else "")
+                            + f"Dis exactement ça au client, rien d'autre. Ne liste pas les prestations."
+                        )
+                    else:
+                        _inject_v2 = (
+                            f"VALIDATION : Aucun coiffeur disponible le {_nom_jour_v}. "
+                            f"{_coif_obj_v['nom']} est en repos ce jour. "
+                            + (f"Il reprend le {_next_travail_v}. " if _next_travail_v else "")
+                            + f"Propose le prochain jour où il travaille."
+                        )
                     messages.append({"role": "user", "content": _inject_v2})
-                    print(f"⚠️ [VALID 2] {_coif_obj_v['nom']} en repos {_nom_jour_v}")
+                    print(f"⚠️ [VALID 2] {_coif_obj_v['nom']} en repos {_nom_jour_v} → reprend {_next_travail_v or '?'}")
 
     # ── C7 — Log contexte RDV avant GPT ─────────────────────────────────────
     print(f"📋 [CONTEXTE RDV AVANT GPT] prestation={_rdv_p or '—'} | jour={_rdv_j or '—'} | heure={_rdv_h or '—'} | coiffeur={_rdv_coiffeur_v or '—'}")
@@ -4274,6 +4450,45 @@ def handle_appel(
     # ── SpeechResult non vide → remettre le compteur de silences à 0 ──────────
     telephone = telephone_appelant
     update_client_context(ctx_key, silences=0)
+
+    # ── Vérification pause déjeuner pré-GPT ──────────────────────────────────
+    _speech_pause = SpeechResult.lower()
+    _m_h_pause = re.search(r'\b(\d{1,2})h(\d{2})?\b', _speech_pause) \
+                 or re.search(r'\b(\d{1,2})\s*heures?\b', _speech_pause)
+    _is_midi_pause   = bool(re.search(r'\bmidi\b', _speech_pause))
+    _is_minuit_pause = bool(re.search(r'\bminuit\b', _speech_pause))
+    if _m_h_pause or _is_midi_pause or _is_minuit_pause:
+        try:
+            if _is_midi_pause and not _m_h_pause:
+                _hh_pause, _mm_pause = 12, "00"
+            elif _is_minuit_pause and not _m_h_pause:
+                _hh_pause, _mm_pause = 0, "00"
+            else:
+                _hh_pause = int(_m_h_pause.group(1))
+                _mm_pause = _m_h_pause.group(2) or "00"
+            _heure_pause_str = f"{_hh_pause:02d}:{_mm_pause}"
+            _pd_pause = salon.get("pause_debut")
+            _pf_pause = salon.get("pause_fin")
+            if _pd_pause and _pf_pause:
+                _h_min_p  = parse_hhmm_en_minutes(_heure_pause_str)
+                _pd_min_p = parse_hhmm_en_minutes(_pd_pause)
+                _pf_min_p = parse_hhmm_en_minutes(_pf_pause)
+                if _pd_min_p <= _h_min_p < _pf_min_p:
+                    _msg_pause_early = (
+                        f"Le salon est en pause déjeuner de {_pd_pause} à {_pf_pause}. "
+                        f"Je peux vous proposer un créneau avant {_pd_pause} ou à partir de {_pf_pause}."
+                    )
+                    print(f"⏸️ [{nom_salon}] [PAUSE PRÉ-GPT] heure={_heure_pause_str} dans pause {_pd_pause}-{_pf_pause}")
+                    _gather_pause = twiml.gather(
+                        input="speech", action="/appel", method="POST",
+                        language="fr-FR", speech_timeout="2",
+                        speech_model="phone_call", timeout=5, hints=HINTS,
+                    )
+                    _gather_pause.say(_msg_pause_early, language="fr-FR", voice="Polly.Lea", barge_in=False)
+                    return str(twiml)
+        except Exception:
+            pass
+
     response_text = run_agent(
         SpeechResult, telephone,
         ctx_key=ctx_key, salon=salon,
@@ -4336,11 +4551,13 @@ def handle_appel(
     _contient_au_revoir = "au revoir" in speech_lower
     _contient_merci = "merci" in speech_lower
     _fin_explicite = _contient_au_revoir and _contient_merci
+    _en_attente_ann = get_client_context(ctx_key).get("en_attente_confirmation_annulation", False)
     est_fin_client = (
         _fin_explicite
         and not est_question
         and not contient_horaire
         and not est_mot_seul_ambigu
+        and not _en_attente_ann
     )
 
     if est_fin_client:
