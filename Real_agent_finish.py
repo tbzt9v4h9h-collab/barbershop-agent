@@ -123,6 +123,11 @@ _coiffeurs_cache: dict   = {}    # {salon_id: {"data": list, "ts": datetime}}
 _prestations_cache: dict = {}    # {salon_id: {"data": list, "ts": datetime}}
 _CACHE_TTL = 60  # secondes
 
+# Dernier salon synchronisé via /update-config — utilisé comme fallback par
+# /sync-staff et /sync-services quand le payload ne contient pas de salon_id.
+# Base44 appelle /update-config PUIS /sync-staff dans la même séquence.
+_last_sync_salon: dict = {}  # {"salon_id": "...", "twilio_number": "...", "nom": "..."}
+
 def _cache_valid(entry: dict | None) -> bool:
     if not entry:
         return False
@@ -3516,6 +3521,20 @@ async def sync_config(request: Request):
         # Invalider le cache pour forcer rechargement au prochain appel
         invalidate_salon_cache(twilio_number=twilio_phone, salon_id=sid)
 
+        # Mémoriser pour /sync-staff et /sync-services qui n'ont pas de salon_id dans leur payload
+        if sid:
+            _nom_uc = data.get("salon_name") or ""
+            if not _nom_uc and supabase:
+                try:
+                    _nr = supabase.table("salon").select("nom").eq("id", sid).limit(1).execute()
+                    _nom_uc = _nr.data[0].get("nom", "") if _nr.data else ""
+                except Exception:
+                    pass
+            _last_sync_salon["salon_id"]      = sid
+            _last_sync_salon["twilio_number"]  = twilio_phone
+            _last_sync_salon["nom"]            = _nom_uc
+            print(f"🔖 [UPDATE-CONFIG] last_sync_salon mis à jour → {_nom_uc} ({sid})")
+
         print(f"✅ [UPDATE-CONFIG] OK | twilio={twilio_phone} | salon_id={sid}")
         return {"status": "ok", "twilio_phone": twilio_phone, "salon_id": sid}
 
@@ -3641,9 +3660,14 @@ async def sync_staff(request: Request):
             except Exception as _e:
                 print(f"⚠️ [SYNC-STAFF] Erreur résolution salon_id : {_e}")
 
-        if not sid:
-            raise HTTPException(status_code=400, detail="salon_id inconnu — fournir twilio_phone ou salon_id valide")
-        print(f"✅ [SYNC-STAFF] Salon identifié : {nom_salon_log} (id={sid})")
+        if not sid and _last_sync_salon.get("salon_id"):
+            sid           = _last_sync_salon["salon_id"]
+            nom_salon_log = _last_sync_salon.get("nom", sid)
+            print(f"✅ [SYNC-STAFF] Salon identifié via last_sync : {nom_salon_log} (id={sid})")
+        elif sid:
+            print(f"✅ [SYNC-STAFF] Salon identifié : {nom_salon_log} (id={sid})")
+        else:
+            raise HTTPException(status_code=400, detail="salon_id inconnu — appeler /update-config avant /sync-staff")
 
         # Supprimer puis réinsérer
         try:
@@ -3709,18 +3733,37 @@ async def sync_services(request: Request):
         print(f"📥 [SYNC-SERVICES] Reçu : {data}")
 
         twilio_phone  = data.get("twilio_phone") or data.get("twilio_number") or ""
+        direct_sid    = data.get("salon_id") or ""
         services_list = data.get("services") or data.get("prestations") or []
 
+        # Résoudre salon_id : salon_id direct → twilio_phone → last_sync_salon
         sid = None
-        if twilio_phone and supabase:
+        nom_salon_log_sv = ""
+        if direct_sid and supabase:
             try:
-                res = supabase.table("salon").select("id").eq("twilio_number", twilio_phone).limit(1).execute()
-                sid = res.data[0]["id"] if res.data else None
+                _sr = supabase.table("salon").select("id,nom").eq("id", direct_sid).limit(1).execute()
+                if _sr.data:
+                    sid = _sr.data[0]["id"]
+                    nom_salon_log_sv = _sr.data[0].get("nom", direct_sid)
+            except Exception as _e:
+                print(f"⚠️ [SYNC-SERVICES] Erreur résolution par salon_id : {_e}")
+        if not sid and twilio_phone and supabase:
+            try:
+                res = supabase.table("salon").select("id,nom").eq("twilio_number", twilio_phone).limit(1).execute()
+                if res.data:
+                    sid = res.data[0]["id"]
+                    nom_salon_log_sv = res.data[0].get("nom", twilio_phone)
             except Exception as _e:
                 print(f"⚠️ [SYNC-SERVICES] Erreur résolution salon_id : {_e}")
 
-        if not sid:
-            raise HTTPException(status_code=400, detail="salon_id inconnu — fournir twilio_phone valide")
+        if not sid and _last_sync_salon.get("salon_id"):
+            sid              = _last_sync_salon["salon_id"]
+            nom_salon_log_sv = _last_sync_salon.get("nom", sid)
+            print(f"✅ [SYNC-SERVICES] Salon identifié via last_sync : {nom_salon_log_sv} (id={sid})")
+        elif sid:
+            print(f"✅ [SYNC-SERVICES] Salon identifié : {nom_salon_log_sv} (id={sid})")
+        else:
+            raise HTTPException(status_code=400, detail="salon_id inconnu — appeler /update-config avant /sync-services")
 
         try:
             supabase.table("service").delete().eq("salon_id", sid).execute()
