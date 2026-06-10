@@ -2939,7 +2939,6 @@ def run_agent(message_user: str, telephone: str,
         if _rdv_p and coiffeurs:
             _NOMS_J_FT = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
             _comp_ft = coiffeurs_competents(_rdv_p, coiffeurs=coiffeurs)
-            logging.info(f"🔍 [DEBUG FT] _rdv_p='{_rdv_p}' | coiffeurs={[c['nom'] for c in coiffeurs]} | _comp_ft={_comp_ft}")
             if not _comp_ft:
                 _prest_list_ft = ", ".join([p.get("name", "") for p in prestations if p.get("name")]) or "nos prestations"
                 _resp_ft_a = (f"Je suis désolé, aucun de nos coiffeurs ne propose \"{_rdv_p}\". "
@@ -2956,8 +2955,6 @@ def run_agent(message_user: str, telephone: str,
                 ]
             except Exception:
                 pass
-            logging.info(f"🔍 [DEBUG FT] _nom_jour_ft='{_nom_jour_ft}' | _rdv_j='{_rdv_j}' | _comp_ft_dispo={_comp_ft_dispo}")
-            logging.info(f"🔍 [DEBUG FT] CAS B check: _nom_jour_ft='{_nom_jour_ft}' | not _comp_ft_dispo={not _comp_ft_dispo}")
             if _nom_jour_ft and not _comp_ft_dispo:
                 _coif_ft = _comp_ft[0]
                 _jours_ouv_ft = [j.lower() for j in (salon.get("jours_ouverts") or [])]
