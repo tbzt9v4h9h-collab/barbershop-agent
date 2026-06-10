@@ -5,6 +5,7 @@
 # ====================================================
 
 import os
+import logging
 import unicodedata
 import json
 import threading
@@ -110,6 +111,9 @@ except Exception as _e:
     twilio_client = None
 
 BASE_URL = "https://barbershop-agent.onrender.com"
+
+# Mettre à True pour réactiver l'envoi réel de SMS
+SMS_ENABLED = False
 
 # ====================================================
 # MULTI-SALON — CACHE CONFIG DYNAMIQUE (TTL 60s)
@@ -815,6 +819,9 @@ def _format_date_sms(date_iso: str) -> str:
 
 def send_sms(to: str, body: str, from_number: str = None) -> tuple[bool, str | None]:
     """Envoie un SMS via Twilio. Retourne (succès, twilio_sid)."""
+    if not SMS_ENABLED:
+        logging.info(f"[SMS DÉSACTIVÉ] SMS non envoyé à {to}")
+        return False, None
     if not twilio_client:
         print("⚠️  [SMS] Client Twilio non initialisé — SMS non envoyé.")
         return False, None
@@ -2577,7 +2584,7 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str,
         raison = tool_input.get("raison", "demande du client")
         ctx = get_client_context(ctx_key)
         nom = ctx.get("prenom") or ctx.get("nom") or telephone
-        if twilio_client:
+        if SMS_ENABLED and twilio_client:
             try:
                 twilio_client.messages.create(
                     to=tel_salon or twilio_num,
@@ -2586,6 +2593,8 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str,
                 )
             except Exception as e:
                 print(f"SMS transfert erreur : {e}")
+        else:
+            logging.info(f"[SMS DÉSACTIVÉ] SMS transfert non envoyé à {tel_salon or twilio_num}")
         return f"Transfert initié. SMS envoyé au salon pour rappeler {nom}."
 
     return "Fonction inconnue."
@@ -3270,14 +3279,18 @@ def run_agent(message_user: str, telephone: str,
     if not ctx2.get("rdv_pris"):
         nb_echecs = ctx2.get("nb_echecs", 0) + 1
         update_client_context(ctx_key, nb_echecs=nb_echecs)
-        if nb_echecs >= 3 and twilio_client:
-            try:
-                twilio_client.messages.create(
-                    to=tel_salon or twilio_num, from_=twilio_num,
-                    body=f"⚠️ [{nom_salon}] Agent bloqué avec {telephone}. Rappeler ce client !")
+        if nb_echecs >= 3:
+            if SMS_ENABLED and twilio_client:
+                try:
+                    twilio_client.messages.create(
+                        to=tel_salon or twilio_num, from_=twilio_num,
+                        body=f"⚠️ [{nom_salon}] Agent bloqué avec {telephone}. Rappeler ce client !")
+                    update_client_context(ctx_key, nb_echecs=0)
+                except Exception:
+                    pass
+            else:
+                logging.info(f"[SMS DÉSACTIVÉ] SMS alerte patron non envoyé à {tel_salon or twilio_num}")
                 update_client_context(ctx_key, nb_echecs=0)
-            except Exception:
-                pass
     else:
         update_client_context(ctx_key, nb_echecs=0)
 
