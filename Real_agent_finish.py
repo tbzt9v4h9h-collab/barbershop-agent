@@ -731,7 +731,7 @@ def est_creneau_disponible_v2(jour: str, heure: str, coiffeur: str = None,
         heure_min = parse_hhmm_en_minutes(heure)
 
         q_ap = supabase.table("appointment")\
-            .select("time, staff_name, duration_minutes")\
+            .select("time, staff_name")\
             .eq("date", jour).neq("status", "cancelled")
         if salon_id:
             q_ap = q_ap.eq("salon_id", salon_id)
@@ -744,7 +744,7 @@ def est_creneau_disponible_v2(jour: str, heure: str, coiffeur: str = None,
                 if not t_raw:
                     continue
                 t_min = parse_hhmm_en_minutes(t_raw)
-                duree_appt = int(appt.get("duration_minutes") or 30)
+                duree_appt = 30
                 if t_min <= heure_min < t_min + duree_appt:
                     rdvs_trouves += 1
                     if appt.get("staff_name"):
@@ -2376,7 +2376,7 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str,
         print(f"🗑️ [ANNULATION] détails récupérés : date={_rdv_date_lisible!r} heure={_rdv_heure_lisible!r} prestation={_rdv_prestation!r} coiffeur={_rdv_coiffeur!r}")
 
         if annuler_rdv(None, rdv_id):
-            update_client_context(ctx_key, en_attente_confirmation_annulation=False)
+            update_client_context(ctx_key, en_attente_confirmation_annulation=False, annulation_effectuee=True)
             # ── Construction SMS annulation complet ───────────────────────────
             ctx = get_client_context(ctx_key)
             _prenom_ann = ctx.get("prenom") or ""
@@ -2486,6 +2486,7 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str,
             return "Aucun RDV à venir pour ce client."
         rdvs_str = []
         for r in rdvs:
+            print(f"📋 [RDV ACTIF] service={r.get('service', '')!r} staff_name={r.get('staff_name', '')!r} date={r.get('date', '')} time={(r.get('time') or '')[:5]}")
             rdvs_str.append(
                 f"ID:{r['id']} | {r.get('date', '')} à "
                 f"{(r.get('time') or '')[:5]} | {r.get('service', '')}"
@@ -3400,7 +3401,8 @@ def run_agent(message_user: str, telephone: str,
             response_text = _rdv_result
 
     # C4-CONFIRMÉ : GPT annonce "confirmé" sans avoir appelé prendre_rdv → forcer prendre_rdv
-    elif _gpt_annonce_confirm and _dispo_positive and not _ctx_rdv_pris_check and _context_complet:
+    elif _gpt_annonce_confirm and _dispo_positive and not _ctx_rdv_pris_check and _context_complet \
+            and not get_client_context(ctx_key).get("annulation_effectuee", False):
         _ctx_c4 = get_client_context(ctx_key)
         _args_c4 = {
             "jour":           _ctx_c4.get("rdv_jour"),
@@ -4177,8 +4179,8 @@ async def sync_appointment(request: Request):
                 print(f"⚠️ [SYNC-APPOINTMENT] Erreur recherche cancel : {e_can}")
 
             if target_id:
-                supabase.table("appointment").update({"status": "cancelled"}).eq("id", target_id).execute()
-                print(f"✅ [SYNC-APPOINTMENT] Annulé | supabase_id={target_id}")
+                supabase.table("appointment").update({"status": "annule"}).eq("id", target_id).execute()
+                print(f"🗑️ [SYNC] RDV annulé depuis Base44 | id={target_id}")
                 return {"success": True, "supabase_id": target_id}
             else:
                 print(f"⚠️ [SYNC-APPOINTMENT] RDV non trouvé pour cancel — base44_id={base44_id!r}")
