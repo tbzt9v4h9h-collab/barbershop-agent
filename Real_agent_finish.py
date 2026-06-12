@@ -1985,10 +1985,21 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str,
                         _resp_json = _json_wh.loads(_body_ok)
                         _b44_id = (_resp_json.get("appointment_id") or "").strip()
                         if _b44_id:
-                            _supabase.table("appointment")\
-                                .update({"base44_id": _b44_id})\
-                                .eq("id", _rdv_id).execute()
-                            print(f"✅ [WEBHOOK] base44_id sauvegardé | rdv_id={_rdv_id} | base44_id={_b44_id}")
+                            _saved = False
+                            for _retry in range(1, 4):
+                                try:
+                                    _supabase.table("appointment")\
+                                        .update({"base44_id": _b44_id})\
+                                        .eq("id", _rdv_id).execute()
+                                    print(f"✅ [WEBHOOK] base44_id sauvegardé | rdv_id={_rdv_id} | base44_id={_b44_id}")
+                                    _saved = True
+                                    break
+                                except Exception as _retry_e:
+                                    print(f"🔄 [WEBHOOK] Retry base44_id | tentative={_retry} | erreur={_retry_e}")
+                                    if _retry < 3:
+                                        _t_mod.sleep(1)
+                            if not _saved:
+                                print(f"❌ [WEBHOOK] base44_id non sauvegardé après 3 tentatives | rdv_id={_rdv_id}")
                         else:
                             print(f"⚠️ [WEBHOOK BG] appointment_id absent du body Base44")
                     except Exception as _b44_e:
@@ -2001,7 +2012,7 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str,
                     except Exception as _sms_e:
                         print(f"⚠️ [WEBHOOK BG] Erreur SMS patron : {_sms_e}")
 
-            _t_wh = threading.Thread(target=_run_webhook, daemon=True)
+            _t_wh = threading.Thread(target=_run_webhook, daemon=False)
             _t_wh.start()
             print(f"📡 [WEBHOOK] Lancé en arrière-plan — réponse vocale immédiate")
 
