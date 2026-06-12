@@ -2361,9 +2361,11 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str,
         _rdv_coiffeur     = ""
         _rdv_client_name  = ""
         _base44_id_ann = None
+        _date_iso = ""
+        _time_raw = ""
         try:
             _r = supabase.table("appointment")\
-                .select("service,date,time,staff_name,client_name,base44_id")\
+                .select("service,date,time,staff_name,client_name,base44_id,notes")\
                 .eq("id", rdv_id).execute()
             if _r.data:
                 _d = _r.data[0]
@@ -2371,6 +2373,15 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str,
                 _rdv_coiffeur    = (_d.get("staff_name") or "").strip()
                 _rdv_client_name = (_d.get("client_name") or "").strip()
                 _base44_id_ann   = (_d.get("base44_id") or "").strip() or None
+                if not _base44_id_ann:
+                    try:
+                        _notes_raw = _d.get("notes") or ""
+                        _notes_obj = json.loads(_notes_raw) if isinstance(_notes_raw, str) and _notes_raw else {}
+                        _base44_id_ann = (_notes_obj.get("base44_id") or "").strip() or None
+                        if _base44_id_ann:
+                            print(f"✅ [ANNULATION] base44_id récupéré depuis notes | {_base44_id_ann}")
+                    except Exception:
+                        pass
                 _date_iso = (_d.get("date") or "").strip()
                 if _date_iso:
                     try:
@@ -2388,6 +2399,34 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str,
                         _rdv_heure_lisible = _time_raw
         except Exception as _e:
             print(f"⚠️ [ANNULATION] Impossible de récupérer détails appointment : {_e}")
+
+        # Fallback base44_id : recherche via API Base44 si toujours absent
+        if not _base44_id_ann and webhook_url and _date_iso and _time_raw:
+            try:
+                import urllib.request as _urlreq_srch
+                _srch_url = webhook_url.rsplit("/", 1)[0] + "/search"
+                _srch_payload = json.dumps({
+                    "app_salon_id": app_salon_id,
+                    "client_telephone": telephone,
+                    "jour": _date_iso,
+                    "heure": _time_raw[:5],
+                }).encode("utf-8")
+                _srch_req = _urlreq_srch.Request(
+                    _srch_url,
+                    data=_srch_payload,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with _urlreq_srch.urlopen(_srch_req, timeout=5) as _sr:
+                    if _sr.status == 200:
+                        _sr_data = json.loads(_sr.read().decode("utf-8", errors="replace"))
+                        _b44_found = (_sr_data.get("appointment_id") or "").strip() or None
+                        if _b44_found:
+                            _base44_id_ann = _b44_found
+                            print(f"✅ [ANNULATION] base44_id récupéré depuis Base44 search | {_base44_id_ann}")
+                            supabase.table("appointment").update({"base44_id": _base44_id_ann}).eq("id", rdv_id).execute()
+            except Exception as _srch_e:
+                print(f"⚠️ [ANNULATION] base44_id introuvable — annulé Supabase uniquement ({type(_srch_e).__name__})")
 
         print(f"🗑️ [ANNULATION] détails récupérés : date={_rdv_date_lisible!r} heure={_rdv_heure_lisible!r} prestation={_rdv_prestation!r} coiffeur={_rdv_coiffeur!r}")
 
@@ -2979,13 +3018,17 @@ def run_agent(message_user: str, telephone: str,
     _heure_detectee = bool(re.search(r'\b\d{1,2}h\d{0,2}\b|\d{1,2}:\d{2}', _hist_text))
 
     # ── C2-ANNULATION — Forcer get_rdv_client_actif quand client parle d'annulation ──
-    _mots_annulation = ["annuler", "annulation", "supprimer", "effacer", "enlever", "mon rendez-vous"]
+    _mots_annulation = ["annul", "supprim", "cancel", "enlev", "effac", "retir", "mon rendez-vous"]
     _ctx_annulation = any(m in message_user.lower() for m in _mots_annulation)
+    _annulation_detectee = _ctx_annulation or _ctx_force.get("en_attente_confirmation_annulation", False)
     _rdv_deja_recupere = "rdv trouvé" in _hist_text or "aucun rdv" in _hist_text or "get_rdv_client_actif" in _hist_text
 
     if _ctx_annulation and not _rdv_deja_recupere:
         _tool_choice = {"type": "function", "function": {"name": "get_rdv_client_actif"}}
         print(f"🔧 [FORCE TOOL] Annulation détectée → tool_choice=get_rdv_client_actif")
+    elif _annulation_detectee:
+        _tool_choice = "auto"
+        print(f"🔧 [FORCE TOOL] Annulation/confirmation en cours → tool_choice=auto (skip FORCE TOOL)")
     elif _ctx_has_all and not _dispos_deja_verif:
         # Vérifier repos AVANT de forcer verifier_disponibilite
         if _rdv_p and coiffeurs:
@@ -4107,6 +4150,11 @@ async def sync_appointment(request: Request):
 
         print(f"📥 [SYNC-APPOINTMENT] action={action} | jour={jour} | heure={heure} | coiffeur={coiffeur!r} | base44_id={base44_id!r}")
 
+        _cancelled_actions = {"cancelled", "canceled", "deleted", "removed", "annule"}
+        _action_lower = action.lower()
+        _status_lower = (data.get("status") or "").lower()
+        _is_cancel = _action_lower in _cancelled_actions or _status_lower in _cancelled_actions
+
         # Résoudre salon_id depuis app_salon_id reçu
         salon_id_eff = None
         if rcvd_app_sid and supabase:
@@ -4122,14 +4170,14 @@ async def sync_appointment(request: Request):
                 print(f"⚠️ [SYNC-APPOINTMENT] Erreur résolution salon_id : {_e_sid}")
         time_sql = heure + ":00" if heure and len(heure) == 5 else heure
 
-        if action == "created":
+        if action == "created" and not _is_cancel:
             # ── Anti-doublon : chercher RDV existant pour ce jour/heure(/coiffeur) ───
             is_doublon = False
             existing_id = None
             try:
                 q = supabase.table("appointment")\
-                    .select("id").eq("date", jour).eq("time", time_sql)\
-                    .neq("status", "cancelled")
+                    .select("id,base44_id").eq("date", jour).eq("time", time_sql)\
+                    .neq("status", "cancelled").neq("status", "annule")
                 if coiffeur:
                     q = q.eq("staff_name", coiffeur)
                 res_dup = q.execute()
@@ -4137,6 +4185,10 @@ async def sync_appointment(request: Request):
                     is_doublon = True
                     existing_id = res_dup.data[0]["id"]
                     print(f"🔁 [ANTI-DOUBLON] RDV déjà présent pour {jour} {heure} coiffeur={coiffeur!r} → id={existing_id}")
+                    # Sauvegarder base44_id si manquant
+                    if base44_id and not (res_dup.data[0].get("base44_id") or "").strip():
+                        supabase.table("appointment").update({"base44_id": base44_id}).eq("id", existing_id).execute()
+                        print(f"✅ [SYNC-APPOINTMENT] base44_id sauvegardé sur RDV existant | id={existing_id}")
             except Exception as e_dup:
                 print(f"⚠️ [SYNC-APPOINTMENT] Erreur anti-doublon : {e_dup}")
 
@@ -4154,6 +4206,7 @@ async def sync_appointment(request: Request):
                 "service":     prestation,
                 "staff_name":  coiffeur,
                 "price":       0,
+                "base44_id":   base44_id or None,
                 "created_at":  datetime.now(timezone.utc).isoformat(),
                 "notes":       json.dumps({"source": "app", "base44_id": base44_id}),
             }
@@ -4166,6 +4219,18 @@ async def sync_appointment(request: Request):
                 appt_row.pop("notes", None)
                 appt_res = supabase.table("appointment").insert(appt_row).execute()
                 supabase_id = appt_res.data[0]["id"] if appt_res.data else None
+
+            # Retrouver et lier les RDV créés par l'agent vocal (base44_id absent)
+            if base44_id and client_tel and jour and time_sql:
+                try:
+                    _ret = supabase.table("appointment").select("id")\
+                        .eq("client_phone", client_tel).eq("date", jour).eq("time", time_sql)\
+                        .eq("status", "confirme").is_("base44_id", "null").neq("id", supabase_id or "").execute()
+                    for _row in (_ret.data or []):
+                        supabase.table("appointment").update({"base44_id": base44_id}).eq("id", _row["id"]).execute()
+                        print(f"✅ [SYNC-APPOINTMENT] base44_id rétabli sur RDV vocal | id={_row['id']}")
+                except Exception as _e_ret:
+                    print(f"⚠️ [SYNC-APPOINTMENT] Erreur rétablissement base44_id : {_e_ret}")
 
             print(f"✅ [SYNC-APPOINTMENT] Créé | supabase_id={supabase_id} | doublon=False")
             return {"success": True, "supabase_id": supabase_id, "doublon": False}
@@ -4195,27 +4260,40 @@ async def sync_appointment(request: Request):
                 print(f"⚠️ [SYNC-APPOINTMENT] RDV non trouvé pour update — base44_id={base44_id!r}")
                 return {"success": False, "error": "RDV non trouvé"}
 
-        elif action == "cancelled":
-            # ── Recherche par jour+heure+coiffeur ─────────────────────────────────
+        elif _is_cancel:
+            # ── Recherche par base44_id d'abord (plus précis) ─────────────────────
             target_id = None
-            try:
-                q_can = supabase.table("appointment").select("id")\
-                    .eq("date", jour).eq("time", time_sql)\
-                    .neq("status", "cancelled")
-                if coiffeur:
-                    q_can = q_can.eq("staff_name", coiffeur)
-                res_can = q_can.execute()
-                if res_can.data:
-                    target_id = res_can.data[0]["id"]
-            except Exception as e_can:
-                print(f"⚠️ [SYNC-APPOINTMENT] Erreur recherche cancel : {e_can}")
+            if base44_id:
+                try:
+                    res_b44 = supabase.table("appointment").select("id")\
+                        .eq("base44_id", base44_id).execute()
+                    if res_b44.data:
+                        target_id = res_b44.data[0]["id"]
+                        print(f"🔍 [SYNC-APPOINTMENT] RDV trouvé par base44_id={base44_id!r} → id={target_id}")
+                except Exception as e_b44:
+                    print(f"⚠️ [SYNC-APPOINTMENT] Erreur recherche base44_id : {e_b44}")
+
+            # ── Fallback : recherche par jour+heure+coiffeur ──────────────────────
+            if not target_id and jour and time_sql:
+                try:
+                    q_can = supabase.table("appointment").select("id")\
+                        .eq("date", jour).eq("time", time_sql)\
+                        .neq("status", "cancelled").neq("status", "annule")
+                    if coiffeur:
+                        q_can = q_can.eq("staff_name", coiffeur)
+                    res_can = q_can.execute()
+                    if res_can.data:
+                        target_id = res_can.data[0]["id"]
+                        print(f"🔍 [SYNC-APPOINTMENT] RDV trouvé par date/heure | id={target_id}")
+                except Exception as e_can:
+                    print(f"⚠️ [SYNC-APPOINTMENT] Erreur recherche cancel : {e_can}")
 
             if target_id:
                 supabase.table("appointment").update({"status": "annule"}).eq("id", target_id).execute()
-                print(f"🗑️ [SYNC] RDV annulé depuis Base44 | id={target_id}")
+                print(f"🗑️ [SYNC] RDV annulé depuis Base44 | action={action!r} | id={target_id}")
                 return {"success": True, "supabase_id": target_id}
             else:
-                print(f"⚠️ [SYNC-APPOINTMENT] RDV non trouvé pour cancel — base44_id={base44_id!r}")
+                print(f"⚠️ [SYNC-APPOINTMENT] RDV non trouvé pour cancel — action={action!r} base44_id={base44_id!r}")
                 return {"success": False, "error": "RDV non trouvé"}
 
         else:
@@ -4223,6 +4301,46 @@ async def sync_appointment(request: Request):
 
     except Exception as e:
         print(f"❌ [SYNC-APPOINTMENT] Erreur : {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/annuler-rdv-base44")
+async def annuler_rdv_base44(request: Request):
+    """
+    Annule un RDV dans Supabase depuis Base44 directement.
+    Body JSON : { "appointment_id": "uuid_supabase", "base44_id": "xxx" }
+    """
+    try:
+        data = await request.json()
+        appointment_id = (data.get("appointment_id") or "").strip()
+        base44_id_in   = (data.get("base44_id") or "").strip()
+
+        if not appointment_id and not base44_id_in:
+            raise HTTPException(status_code=400, detail="appointment_id ou base44_id requis")
+
+        target_id = None
+        if appointment_id:
+            target_id = appointment_id
+        elif base44_id_in:
+            try:
+                res = supabase.table("appointment").select("id").eq("base44_id", base44_id_in).execute()
+                if res.data:
+                    target_id = res.data[0]["id"]
+            except Exception as _e:
+                print(f"⚠️ [ANNULER-RDV-BASE44] Erreur lookup base44_id : {_e}")
+
+        if not target_id:
+            print(f"⚠️ [ANNULER-RDV-BASE44] RDV introuvable | appointment_id={appointment_id!r} base44_id={base44_id_in!r}")
+            return {"success": False, "error": "RDV non trouvé"}
+
+        supabase.table("appointment").update({"status": "annule"}).eq("id", target_id).execute()
+        print(f"🗑️ [ANNULER-RDV-BASE44] RDV annulé | id={target_id}")
+        return {"success": True, "supabase_id": target_id}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ [ANNULER-RDV-BASE44] Erreur : {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
