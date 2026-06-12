@@ -963,12 +963,12 @@ def annuler_rdv(client_id: str, rdv_id: str) -> bool:
         return False
     try:
         res_ap = supabase.table("appointment")\
-            .update({"status": "cancelled"})\
+            .update({"status": "annule"})\
             .eq("id", rdv_id)\
             .execute()
         ok = bool(res_ap.data)
         if ok:
-            print(f"✅ [ANNULATION] appointment id={rdv_id} annulé")
+            print(f"✅ [ANNULATION] appointment id={rdv_id} → status=annule")
         return ok
     except Exception as e:
         print(f"⚠️ [ANNULATION] appointment : {e}")
@@ -1529,6 +1529,8 @@ Si le client demande un RDV aujourd'hui en fin de journée, calcule le temps res
 FIN D'APPEL :
 Si client dit au revoir / merci au revoir / bonne journée / c'est tout merci : "Merci pour votre appel. Bonne journée et à bientôt."
 
+RÈGLE PRÉNOM : Si le client est nouveau (première visite), demande son prénom AVANT tout. Tu ne peux pas appeler prendre_rdv sans client_nom rempli. Si prendre_rdv retourne une demande de prénom, pose la question au client et rappelle prendre_rdv avec son prénom.
+
 """
 
     # Coiffeurs
@@ -1863,6 +1865,9 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str,
         nom_fourni = tool_input.get("client_nom") or tool_input.get("prenom")
         if nom_fourni and not client_nom:
             client_nom = nom_fourni
+        if not client_nom:
+            print(f"⚠️ [{nom_salon}] [PRENDRE_RDV] client_nom absent → demande prénom")
+            return "Avant de confirmer votre rendez-vous, pouvez-vous me donner votre prénom ?"
         if client_nom and client_id:
             mettre_a_jour_nom_client(client_id, client_nom)
 
@@ -2429,10 +2434,10 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str,
             elif not app_salon_id:
                 print(f"❌ [{nom_salon}] [WEBHOOK ANNULATION] app_salon_id VIDE — sync impossible")
             else:
-                print(f"📡 [{nom_salon}] [WEBHOOK ANNULATION] DÉBUT | url={webhook_url} | rdv_id={rdv_id}")
+                print(f"📡 [{nom_salon}] [WEBHOOK ANNULATION] DÉBUT | url={webhook_url} | base44_id={_base44_id_ann}")
                 _ann_payload_dict = {
                     "action": "cancelled",
-                    "appointment_id": rdv_id,
+                    "appointment_id": _base44_id_ann,
                     "app_salon_id": app_salon_id,
                     "source": "agent",
                 }
@@ -2493,6 +2498,22 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str,
         client = get_or_create_client(tel)
         client_id = client.get("id")
         rdvs = get_rdv_client(tel, salon_id=salon.get("id"))
+        _mtn = now_paris()
+        _auj = _mtn.date()
+        _mtn_min = _mtn.hour * 60 + _mtn.minute
+        rdvs_futurs = []
+        for r in rdvs:
+            try:
+                _rdv_date = date.fromisoformat(r.get("date", ""))
+                _rdv_t = (r.get("time") or "00:00")[:5]
+                _rdv_min = parse_hhmm_en_minutes(_rdv_t)
+                if _rdv_date == _auj and _rdv_min < _mtn_min:
+                    print(f"📋 [RDV ACTIF] ignoré — RDV passé | date={r.get('date')} heure={_rdv_t} (il est {_mtn.strftime('%H:%M')})")
+                    continue
+            except Exception:
+                pass
+            rdvs_futurs.append(r)
+        rdvs = rdvs_futurs
         if not rdvs:
             return "Aucun RDV à venir pour ce client."
         rdvs_str = []
