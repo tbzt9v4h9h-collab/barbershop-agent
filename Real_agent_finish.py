@@ -1949,50 +1949,62 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str,
             }
             print(f"📡 [{nom_salon}] [WEBHOOK] PAYLOAD | {json.dumps(_payload_dict)}")
 
-            try:
-                _wh_resp = requests.post(
-                    webhook_url,
-                    json=_payload_dict,
-                    timeout=8,
-                )
-                _wh_body = _wh_resp.text[:2000]
-                logging.info(
-                    f"📡 [WEBHOOK SYNC] "
-                    f"status={_wh_resp.status_code} | "
-                    f"body_len={len(_wh_body)}"
-                )
-                if _wh_resp.status_code == 200:
-                    import re as _re
-                    _m = _re.search(
-                        r'"appointment_id"\s*:\s*"([a-f0-9]{24})"',
-                        _wh_body
-                    )
-                    if _m:
-                        _b44_id = _m.group(1)
-                        supabase.table("appointment")\
-                            .update({"base44_id": _b44_id})\
-                            .eq("id", _rdv_id_cree)\
-                            .execute()
-                        logging.info(
-                            f"✅ [WEBHOOK SYNC] base44_id "
-                            f"sauvegardé | rdv={_rdv_id_cree} "
-                            f"| b44={_b44_id}"
+            def _run_webhook_creation(
+                _wh_url=webhook_url,
+                _wh_payload=_payload_dict,
+                _wh_rdv_id=_rdv_id_cree,
+                _wh_supabase=supabase,
+            ):
+                import time as _time_wh
+                import re as _re_wh
+                for _tentative in range(3):
+                    try:
+                        _resp = requests.post(
+                            _wh_url,
+                            json=_wh_payload,
+                            timeout=10,
                         )
-                    else:
+                        _body = _resp.text[:2000]
+                        if _resp.status_code == 200:
+                            _m = _re_wh.search(
+                                r'"appointment_id"\s*:\s*"([a-f0-9]{24})"',
+                                _body
+                            )
+                            if _m:
+                                _b44_id = _m.group(1)
+                                _wh_supabase.table("appointment")\
+                                    .update({"base44_id": _b44_id})\
+                                    .eq("id", _wh_rdv_id)\
+                                    .execute()
+                                logging.info(
+                                    f"✅ [WEBHOOK ASYNC] "
+                                    f"base44_id={_b44_id} | "
+                                    f"tentative={_tentative+1}"
+                                )
+                                return
                         logging.warning(
-                            f"⚠️ [WEBHOOK SYNC] "
-                            f"appointment_id introuvable | "
-                            f"body={_wh_body[:100]}"
+                            f"⚠️ [WEBHOOK ASYNC] "
+                            f"tentative={_tentative+1} "
+                            f"status={_resp.status_code}"
                         )
-            except requests.Timeout:
+                    except Exception as _e_wh:
+                        logging.warning(
+                            f"⚠️ [WEBHOOK ASYNC] "
+                            f"tentative={_tentative+1} "
+                            f"erreur={_e_wh}"
+                        )
+                    if _tentative < 2:
+                        _time_wh.sleep(2)
                 logging.warning(
-                    "⚠️ [WEBHOOK SYNC] Timeout 3s — "
-                    "base44_id non sauvegardé"
+                    "❌ [WEBHOOK ASYNC] "
+                    "base44_id non sauvegardé après 3 tentatives"
                 )
-            except Exception as _e:
-                logging.warning(
-                    f"⚠️ [WEBHOOK SYNC] Erreur : {_e}"
-                )
+
+            threading.Thread(
+                target=_run_webhook_creation,
+                daemon=False,
+            ).start()
+            logging.info(f"📡 [WEBHOOK ASYNC] Thread lancé | rdv={_rdv_id_cree}")
 
         # ── Notification fidélité Base44 agentRdvConfirmed — ARRIÈRE-PLAN ───────
         if _rdv_id_cree and app_salon_id:
@@ -4129,6 +4141,39 @@ async def sync_appointment(request: Request):
         time_sql = heure + ":00" if heure and len(heure) == 5 else heure
 
         if action == "created" and not _is_cancel:
+            # ── Rétablissement base44_id depuis payload Base44 (avant tout) ─────
+            _b44_id_sync = (
+                data.get("appointment_id") or
+                data.get("base44_appointment_id") or ""
+            ).strip()
+            if _b44_id_sync:
+                _tel_sync  = (data.get("client_telephone") or data.get("telephone") or "").strip()
+                _jour_sync = (data.get("jour") or data.get("date") or "").strip()
+                _heure_sync = (data.get("heure") or data.get("time") or "")[:5].strip()
+                if _tel_sync and _jour_sync and _heure_sync:
+                    _time_sync_sql = _heure_sync + ":00" if len(_heure_sync) == 5 else _heure_sync
+                    try:
+                        _rdv_sync = supabase.table("appointment")\
+                            .select("id, base44_id")\
+                            .eq("client_phone", _tel_sync)\
+                            .eq("date", _jour_sync)\
+                            .eq("time", _time_sync_sql)\
+                            .is_("base44_id", "null")\
+                            .execute()
+                        if _rdv_sync.data:
+                            supabase.table("appointment")\
+                                .update({"base44_id": _b44_id_sync})\
+                                .eq("id", _rdv_sync.data[0]["id"])\
+                                .execute()
+                            logging.info(
+                                f"✅ [SYNC] base44_id rétabli "
+                                f"via sync-appointment | "
+                                f"rdv={_rdv_sync.data[0]['id']} | "
+                                f"b44={_b44_id_sync}"
+                            )
+                    except Exception as _e_sync:
+                        logging.warning(f"⚠️ [SYNC] Erreur rétablissement base44_id : {_e_sync}")
+
             # ── Anti-doublon : chercher RDV existant pour ce jour/heure(/coiffeur) ───
             is_doublon = False
             existing_id = None
