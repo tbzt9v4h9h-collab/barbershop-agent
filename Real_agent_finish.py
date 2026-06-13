@@ -1953,7 +1953,7 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str,
                 _wh_resp = requests.post(
                     webhook_url,
                     json=_payload_dict,
-                    timeout=3,
+                    timeout=8,
                 )
                 _wh_body = _wh_resp.text[:2000]
                 logging.info(
