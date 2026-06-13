@@ -4136,6 +4136,8 @@ async def sync_appointment(request: Request):
     Maintient la vision temps réel pour que l'agent voit les créneaux occupés.
     """
     try:
+        _raw_body = await request.body()
+        logging.info(f"📥 [SYNC-APPOINTMENT] Payload brut reçu : {_raw_body}")
         data = await request.json()
         action       = data.get("action", "created")
         base44_id    = data.get("appointment_id", "")
@@ -4341,6 +4343,57 @@ async def annuler_rdv_base44(request: Request):
         raise
     except Exception as e:
         print(f"❌ [ANNULER-RDV-BASE44] Erreur : {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/force-sync-annulation")
+async def force_sync_annulation(request: Request):
+    """
+    Base44 appelle cet endpoint quand un RDV est annulé depuis le planning.
+    Body JSON : { "base44_id": "xxx", "app_salon_id": "xxx" }
+    Utilisable même si /sync-appointment ne reçoit pas de webhook.
+    """
+    try:
+        body = await request.json()
+        base44_id_fs = (body.get("base44_id") or "").strip()
+        app_salon_id_fs = (body.get("app_salon_id") or "").strip()
+
+        logging.info(f"📥 [FORCE-SYNC] Payload reçu : base44_id={base44_id_fs!r} app_salon_id={app_salon_id_fs!r}")
+
+        if not base44_id_fs:
+            return {"error": "base44_id manquant"}
+
+        # Recherche par base44_id
+        result = supabase.table("appointment").select("id, status")\
+            .eq("base44_id", base44_id_fs).execute()
+
+        # Fallback : recherche par app_salon_id si base44_id inconnu
+        if not result.data and app_salon_id_fs:
+            try:
+                _s = supabase.table("salon").select("id").eq("app_salon_id", app_salon_id_fs).limit(1).execute()
+                if _s.data:
+                    _sid = _s.data[0]["id"]
+                    result = supabase.table("appointment").select("id, status")\
+                        .eq("salon_id", _sid).eq("base44_id", base44_id_fs).execute()
+            except Exception:
+                pass
+
+        if not result.data:
+            logging.info(f"⚠️ [FORCE-SYNC] RDV introuvable | base44_id={base44_id_fs!r}")
+            return {"error": "RDV introuvable", "base44_id": base44_id_fs}
+
+        rdv_id = result.data[0]["id"]
+        supabase.table("appointment").update({"status": "annule"}).eq("id", rdv_id).execute()
+        logging.info(f"✅ [FORCE-SYNC] RDV annulé depuis Base44 | base44_id={base44_id_fs} | supabase_id={rdv_id}")
+
+        return {
+            "success": True,
+            "message": "RDV annulé dans Supabase",
+            "rdv_id": rdv_id,
+        }
+
+    except Exception as e:
+        logging.info(f"❌ [FORCE-SYNC] Erreur : {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
