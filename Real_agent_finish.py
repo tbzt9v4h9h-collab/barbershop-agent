@@ -22,6 +22,7 @@ import pytz
 from datetime import datetime, timedelta, date, timezone
 from dotenv import load_dotenv
 from supabase import create_client, Client
+import requests
 
 PARIS_TZ = pytz.timezone("Europe/Paris")
 
