@@ -1948,80 +1948,50 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str,
             }
             print(f"📡 [{nom_salon}] [WEBHOOK] PAYLOAD | {json.dumps(_payload_dict)}")
 
-            def _run_webhook(
-                _url=webhook_url,
-                _payload=json.dumps(_payload_dict).encode("utf-8"),
-                _tel_salon=tel_salon,
-                _nom=client_nom, _prest=prestation,
-                _j=_jour_wh, _h=_heure_wh,
-                _supabase=supabase,
-                _rdv_id=_rdv_id_cree,
-            ):
-                import urllib.request as _req_mod
-                import time as _t_mod
-                import json as _json_wh
-                _headers = {"Content-Type": "application/json", "Accept": "application/json"}
-                def _post():
-                    _req = _req_mod.Request(_url, data=_payload, headers=_headers, method="POST")
-                    with _req_mod.urlopen(_req, timeout=10) as _r:
-                        _rb = _r.read().decode("utf-8", errors="replace")[:2000]
-                        print(f"📡 [WEBHOOK BG] status={_r.status} | body={_rb!r}")
-                        return _r.status, _rb
-                _ok = False
-                _body_ok = ""
-                try:
-                    _status, _body_ok = _post()
-                    _ok = (_status == 200)
-                    if not _ok:
-                        print("⚠️ [WEBHOOK BG] Tentative 1 — status inattendu")
-                except Exception as _e1:
-                    print(f"⚠️ [WEBHOOK BG] Tentative 1 — {type(_e1).__name__}: {_e1}")
-                if not _ok:
-                    _t_mod.sleep(2)
-                    try:
-                        _status, _body_ok = _post()
-                        _ok = (_status == 200)
-                        if not _ok:
-                            print("⚠️ [WEBHOOK BG] Tentative 2 — status inattendu")
-                    except Exception as _e2:
-                        print(f"⚠️ [WEBHOOK BG] Tentative 2 — {type(_e2).__name__}: {_e2}")
-                if _ok and _body_ok and _supabase and _rdv_id:
-                    import re as _re_wh
-                    _match = _re_wh.search(
+            try:
+                _wh_resp = requests.post(
+                    webhook_url,
+                    json=_payload_dict,
+                    timeout=3,
+                )
+                _wh_body = _wh_resp.text[:2000]
+                logging.info(
+                    f"📡 [WEBHOOK SYNC] "
+                    f"status={_wh_resp.status_code} | "
+                    f"body_len={len(_wh_body)}"
+                )
+                if _wh_resp.status_code == 200:
+                    import re as _re
+                    _m = _re.search(
                         r'"appointment_id"\s*:\s*"([a-f0-9]{24})"',
-                        _body_ok
+                        _wh_body
                     )
-                    if _match:
-                        _b44_id = _match.group(1)
-                        logging.info(f"✅ [WEBHOOK BG] base44_id extrait | {_b44_id}")
-                        _saved = False
-                        for _retry in range(1, 4):
-                            try:
-                                _supabase.table("appointment")\
-                                    .update({"base44_id": _b44_id})\
-                                    .eq("id", _rdv_id).execute()
-                                logging.info(f"✅ [WEBHOOK BG] base44_id sauvegardé | rdv_id={_rdv_id} | base44_id={_b44_id}")
-                                _saved = True
-                                break
-                            except Exception as _retry_e:
-                                logging.warning(f"⚠️ [WEBHOOK BG] Erreur UPDATE base44_id : {_retry_e}")
-                                if _retry < 3:
-                                    _t_mod.sleep(1)
-                        if not _saved:
-                            logging.warning(f"⚠️ [WEBHOOK BG] base44_id non sauvegardé après 3 tentatives | rdv_id={_rdv_id}")
+                    if _m:
+                        _b44_id = _m.group(1)
+                        supabase.table("appointment")\
+                            .update({"base44_id": _b44_id})\
+                            .eq("id", _rdv_id_cree)\
+                            .execute()
+                        logging.info(
+                            f"✅ [WEBHOOK SYNC] base44_id "
+                            f"sauvegardé | rdv={_rdv_id_cree} "
+                            f"| b44={_b44_id}"
+                        )
                     else:
-                        logging.warning(f"⚠️ [WEBHOOK BG] appointment_id introuvable dans body={_body_ok[:200]}")
-                if not _ok:
-                    print(f"❌ [WEBHOOK BG] ÉCHEC — RDV {_j} {_h} non synchronisé Base44")
-                    try:
-                        send_sms(_tel_salon,
-                            f"⚠️ RDV non synchronisé.\nClient : {_nom} — {_prest} | {_j} à {_h}")
-                    except Exception as _sms_e:
-                        print(f"⚠️ [WEBHOOK BG] Erreur SMS patron : {_sms_e}")
-
-            _t_wh = threading.Thread(target=_run_webhook, daemon=False)
-            _t_wh.start()
-            print(f"📡 [WEBHOOK] Lancé en arrière-plan — réponse vocale immédiate")
+                        logging.warning(
+                            f"⚠️ [WEBHOOK SYNC] "
+                            f"appointment_id introuvable | "
+                            f"body={_wh_body[:100]}"
+                        )
+            except requests.Timeout:
+                logging.warning(
+                    "⚠️ [WEBHOOK SYNC] Timeout 3s — "
+                    "base44_id non sauvegardé"
+                )
+            except Exception as _e:
+                logging.warning(
+                    f"⚠️ [WEBHOOK SYNC] Erreur : {_e}"
+                )
 
         # ── Notification fidélité Base44 agentRdvConfirmed — ARRIÈRE-PLAN ───────
         if _rdv_id_cree and app_salon_id:
@@ -2430,9 +2400,15 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str,
             except Exception as _srch_e:
                 print(f"⚠️ [ANNULATION] base44_id introuvable — annulé Supabase uniquement ({type(_srch_e).__name__})")
 
-        print(f"🗑️ [ANNULATION] détails récupérés : date={_rdv_date_lisible!r} heure={_rdv_heure_lisible!r} prestation={_rdv_prestation!r} coiffeur={_rdv_coiffeur!r}")
+        logging.info(
+            f"🔍 [ANNULATION] rdv={rdv_id} | "
+            f"base44_id='{_base44_id_ann}' | "
+            f"service={_rdv_prestation!r} | "
+            f"date={_rdv_date_lisible!r} heure={_rdv_heure_lisible!r}"
+        )
 
         if annuler_rdv(None, rdv_id):
+            logging.info(f"✅ [ANNULATION] id={rdv_id} → status=annule")
             update_client_context(ctx_key, en_attente_confirmation_annulation=False, annulation_effectuee=True)
             # ── Construction SMS annulation complet ───────────────────────────
             ctx = get_client_context(ctx_key)
@@ -2466,59 +2442,31 @@ def process_tool_call(tool_name: str, tool_input: dict, telephone: str,
             print(f"📱 [ANNULATION] SMS envoyé : ok={ok_sms}")
 
             # ── Webhook vers Base44 (annulation) ─────────────────────────────
-            import urllib.request as _urlreq_ann
-            import time as _time_ann
-            if not _base44_id_ann:
-                print(f"⚠️ [{nom_salon}] [WEBHOOK ANNULATION] Skippé — pas de base44_id pour rdv_id={rdv_id}")
-            elif not webhook_url:
-                print(f"❌ [{nom_salon}] [WEBHOOK ANNULATION] URL VIDE — sync impossible")
-            elif not app_salon_id:
-                print(f"❌ [{nom_salon}] [WEBHOOK ANNULATION] app_salon_id VIDE — sync impossible")
-            else:
-                print(f"📡 [{nom_salon}] [WEBHOOK ANNULATION] DÉBUT | url={webhook_url} | base44_id={_base44_id_ann}")
-                _ann_payload_dict = {
+            if _base44_id_ann:
+                _ann_payload = {
                     "action": "cancelled",
                     "appointment_id": _base44_id_ann,
                     "app_salon_id": app_salon_id,
                     "source": "agent",
                 }
-                _ann_payload_bytes = json.dumps(_ann_payload_dict).encode("utf-8")
-                print(f"📡 [{nom_salon}] [WEBHOOK ANNULATION] PAYLOAD | {json.dumps(_ann_payload_dict)}")
-
-                def _do_ann_webhook_post():
-                    _ann_req = _urlreq_ann.Request(
-                        webhook_url,
-                        data=_ann_payload_bytes,
-                        headers={"Content-Type": "application/json", "Accept": "application/json"},
-                        method="POST",
-                    )
-                    with _urlreq_ann.urlopen(_ann_req, timeout=10) as _ar:
-                        _ar_body = _ar.read().decode("utf-8", errors="replace")[:200]
-                        print(f"📡 [WEBHOOK ANNULATION] RÉPONSE | status={_ar.status} | body={_ar_body!r}")
-                        return _ar.status
-
-                _ann_ok = False
                 try:
-                    _sa1 = _do_ann_webhook_post()
-                    _ann_ok = (_sa1 == 200)
-                    if not _ann_ok:
-                        print(f"⚠️ [WEBHOOK ANNULATION] Tentative 1 — status inattendu : {_sa1}")
-                except Exception as _we1:
-                    print(f"❌ [WEBHOOK ANNULATION] ERREUR | message={_we1}")
-
-                if not _ann_ok:
-                    print("🔄 [WEBHOOK ANNULATION] Retry dans 2s…")
-                    _time_ann.sleep(2)
-                    try:
-                        _sa2 = _do_ann_webhook_post()
-                        _ann_ok = (_sa2 == 200)
-                        if not _ann_ok:
-                            print(f"⚠️ [WEBHOOK ANNULATION] Tentative 2 — status inattendu : {_sa2}")
-                    except Exception as _we2:
-                        print(f"❌ [WEBHOOK ANNULATION] ERREUR | message={_we2}")
-
-                if not _ann_ok:
-                    print(f"❌ [WEBHOOK ANNULATION] ÉCHEC DÉFINITIF — RDV {rdv_id} non synchronisé avec Base44")
+                    _ann_resp = requests.post(
+                        webhook_url,
+                        json=_ann_payload,
+                        timeout=5,
+                    )
+                    logging.info(
+                        f"📡 [WEBHOOK ANNULATION] "
+                        f"base44_id={_base44_id_ann} | "
+                        f"status={_ann_resp.status_code}"
+                    )
+                except Exception as _ann_e:
+                    logging.warning(f"⚠️ [WEBHOOK ANNULATION] {_ann_e}")
+            else:
+                logging.warning(
+                    f"⚠️ [WEBHOOK ANNULATION] Skippé "
+                    f"— base44_id vide pour {rdv_id}"
+                )
 
             return "RDV annulé avec succès. SMS de confirmation envoyé au client."
 
@@ -3391,6 +3339,9 @@ def run_agent(message_user: str, telephone: str,
     _ctx_rdv_pris_check  = get_client_context(ctx_key).get("rdv_pris", False)
     _dispo_positive      = "disponibilité : libre" in _hist_text_i or "créneau libre" in _hist_text_i
     _gpt_annonce_confirm = any(m in _resp_lower_i for m in _mots_confirm)
+    _ann_effect_c4       = get_client_context(ctx_key).get("annulation_effectuee", False)
+    _ann_rdv_in_hist     = "annuler_rdv" in _hist_text_i
+    _rdv_actif_in_hist   = "get_rdv_client_actif" in _hist_text_i
 
     # C1 : GPT a dit "je vais vérifier" au lieu d'appeler le tool → forcer l'appel direct
     if _est_phrase_attente and _context_complet:
@@ -3479,7 +3430,9 @@ def run_agent(message_user: str, telephone: str,
 
     # C4-CONFIRMÉ : GPT annonce "confirmé" sans avoir appelé prendre_rdv → forcer prendre_rdv
     elif _gpt_annonce_confirm and _dispo_positive and not _ctx_rdv_pris_check and _context_complet \
-            and not get_client_context(ctx_key).get("annulation_effectuee", False):
+            and not _ann_effect_c4 \
+            and not _ann_rdv_in_hist \
+            and not _rdv_actif_in_hist:
         _ctx_c4 = get_client_context(ctx_key)
         _args_c4 = {
             "jour":           _ctx_c4.get("rdv_jour"),
@@ -4386,7 +4339,11 @@ async def force_sync_annulation(request: Request):
 
         rdv_id = result.data[0]["id"]
         supabase.table("appointment").update({"status": "annule"}).eq("id", rdv_id).execute()
-        logging.info(f"✅ [FORCE-SYNC] RDV annulé depuis Base44 | base44_id={base44_id_fs} | supabase_id={rdv_id}")
+        logging.info(
+            f"✅ [FORCE-SYNC] RDV annulé | "
+            f"base44_id={base44_id_fs} | "
+            f"supabase_id={rdv_id}"
+        )
 
         return {
             "success": True,
